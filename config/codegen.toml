@@ -1,0 +1,15 @@
+# Code generation options (all executables).
+#
+# Keep PowerPC registers in C++ locals instead of the shared PPCContext where
+# that's safe, so the host compiler can hold them in registers. This makes all
+# recompiled game code faster. It relies on setjmp/longjmp being declared
+# (config/<build>/functions.toml).
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+# non_argument_as_local must stay off. MSVC EH funclets (e.g. 0x82805420)
+# get their parent's frame in r12 and the GPR save/restore helpers use r12, so
+# r0/r11/r12 have to stay visible across calls.
+non_volatile_as_local = true
+skip_msr = true

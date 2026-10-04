@@ -1,0 +1,28 @@
+# Third-party reference checkouts (decomp, RB3DX, ReXGlue SDK source)
+/reference/
+# Locally installed ReXGlue SDK
+/.sdk/
+
+# Copyrighted game data. Supply your own and never commit it
+/game/*
+!/game/README.md
+
+# Recompiled output comes from the game executable, so never commit it
+/generated/*
+!/generated/rexglue.cmake
+
+# Written by codegen next to config/dx/rb3pc_dx_manifest.toml, unused
+/config/dx/generated/
+
+# Build output
+/out/
+/build/
+CMakeUserPresets.json
+
+# Archives dropped into the project root
+/*.zip
+/*.7z
+/*.iso
+
+# Local notes, not published
+/docs/

@@ -1,0 +1,72 @@
+# Codegen overrides for the retail disc executable
+# (default.xex, title 45410914, version 0.0.0.1, built 2010-08-07).
+
+# CRT setjmp/longjmp. Debug::Fail's TRY blocks (TheDebugJump) and about 20
+# library error paths use them. ReXGlue must know them to implement them
+# natively; recompiled as ordinary code, longjmp can't unwind to the setjmp
+# site.
+setjmp_address = 0x82B88A00
+longjmp_address = 0x82B885D0
+#
+# Small leaf/tail-call functions with no .pdata entry that analysis misses.
+# They are only reached through a tail branch (`b`), so they need explicit
+# boundaries. Inspect them with tools/dis.sh.
+
+[functions]
+0x82399C68 = { size = 0x48 }  # loop writing f1 into each 8-byte element of a vector
+0x8276B480 = { size = 0x24 }  # bool (mask >> bit) & 1
+0x8276B9E8 = { size = 0x10 }  # tail-calls 0x8275A810 with fields 0x38/0x64
+0x82778858 = { size = 0x08 }  # lwz r3,0(r3); b 0x82770018
+0x82B565C8 = { size = 0x0C }  # tail-calls 0x82B56508
+0x82B66F10 = { size = 0x08 }  # lwz r3,200(r3); b 0x82B78720
+
+# Virtual-call thunks reachable only through vtables. Analysis merged each into
+# the thunk before it. Found with tools/find_missing_funcs.py.
+0x82893448 = { size = 0x10 }  # ref @0x82136E48
+0x828936B0 = { size = 0x28 }  # ref @0x8213700C
+0x828936D8 = { size = 0x28 }  # ref @0x82137010
+0x82893700 = { size = 0x28 }  # ref @0x82137014
+0x82893728 = { size = 0x28 }  # ref @0x82137018
+0x82893B40 = { size = 0x20 }  # ref @0x8213704C
+0x82893B60 = { size = 0x8 }  # ref @0x82136E60
+0x829EF0A8 = { size = 0x18 }  # ref @0x8216B4B8
+0x82BAFDA8 = { size = 0x18 }  # ref @0x821A0F2C
+0x82BC3A10 = { size = 0x8 }  # ref @0x821A60EC
+
+# This-adjustor thunks (addi r3,r3,-N; b target) that follow another thunk.
+0x82B90448 = { size = 0x8 }  # ref @0x8219F9DC
+0x82B9B278 = { size = 0x8 }  # ref @0x8219FD0C
+0x82B9B288 = { size = 0x8 }  # ref @0x8219FCC8
+0x82B9B290 = { size = 0x8 }  # ref @0x8219FCC0
+0x82BA1AD0 = { size = 0x8 }  # ref @0x821A0054
+0x82BA1AE0 = { size = 0x8 }  # ref @0x8219FCDC
+0x82BA1D90 = { size = 0x8 }  # ref @0x8219FCE4
+0x82BA1D98 = { size = 0x8 }  # ref @0x821A00C4
+0x82BA1DA8 = { size = 0x8 }  # ref @0x8219FCE8
+0x82BA1DB0 = { size = 0x8 }  # ref @0x821A0040
+0x82BA1DB8 = { size = 0x8 }  # ref @0x821A0038
+0x82BA1DC0 = { size = 0x8 }  # ref @0x8219FCE0
+0x82BA1DC8 = { size = 0x8 }  # ref @0x821A0008
+0x82BA1DD0 = { size = 0x8 }  # ref @0x8219FCD8
+0x82BA1DD8 = { size = 0x8 }  # ref @0x8219FD00
+0x82BA1DE0 = { size = 0x8 }  # ref @0x8219FCFC
+0x82BA1DE8 = { size = 0x8 }  # ref @0x8219FD04
+0x82BA1DF0 = { size = 0x8 }  # ref @0x8219FCD0
+0x82BB0860 = { size = 0x8 }  # ref @0x821A0EC4
+
+# Functions whose address is built in code (lis/addi): callbacks such as qsort
+# comparators, and function pointers returned by selector functions.
+0x82893B78 = { size = 0x10 }  # ref @0x8289CEEC
+0x82893B88 = { size = 0x10 }  # ref @0x8289D19C
+0x82893B98 = { size = 0x10 }  # ref @0x8289D1EC
+0x82893BA8 = { size = 0x10 }  # ref @0x8289D514
+0x82893BB8 = { size = 0x10 }  # ref @0x8289CD24
+0x82893BC8 = { size = 0x10 }  # ref @0x8289D72C
+0x82893BD8 = { size = 0x10 }  # ref @0x8289CFCC
+0x82893BE8 = { size = 0x10 }  # ref @0x8289CD74
+0x82893BF8 = { size = 0x10 }  # ref @0x8289D23C
+0x82908010 = { size = 0x10 }  # ref @0x82909134
+0x82908020 = { size = 0x78 }  # ref @0x82909140
+0x8292DA50 = { size = 0x8 }  # ref @0x82916D10
+0x829635D0 = { size = 0x74 }  # ref @0x8297C8B4
+0x82C04628 = { size = 0x18 }  # ref @0x82C046D0
