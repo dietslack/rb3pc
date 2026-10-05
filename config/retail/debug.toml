@@ -1,0 +1,29 @@
+# Temporary diagnostic hooks for the retail executable. To enable, add this
+# file to [entrypoint].includes in rb3pc_manifest.toml.
+
+# D3D: command buffer allocation result in sub_828386F0 (crash at 0x828387D0
+# writing through r6-4+0x10 == 0).
+[[midasm_hook]]
+address = 0x8283875C
+name = "DebugD3DAllocResult"
+registers = ["r3", "r26", "r31"]
+after_instruction = true
+
+# Joypad type chosen by RB3's Xbox controller classifier (sub_8251EB20):
+# 2 = hx_xbox gamepad (vocals), 5 = strat_xbox guitar, 9 = hx_drums_xbox_rb2.
+[[midasm_hook]]
+address = 0x8251EC2C
+name = "DebugJoypadType"
+registers = ["r26", "r30"]
+
+# XAudio render-driver client callback (pumped by the SDK's AudioWorker once
+# per 256-sample frame, about 187/s at 48 kHz). Prints calls per second.
+[[midasm_hook]]
+address = 0x82BC40F0
+name = "DebugAudioCallbackRate"
+
+# Peak level of each 6ch x 256-sample float frame submitted to XAudio.
+[[midasm_hook]]
+address = 0x82BC3FF0
+name = "DebugAudioFramePeak"
+registers = ["r4"]

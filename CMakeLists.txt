@@ -22,7 +22,10 @@ endif()
 # Sources
 set(RB3PC_SOURCES
     src/main.cpp
+    src/debug_hooks.cpp
     src/shm_cleanup.cpp
+    src/xam_trace.cpp
+    src/kernel_trace.cpp
 )
 
 if(WIN32)
@@ -49,4 +52,13 @@ if(NOT WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_rex_shared_libs} $<TARGET_FILE_DIR:rb3pc>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_libstdcxx} $<TARGET_FILE_DIR:rb3pc>/libstdc++.so.6
         VERBATIM)
+endif()
+
+# Debugging aid: build selected generated files at -O0 with full debug info so
+# gdb can show guest registers (ctx.rN) at a crash. Example:
+#   -DRB3PC_DEBUG_SOURCES="generated/default/rb3pc_recomp.124.cpp"
+set(RB3PC_DEBUG_SOURCES "" CACHE STRING "Generated sources to build at -O0 -g")
+if(RB3PC_DEBUG_SOURCES)
+    set_source_files_properties(${RB3PC_DEBUG_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-O0;-g" SKIP_PRECOMPILE_HEADERS ON)
 endif()
