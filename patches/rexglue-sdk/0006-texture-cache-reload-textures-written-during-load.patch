@@ -1,0 +1,93 @@
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..bf2ed01 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -95,6 +95,12 @@ class SharedMemory {
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
++  // Whether every page in the range is still valid, i.e. hasn't been written
++  // by the CPU since it was last uploaded. Lets a consumer that loaded from
++  // the range and is about to start watching it detect writes that happened
++  // in between, which would otherwise never fire its watch.
++  bool IsRangeValid(uint32_t start, uint32_t length);
++
+  protected:
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..006ae20 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -689,20 +689,33 @@ TextureCache::Texture::~Texture() {
+ void TextureCache::Texture::MakeUpToDateAndWatch(
+     const std::unique_lock<std::recursive_mutex>& global_lock) {
+   SharedMemory& shared_memory = texture_cache().shared_memory();
+-  if (base_outdated_) {
++  // The data was uploaded to shared memory before the texture was loaded from
++  // it, and nothing watched the range in between. If the CPU wrote to it in
++  // that window (the guest streaming in new texture data), what was loaded is
++  // stale, so leave that part outdated to be reloaded on the next use rather
++  // than watching an already-modified range that will never fire.
++  bool stale = false;
++  if (base_outdated_ && !shared_memory.IsRangeValid(key().base_page << 12, GetGuestBaseSize())) {
++    stale = true;
++  } else if (base_outdated_) {
+     assert_not_zero(GetGuestBaseSize());
+     base_outdated_ = false;
+     base_watch_handle_ = shared_memory.WatchMemoryRange(
+         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
+     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+   }
+-  if (mips_outdated_) {
++  if (mips_outdated_ && !shared_memory.IsRangeValid(key().mip_page << 12, GetGuestMipsSize())) {
++    stale = true;
++  } else if (mips_outdated_) {
+     assert_not_zero(GetGuestMipsSize());
+     mips_outdated_ = false;
+     mips_watch_handle_ = shared_memory.WatchMemoryRange(
+         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
+     outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+   }
++  if (stale) {
++    texture_cache_.texture_became_outdated_.store(true, std::memory_order_release);
++  }
+ }
+ 
+ void TextureCache::Texture::MarkAsUsed() {
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..a710791 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -272,6 +272,31 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   MakeRangeValid(start, length, true);
+ }
+ 
++bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) {
++  if (length == 0 || start >= kBufferSize) {
++    return true;
++  }
++  length = std::min(length, kBufferSize - start);
++  uint32_t page_first = start >> page_size_log2_;
++  uint32_t page_last = (start + length - 1) >> page_size_log2_;
++  uint32_t block_first = page_first >> 6;
++  uint32_t block_last = page_last >> 6;
++  auto global_lock = global_critical_region_.Acquire();
++  for (uint32_t i = block_first; i <= block_last; ++i) {
++    uint64_t check_bits = UINT64_MAX;
++    if (i == block_first) {
++      check_bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
++    }
++    if (i == block_last && (page_last & 63) != 63) {
++      check_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++    }
++    if ((system_page_flags_valid_[i] & check_bits) != check_bits) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                                     uint32_t length_allocations) {
+   assert_always(

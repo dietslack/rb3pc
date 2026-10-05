@@ -1,0 +1,24 @@
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 79daa0f..1615cc4 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4485,11 +4485,15 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   // auto: render-to-texture that's resolved once in a while (RB3 composites
+   // character skin and outfits this way, then compresses them on the CPU) has
+   // to reach guest memory before the CPU looks, so read it back immediately.
+-  // Per-frame targets, which the CPU doesn't read, take the delayed path.
++  // Per-frame targets (scene buffers for post effects, shadow maps) are only
++  // read by the GPU, which already has them, so they aren't read back at all:
++  // copying them into guest memory every frame was a third of the GPU
++  // thread's time on RB3's title screen.
+   if (readback_mode == ReadbackResolveMode::kAuto) {
+-    readback_mode = readback.frame_streak >= kReadbackAutoFrequentFrames
+-                        ? ReadbackResolveMode::kFast
+-                        : ReadbackResolveMode::kFull;
++    if (readback.frame_streak >= kReadbackAutoFrequentFrames) {
++      return true;
++    }
++    readback_mode = ReadbackResolveMode::kFull;
+   }
+   uint32_t write_index = readback.current_index;
+   uint32_t readback_size = AlignReadbackBufferSize(written_length);
