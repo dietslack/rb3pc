@@ -22,6 +22,7 @@ endif()
 # Sources
 set(RB3PC_SOURCES
     src/main.cpp
+    src/shm_cleanup.cpp
 )
 
 if(WIN32)
@@ -31,3 +32,21 @@ else()
 endif()
 
 rexglue_setup_target(rb3pc)
+
+# Ship the SDK's shared libraries (runtime, Xenos GPU plugin, Tracy) next to
+# the executable. The GPU plugin is only searched for there.
+set_target_properties(rb3pc PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+if(NOT WIN32)
+    get_target_property(_rex_runtime_lib rex::runtime IMPORTED_LOCATION_RELEASE)
+    get_filename_component(_rex_lib_dir "${_rex_runtime_lib}" DIRECTORY)
+    file(GLOB _rex_shared_libs "${_rex_lib_dir}/*.so")
+    # Ship the compiler's libstdc++ too, so the binary still runs on systems
+    # with an older libstdc++ than the one it was made with.
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.so.6
+                    OUTPUT_VARIABLE _libstdcxx OUTPUT_STRIP_TRAILING_WHITESPACE)
+    file(REAL_PATH "${_libstdcxx}" _libstdcxx)
+    add_custom_command(TARGET rb3pc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_rex_shared_libs} $<TARGET_FILE_DIR:rb3pc>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_libstdcxx} $<TARGET_FILE_DIR:rb3pc>/libstdc++.so.6
+        VERBATIM)
+endif()
