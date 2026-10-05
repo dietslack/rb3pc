@@ -1,0 +1,72 @@
+# Permanent mid-asm hooks for the retail executable.
+
+# Game frame counter: D3D Present calls VdSwap exactly once per rendered frame
+# (bl at 0x828374BC). Feeds the FPS counter (src/frame_stats.cpp).
+[[midasm_hook]]
+address = 0x828374BC
+name = "Rb3pcOnGuestFrame"
+
+# D3D's GPU wait poll (sub_8282C5B8, called by BlockOnFence and the other D3D
+# wait loops) returns 1 at 0x8282C664 when the GPU isn't there yet. The game
+# busy-spins on it through all its idle time at 60 FPS; this makes the waiting
+# thread back off instead (src/gpu_wait.cpp).
+[[midasm_hook]]
+address = 0x8282C664
+name = "Rb3pcOnGpuWaitPoll"
+
+# Remembering settings vanilla RB3 resets every boot (src/save_tweaks.cpp).
+
+# Modifier::UseSaveValue (sub_825719B0) returns Contains(use_save_value) in r30
+# here. Breakneck Speed (mod_doublespeed) is saved but has no use_save_value,
+# so it was never restored or marked for saving.
+[[midasm_hook]]
+address = 0x82571A28
+name = "Rb3pcModifierUseSaveValue"
+registers = ["r29", "r30"]
+
+# DefaultDifficulty() (sub_82671060) returns tour.default_difficulty in r3.
+[[midasm_hook]]
+address = 0x826710BC
+name = "Rb3pcDefaultDifficulty"
+registers = ["r3"]
+
+# BandUser::SetDifficulty(Difficulty) (sub_8266DA80), after its IsLocal()
+# check: r31 = user, r30 = difficulty.
+[[midasm_hook]]
+address = 0x8266DABC
+name = "Rb3pcSetDifficulty"
+registers = ["r30"]
+
+# ManageBandPanel::SetStandIn (sub_826080A0) epilogue: r30 = panel, its
+# mProfile at +80. Changing a stand-in doesn't mark the profile dirty, so it
+# was only saved if something else triggered a save.
+[[midasm_hook]]
+address = 0x826081B8
+name = "Rb3pcStandInChanged"
+registers = ["r30"]
+
+# Quick start (src/script_patches.cpp): Splash's constructor (sub_8271D198) has
+# just stored mSplashTime (ui.splash_time, ms, at +8) and mWaitForSplash
+# (ui.wait_for_splash, at +12); r30 = Splash. Zeroing them lets the boot logos
+# go by as soon as loading is done.
+[[midasm_hook]]
+address = 0x8271D288
+name = "Rb3pcSplashCreated"
+registers = ["r30"]
+
+# Boot speed (src/boot_speed.cpp): Splash::Poll (sub_8271D9C0), called by the
+# loader over and over while it loads, draws and presents a boot logo frame
+# every time (UpdateThreadLoop, 0x8271D718). Uncapped that was ~240 frames
+# a second, with the main thread waiting on the GPU for most of the load.
+# Skipping to the epilogue when the last frame was under 33 ms ago gives
+# that time back to loading.
+[[midasm_hook]]
+address = 0x8271D9EC
+name = "Rb3pcSplashPollThrottle"
+jump_address_on_true = 0x8271DA48
+
+# CalibrationPanel::Poll (0x825F0710, vtable 0x820BD664 slot 7), after its
+# prologue: the lag calibration screens run at 60 FPS (src/calibration_fps.cpp).
+[[midasm_hook]]
+address = 0x825F0724
+name = "Rb3pcCalibrationPoll"

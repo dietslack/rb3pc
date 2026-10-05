@@ -23,8 +23,11 @@ endif()
 set(RB3PC_SOURCES
     src/main.cpp
     src/debug_hooks.cpp
+    src/app_hooks.cpp
     src/shm_cleanup.cpp
+    src/boot_speed.cpp
     src/save_tweaks.cpp
+    src/gpu_wait.cpp
     src/profile.cpp
     src/xam_trace.cpp
     src/kernel_trace.cpp
