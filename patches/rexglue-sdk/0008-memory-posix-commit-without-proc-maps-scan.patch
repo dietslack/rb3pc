@@ -1,0 +1,61 @@
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..b86eeb8 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -189,38 +189,6 @@ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
+   return false;
+ }
+ 
+-// Check if [base, base+length) is fully covered by existing mappings (no gaps)
+-static bool IsRangeFullyMapped(void* base_address, size_t length) {
+-  if (!base_address || length == 0)
+-    return false;
+-
+-  const uintptr_t begin = reinterpret_cast<uintptr_t>(base_address);
+-  const uintptr_t end = begin + length;
+-  if (end < begin) {  // overflow check
+-    return false;
+-  }
+-
+-  std::ifstream maps("/proc/self/maps");
+-  if (!maps.is_open())
+-    return false;
+-
+-  uintptr_t cursor = begin;
+-  std::string line;
+-  while (std::getline(maps, line)) {
+-    LinuxMapEntry e;
+-    if (!ParseProcMapsLine(line, e))
+-      continue;
+-    if (e.end <= cursor)
+-      continue;
+-    if (e.start > cursor)
+-      return false;  // gap found
+-    cursor = e.end;
+-    if (cursor >= end)
+-      return true;
+-  }
+-  return cursor >= end;
+-}
+-
+ // Convert /proc/self/maps permission chars to PageAccess
+ static PageAccess PermsToPageAccess(const char perms[5]) {
+   const bool r = perms[0] == 'r';
+@@ -304,11 +272,12 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+   if (errno == EEXIST && base_address &&
+       (allocation_type == AllocationType::kCommit ||
+        allocation_type == AllocationType::kReserveCommit)) {
+-    // Verify the entire range is mapped before using mprotect
+-    if (IsRangeFullyMapped(base_address, length)) {
+-      if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+-        return base_address;
+-      }
++    // mprotect itself fails with ENOMEM if any page in the range is
++    // unmapped, so it doubles as the "fully reserved" check. (Scanning
++    // /proc/self/maps here instead cost a full parse of thousands of lines
++    // on every guest commit, which dominated load times.)
++    if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
++      return base_address;
+     }
+   }
+ #endif
