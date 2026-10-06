@@ -32,6 +32,8 @@ set(RB3PC_SOURCES
     src/gpu_wait.cpp
     src/profile.cpp
     src/shader_warmup.cpp
+    src/ark.cpp
+    src/dtb.cpp
     src/sha1.cpp
     src/xam_trace.cpp
     src/kernel_trace.cpp
