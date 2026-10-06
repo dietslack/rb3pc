@@ -1,0 +1,338 @@
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817f..6aba119 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -71,6 +71,8 @@ class VulkanDevice {
+     uint32_t maxFragmentInputComponents = 64;
+     uint32_t maxFragmentCombinedOutputResources = 4;
+     float maxSamplerAnisotropy = 1.0f;
++    // Nanoseconds per timestamp query tick.
++    float timestampPeriod = 1.0f;
+     uint32_t maxViewportDimensions[2] = {4096, 4096};
+     VkDeviceSize minUniformBufferOffsetAlignment = 256;
+     VkDeviceSize minStorageBufferOffsetAlignment = 256;
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index d9d6ed3..0899f08 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -32,6 +32,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilCompareMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilReference)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilWriteMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetViewport)
++XE_UI_VULKAN_FUNCTION(vkCmdWriteTimestamp)
+ XE_UI_VULKAN_FUNCTION(vkCreateBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCreateBufferView)
+ XE_UI_VULKAN_FUNCTION(vkCreateCommandPool)
+@@ -75,6 +76,7 @@ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetPipelineCacheData)
++XE_UI_VULKAN_FUNCTION(vkGetQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
+ XE_UI_VULKAN_FUNCTION(vkResetCommandPool)
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033..08427c5 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -9,19 +9,199 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <array>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <map>
++#include <string>
++#include <vector>
++
++#include <fmt/format.h>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/graphics/vulkan/deferred_command_buffer.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_gpu_timing, false, "GPU/Vulkan",
++                    "Log, each second, the GPU time spent per kind of command (draws, "
++                    "compute dispatches per pipeline, copies, clears), from timestamp queries")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::vulkan {
+ 
++namespace {
++
++// vulkan_gpu_timing: a timestamp is written whenever the kind of command
++// being replayed changes (and on every compute pipeline change), so each
++// interval between two timestamps is charged to one kind. Results are read
++// once the submission has completed.
++enum class GpuWork : uint8_t { kOther, kDraw, kDispatch, kCopy, kCopyToImage, kClear, kBarrier, kCount };
++constexpr const char* kGpuWorkNames[] = {"other", "draw", "dispatch", "copy", "copy_to_image",
++                                         "clear", "barrier"};
++
++class GpuTimer {
++ public:
++  static GpuTimer& Get() {
++    static GpuTimer timer;
++    return timer;
++  }
++
++  // Starts timing a command buffer; returns false if no slot is free.
++  bool Begin(const VulkanCommandProcessor& cp, VkCommandBuffer command_buffer) {
++    const auto* device = cp.GetVulkanDevice();
++    const auto& dfn = device->functions();
++    Harvest(cp);
++    active_ = nullptr;
++    for (auto& slot : slots_) {
++      if (slot.pending) continue;
++      if (slot.pool == VK_NULL_HANDLE) {
++        VkQueryPoolCreateInfo info = {};
++        info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        info.queryCount = kMaxQueries;
++        if (dfn.vkCreateQueryPool(device->device(), &info, nullptr, &slot.pool) != VK_SUCCESS) {
++          slot.pool = VK_NULL_HANDLE;
++          return false;
++        }
++      }
++      active_ = &slot;
++      break;
++    }
++    if (!active_) return false;
++    active_->labels.clear();
++    active_->submission = cp.GetCurrentSubmission();
++    dfn.vkCmdResetQueryPool(command_buffer, active_->pool, 0, kMaxQueries);
++    current_ = {GpuWork::kOther, VK_NULL_HANDLE};
++    Stamp(cp, command_buffer, current_);
++    return true;
++  }
++
++  // Before replaying a command of this kind (pipeline: the bound compute
++  // pipeline, for dispatches).
++  void Before(const VulkanCommandProcessor& cp, VkCommandBuffer command_buffer, GpuWork work,
++              VkPipeline pipeline) {
++    if (!active_) return;
++    if (work == GpuWork::kDraw) ++draws_;
++    std::pair<GpuWork, VkPipeline> label{work, work == GpuWork::kDispatch ? pipeline
++                                                                          : VK_NULL_HANDLE};
++    if (label != current_) {
++      current_ = label;
++      Stamp(cp, command_buffer, label);
++    }
++  }
++
++  void CountImageCopy(uint64_t texels) {
++    if (!active_) return;
++    image_copies_ += 1;
++    image_texels_ += texels;
++  }
++
++  void CountCopy(uint32_t regions, uint64_t bytes) {
++    if (!active_) return;
++    copies_ += 1;
++    copy_regions_ += regions;
++    copy_bytes_ += bytes;
++  }
++
++  void End(const VulkanCommandProcessor& cp, VkCommandBuffer command_buffer) {
++    if (!active_) return;
++    Stamp(cp, command_buffer, current_);
++    active_->pending = true;
++    active_ = nullptr;
++  }
++
++ private:
++  static constexpr uint32_t kMaxQueries = 8192;
++
++  struct Slot {
++    VkQueryPool pool = VK_NULL_HANDLE;
++    uint64_t submission = 0;
++    bool pending = false;
++    // labels[i]: what ran between timestamps i and i + 1.
++    std::vector<std::pair<GpuWork, VkPipeline>> labels;
++  };
++
++  void Stamp(const VulkanCommandProcessor& cp, VkCommandBuffer command_buffer,
++             std::pair<GpuWork, VkPipeline> label) {
++    if (active_->labels.size() + 1 >= kMaxQueries) return;
++    cp.GetVulkanDevice()->functions().vkCmdWriteTimestamp(
++        command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, active_->pool,
++        uint32_t(active_->labels.size()));
++    active_->labels.push_back(label);
++  }
++
++  void Harvest(const VulkanCommandProcessor& cp) {
++    const auto* device = cp.GetVulkanDevice();
++    const auto& dfn = device->functions();
++    double period_ms = double(device->properties().timestampPeriod) / 1e6;
++    for (auto& slot : slots_) {
++      if (!slot.pending || slot.submission > cp.GetCompletedSubmission()) continue;
++      slot.pending = false;
++      uint32_t count = uint32_t(slot.labels.size());
++      if (count < 2) continue;
++      std::vector<uint64_t> stamps(count);
++      if (dfn.vkGetQueryPoolResults(device->device(), slot.pool, 0, count,
++                                    stamps.size() * sizeof(uint64_t), stamps.data(),
++                                    sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++        continue;
++      }
++      for (uint32_t i = 0; i + 1 < count; ++i) {
++        double ms = double(stamps[i + 1] - stamps[i]) * period_ms;
++        auto [work, pipeline] = slot.labels[i];
++        totals_[size_t(work)] += ms;
++        if (work == GpuWork::kDispatch) dispatch_by_pipeline_[pipeline] += ms;
++      }
++      total_span_ += double(stamps[count - 1] - stamps[0]) * period_ms;
++    }
++    auto now = std::chrono::steady_clock::now();
++    if (now - last_report_ < std::chrono::seconds(1)) return;
++    double seconds = std::chrono::duration<double>(now - last_report_).count();
++    last_report_ = now;
++    std::string line;
++    for (size_t i = 0; i < size_t(GpuWork::kCount); ++i) {
++      line += fmt::format(" {} {:.0f}", kGpuWorkNames[i], totals_[i] / seconds);
++    }
++    std::vector<std::pair<double, VkPipeline>> top;
++    for (auto& [pipeline, ms] : dispatch_by_pipeline_) top.push_back({ms, pipeline});
++    std::sort(top.rbegin(), top.rend());
++    std::string pipelines;
++    for (size_t i = 0; i < top.size() && i < 6; ++i) {
++      pipelines += fmt::format(" {:x}:{:.0f}", uint64_t(top[i].second), top[i].first / seconds);
++    }
++    REXGPU_INFO(
++        "GPU time (ms/s): busy {:.0f},{}, {:.0f} draws/s, {:.0f} copies/s ({:.0f} regions, "
++        "{:.1f} MB/s), {:.0f} image copies/s ({:.1f} Mtexels/s); dispatch pipelines:{}",
++        total_span_ / seconds, line, double(draws_) / seconds, double(copies_) / seconds,
++        double(copy_regions_) / seconds, double(copy_bytes_) / seconds / 1048576.0,
++        double(image_copies_) / seconds, double(image_texels_) / seconds / 1e6, pipelines);
++    copies_ = copy_regions_ = copy_bytes_ = image_copies_ = image_texels_ = 0;
++    totals_ = {};
++    dispatch_by_pipeline_.clear();
++    total_span_ = 0;
++    draws_ = 0;
++  }
++
++  std::array<Slot, 16> slots_;
++  Slot* active_ = nullptr;
++  std::pair<GpuWork, VkPipeline> current_{GpuWork::kOther, VK_NULL_HANDLE};
++  std::array<double, size_t(GpuWork::kCount)> totals_{};
++  std::map<VkPipeline, double> dispatch_by_pipeline_;
++  double total_span_ = 0;
++  uint64_t draws_ = 0;
++  uint64_t copies_ = 0, copy_regions_ = 0, copy_bytes_ = 0, image_copies_ = 0, image_texels_ = 0;
++  std::chrono::steady_clock::time_point last_report_ = std::chrono::steady_clock::now();
++};
++
++}  // namespace
++
+ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
+                                              size_t initial_size)
+     : command_processor_(command_processor) {
+@@ -41,10 +221,45 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+       command_processor_.GetVulkanDevice()->functions();
+   const uintmax_t* stream = command_stream_.data();
+   size_t stream_remaining = command_stream_.size();
++  bool timing = REXCVAR_GET(vulkan_gpu_timing) &&
++                GpuTimer::Get().Begin(command_processor_, command_buffer);
++  VkPipeline compute_pipeline = VK_NULL_HANDLE;
++  auto work_of = [](Command command) {
++    switch (command) {
++      case Command::kVkDraw:
++      case Command::kVkDrawIndexed:
++        return GpuWork::kDraw;
++      case Command::kVkDispatch:
++        return GpuWork::kDispatch;
++      case Command::kVkCopyBuffer:
++        return GpuWork::kCopy;
++      case Command::kVkCopyBufferToImage:
++        return GpuWork::kCopyToImage;
++      case Command::kVkClearAttachments:
++      case Command::kVkClearColorImage:
++        return GpuWork::kClear;
++      case Command::kVkPipelineBarrier:
++        return GpuWork::kBarrier;
++      default:
++        return GpuWork::kOther;
++    }
++  };
+   while (stream_remaining) {
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+     stream_remaining -= kCommandHeaderSizeElements;
++    if (timing) {
++      if (header.command == Command::kVkBindPipeline) {
++        auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
++        if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
++          compute_pipeline = args.pipeline;
++        }
++      }
++      GpuWork work = work_of(header.command);
++      if (work != GpuWork::kOther) {
++        GpuTimer::Get().Before(command_processor_, command_buffer, work, compute_pipeline);
++      }
++    }
+ 
+     switch (header.command) {
+       case Command::kVkBeginRenderPass: {
+@@ -140,6 +355,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkCopyBuffer: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
++        if (timing) {
++          auto* regions = reinterpret_cast<const VkBufferCopy*>(
++              reinterpret_cast<const uint8_t*>(stream) +
++              rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy)));
++          uint64_t bytes = 0;
++          for (uint32_t i = 0; i < args.region_count; ++i) bytes += regions[i].size;
++          GpuTimer::Get().CountCopy(args.region_count, bytes);
++        }
+         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
+                             reinterpret_cast<const VkBufferCopy*>(
+                                 reinterpret_cast<const uint8_t*>(stream) +
+@@ -148,6 +371,17 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkCopyBufferToImage: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
++        if (timing) {
++          auto* regions = reinterpret_cast<const VkBufferImageCopy*>(
++              reinterpret_cast<const uint8_t*>(stream) +
++              rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy)));
++          uint64_t texels = 0;
++          for (uint32_t r = 0; r < args.region_count; ++r) {
++            texels += uint64_t(regions[r].imageExtent.width) * regions[r].imageExtent.height *
++                      regions[r].imageExtent.depth;
++          }
++          GpuTimer::Get().CountImageCopy(texels);
++        }
+         dfn.vkCmdCopyBufferToImage(
+             command_buffer, args.src_buffer, args.dst_image, args.dst_image_layout,
+             args.region_count,
+@@ -322,6 +556,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+     stream += header.arguments_size_elements;
+     stream_remaining -= header.arguments_size_elements;
+   }
++  if (timing) {
++    GpuTimer::Get().End(command_processor_, command_buffer);
++  }
+ }
+ 
+ void DeferredCommandBuffer::CmdVkPipelineBarrier(
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..0c668b3 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -520,6 +520,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   device->properties_.driverVersion = properties.driverVersion;
+   device->properties_.vendorID = properties.vendorID;
+   device->properties_.deviceID = properties.deviceID;
++  device->properties_.timestampPeriod = properties.limits.timestampPeriod;
+   rex::string::copy_truncating(device->properties_.deviceName, properties.deviceName,
+                                sizeof(device->properties_.deviceName));
+ 

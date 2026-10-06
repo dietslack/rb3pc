@@ -26,6 +26,7 @@ set(RB3PC_SOURCES
     src/app_hooks.cpp
     src/shm_cleanup.cpp
     src/boot_speed.cpp
+    src/frame_stats.cpp
     src/save_tweaks.cpp
     src/gpu_wait.cpp
     src/profile.cpp
