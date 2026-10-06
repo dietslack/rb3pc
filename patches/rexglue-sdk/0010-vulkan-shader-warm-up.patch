@@ -1,0 +1,441 @@
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 769c483..5db5dd0 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -339,6 +339,11 @@ class VulkanPipelineCache {
+                                VulkanShader::VulkanTranslation& translation);
+   void SetUpBindingLayouts(VulkanShader& shader);
+   std::unique_ptr<SpirvShaderTranslator> CreateShaderTranslator() const;
++  // Compiles a pipeline for each shader pair from the title's warm-up source
++  // (rex/system/shader_warmup.h) that the list at warmup_list_path doesn't
++  // have yet, so the driver's compiled pixel shaders are in the persistent
++  // VkPipelineCache before the game first draws with them.
++  void WarmUpShaders(const std::filesystem::path& warmup_list_path);
+ 
+   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
+                                             PipelineRenderTarget& render_target_out) const;
+diff --git a/include/rex/system/shader_warmup.h b/include/rex/system/shader_warmup.h
+new file mode 100644
+index 0000000..df00a95
+--- /dev/null
++++ b/include/rex/system/shader_warmup.h
+@@ -0,0 +1,32 @@
++/**
++ * @file        rex/system/shader_warmup.h
++ * @brief       Shaders to compile ahead of time, supplied by the title.
++ *
++ * The first draw with a new pixel shader makes the driver compile a pipeline,
++ * which can take most of a second and stalls the game. A title that knows its
++ * shaders (e.g. from its data files) can register them here; the GPU backend
++ * compiles a pipeline for each while loading the shader storage, into the
++ * persistent pipeline cache, so later draws with them are cache hits.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <functional>
++#include <vector>
++
++namespace rex::system {
++
++struct ShaderWarmupPair {
++  // Guest-endian (big-endian) ucode dwords, as the title hands them to the GPU.
++  std::vector<uint32_t> vertex_ucode;
++  std::vector<uint32_t> pixel_ucode;
++};
++
++using ShaderWarmupSource = std::function<std::vector<ShaderWarmupPair>()>;
++
++// Called once, during shader storage initialization, on a loader thread.
++void SetShaderWarmupSource(ShaderWarmupSource source);
++const ShaderWarmupSource& GetShaderWarmupSource();
++
++}  // namespace rex::system
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index a39c8f7..b5c824d 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -18,6 +18,8 @@
+ #include <set>
+ #include <string>
+ #include <string_view>
++#include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -28,6 +30,7 @@
+ #include <rex/dbg.h>
+ #include <rex/filesystem.h>
+ #include <rex/system/shader_storage_progress.h>
++#include <rex/system/shader_warmup.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/thread.h>
+@@ -753,6 +756,11 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+     }
+   }
+ 
++  if (edram_fragment_shader_interlock) {
++    WarmUpShaders(shader_storage_root /
++                  fmt::format("{:08X}.fsi.warmup", title_id));
++  }
++
+   // If any pipeline descriptions were corrupted (or the whole file has excess
+   // bytes in the end), truncate to the last valid pipeline description.
+   rex::filesystem::TruncateStdioFile(
+@@ -3840,6 +3848,321 @@ void VulkanPipelineCache::LoadVkPipelineCache(const std::filesystem::path& path)
+               data.size(), rex::path_to_utf8(path));
+ }
+ 
++void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list_path) {
++  const rex::system::ShaderWarmupSource& source = rex::system::GetShaderWarmupSource();
++  if (!source) {
++    return;
++  }
++  auto start_time = std::chrono::steady_clock::now();
++  std::vector<rex::system::ShaderWarmupPair> pairs = source();
++  if (pairs.empty()) {
++    return;
++  }
++
++  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const auto& device_properties = vulkan_device->properties();
++
++  // The list is only valid for the VkPipelineCache it was built into: the same
++  // GPU, driver and shader translation settings.
++  struct {
++    uint32_t vendor_id, device_id, driver_version;
++    uint32_t pipeline_version, modification_version;
++    uint32_t resolution_scale_x, resolution_scale_y;
++    uint32_t msaa_2x_attachments, msaa_2x_no_attachments;
++  } salt_source = {device_properties.vendorID,
++                   device_properties.deviceID,
++                   device_properties.driverVersion,
++                   PipelineDescription::kVersion,
++                   SpirvShaderTranslator::Modification::kVersion,
++                   render_target_cache_.draw_resolution_scale_x(),
++                   render_target_cache_.draw_resolution_scale_y(),
++                   uint32_t(render_target_cache_.msaa_2x_attachments_supported()),
++                   uint32_t(render_target_cache_.msaa_2x_no_attachments_supported())};
++  const uint64_t salt = XXH3_64bits(&salt_source, sizeof(salt_source));
++
++  // The list: the salt, then the key of every pair already compiled.
++  std::unordered_set<uint64_t> warmed;
++  if (FILE* file = rex::filesystem::OpenFile(warmup_list_path, "rb")) {
++    uint64_t file_salt = 0;
++    if (fread(&file_salt, sizeof(file_salt), 1, file) == 1 && file_salt == salt) {
++      uint64_t key;
++      while (fread(&key, sizeof(key), 1, file) == 1) {
++        warmed.insert(key);
++      }
++    }
++    fclose(file);
++  }
++
++  struct PairWork {
++    size_t pair_index;
++    uint64_t key;
++    uint64_t vertex_hash, pixel_hash;
++  };
++  std::vector<PairWork> pending;
++  std::unordered_set<uint64_t> pending_keys;
++  for (size_t i = 0; i < pairs.size(); ++i) {
++    const auto& pair = pairs[i];
++    if (pair.vertex_ucode.empty() || pair.pixel_ucode.empty()) {
++      continue;
++    }
++    uint64_t hashes[3] = {
++        XXH3_64bits(pair.vertex_ucode.data(), pair.vertex_ucode.size() * sizeof(uint32_t)),
++        XXH3_64bits(pair.pixel_ucode.data(), pair.pixel_ucode.size() * sizeof(uint32_t)), salt};
++    uint64_t key = XXH3_64bits(hashes, sizeof(hashes));
++    if (warmed.count(key) || !pending_keys.insert(key).second) {
++      continue;
++    }
++    pending.push_back({i, key, hashes[0], hashes[1]});
++  }
++  if (pending.empty()) {
++    REXGPU_INFO("Shader warm-up: all {} shader pairs already compiled", pairs.size());
++    return;
++  }
++  REXGPU_INFO("Shader warm-up: compiling {} of {} shader pairs", pending.size(), pairs.size());
++
++  auto& progress = rex::system::shader_storage_progress();
++  progress.total += uint32_t(pending.size());
++
++  // One shader object per distinct ucode (many pairs share a vertex shader).
++  // These are private to the warm-up and freed with it, so the game's own
++  // shaders (and the shader storage) are untouched.
++  std::unordered_map<uint64_t, std::unique_ptr<VulkanShader>> shaders;
++  auto get_shader = [&](xenos::ShaderType type, const std::vector<uint32_t>& ucode,
++                        uint64_t hash) {
++    auto& shader = shaders[hash];
++    if (!shader) {
++      shader = std::make_unique<VulkanShader>(vulkan_device, type, hash, ucode.data(),
++                                              uint32_t(ucode.size()));
++    }
++    return shader.get();
++  };
++
++  uint32_t processors = std::max(rex::thread::logical_processor_count(), uint32_t(1));
++  size_t thread_count = std::max(processors * 3 / 4, uint32_t(1));
++  auto run_parallel = [thread_count](size_t count, const std::function<void(size_t)>& work) {
++    std::atomic<size_t> next(0);
++    auto worker = [&]() {
++      for (size_t i; (i = next.fetch_add(1)) < count;) {
++        work(i);
++      }
++    };
++    size_t threads = std::min(thread_count, count);
++    if (threads <= 1) {
++      worker();
++      return;
++    }
++    std::vector<std::unique_ptr<rex::thread::Thread>> handles;
++    for (size_t i = 0; i < threads; ++i) {
++      auto thread = rex::thread::Thread::Create({}, worker);
++      assert_not_null(thread);
++      thread->set_name("Shader Warm-up");
++      handles.push_back(std::move(thread));
++    }
++    for (const auto& thread : handles) {
++      rex::thread::Wait(thread.get(), false);
++    }
++  };
++
++  // Analyze every distinct shader.
++  std::vector<VulkanShader*> vertex_shaders(pending.size()), pixel_shaders(pending.size());
++  for (size_t i = 0; i < pending.size(); ++i) {
++    const auto& pair = pairs[pending[i].pair_index];
++    vertex_shaders[i] =
++        get_shader(xenos::ShaderType::kVertex, pair.vertex_ucode, pending[i].vertex_hash);
++    pixel_shaders[i] =
++        get_shader(xenos::ShaderType::kPixel, pair.pixel_ucode, pending[i].pixel_hash);
++  }
++  {
++    std::vector<VulkanShader*> unique_shaders;
++    for (auto& entry : shaders) {
++      unique_shaders.push_back(entry.second.get());
++    }
++    run_parallel(unique_shaders.size(), [&](size_t i) {
++      string::StringBuffer disasm_buffer;
++      unique_shaders[i]->AnalyzeUcode(disasm_buffer);
++    });
++  }
++
++  // The modifications a typical draw with the pair gets (see
++  // GetCurrentVertexShaderModification / GetCurrentPixelShaderModification):
++  // no dynamic register count beyond the static bound, no point sprites,
++  // user clip planes or PsParamGen, single-sampled.
++  auto modifications = [&](const Shader& vertex_shader, const Shader& pixel_shader) {
++    reg::SQ_PROGRAM_CNTL program_cntl;
++    program_cntl.value = 0;
++    program_cntl.vs_num_reg = std::max(vertex_shader.register_static_address_bound(), 1u) - 1;
++    program_cntl.ps_num_reg = std::max(pixel_shader.register_static_address_bound(), 1u) - 1;
++    reg::SQ_CONTEXT_MISC context_misc;
++    context_misc.value = 0;
++    uint32_t param_gen_pos;
++    uint32_t interpolator_mask =
++        vertex_shader.writes_interpolators() &
++        pixel_shader.GetInterpolatorInputMask(program_cntl, context_misc, param_gen_pos);
++
++    SpirvShaderTranslator::Modification vertex_modification(
++        shader_translator_->GetDefaultVertexShaderModification(
++            vertex_shader.GetDynamicAddressableRegisterCount(program_cntl.vs_num_reg),
++            Shader::HostVertexShaderType::kVertex));
++    vertex_modification.vertex.interpolator_mask = interpolator_mask;
++    vertex_modification.vertex.vertex_kill_and =
++        uint32_t(device_properties.shaderCullDistance &&
++                 (vertex_shader.writes_point_size_edge_flag_kill_vertex() & 0b100));
++
++    SpirvShaderTranslator::Modification pixel_modification(
++        shader_translator_->GetDefaultPixelShaderModification(
++            pixel_shader.GetDynamicAddressableRegisterCount(program_cntl.ps_num_reg)));
++    pixel_modification.pixel.interpolator_mask = interpolator_mask;
++    return std::make_pair(vertex_modification.value, pixel_modification.value);
++  };
++
++  VkRenderPass render_pass = VK_NULL_HANDLE;
++  if (!(REXCVAR_GET(vulkan_dynamic_rendering) && device_properties.dynamicRendering)) {
++    render_pass = render_target_cache_.GetFragmentShaderInterlockRenderPass();
++    if (render_pass == VK_NULL_HANDLE) {
++      return;
++    }
++  }
++
++  // The driver's compiled pixel shader is what's worth caching (any pipeline
++  // using it afterwards is a cache hit), so compile one pipeline per distinct
++  // pixel shader translation. The other pairs are covered by it.
++  struct Unique {
++    size_t first;                    // index into pending
++    std::vector<size_t> covered;     // pending indices this one stands for
++    uint64_t vertex_modification, pixel_modification;
++  };
++  std::vector<Unique> uniques;
++  {
++    std::unordered_map<uint64_t, size_t> unique_of_translation;
++    for (size_t i = 0; i < pending.size(); ++i) {
++      auto [vertex_modification, pixel_modification] =
++          modifications(*vertex_shaders[i], *pixel_shaders[i]);
++      uint64_t translation_key[2] = {pending[i].pixel_hash, pixel_modification};
++      auto [it, inserted] = unique_of_translation.emplace(
++          XXH3_64bits(translation_key, sizeof(translation_key)), uniques.size());
++      if (inserted) {
++        uniques.push_back({i, {}, vertex_modification, pixel_modification});
++      }
++      uniques[it->second].covered.push_back(i);
++    }
++  }
++  progress.total -= uint32_t(pending.size() - uniques.size());
++
++  // In batches, so only one batch's SPIR-V is held at a time.
++  constexpr size_t kBatchSize = 256;
++  std::mutex layout_mutex;
++  std::atomic<uint32_t> compiled(0);
++  std::vector<uint64_t> done_keys;
++  bool list_started = !warmed.empty();
++  auto last_save = std::chrono::steady_clock::now();
++  for (size_t batch_start = 0; batch_start < uniques.size(); batch_start += kBatchSize) {
++    size_t batch_end = std::min(batch_start + kBatchSize, uniques.size());
++
++    // Create the translations serially (vertex shaders are shared), then
++    // translate on all threads.
++    struct Item {
++      VulkanShader::VulkanTranslation* vertex;
++      VulkanShader::VulkanTranslation* pixel;
++    };
++    std::vector<Item> items(batch_end - batch_start);
++    std::vector<VulkanShader::VulkanTranslation*> to_translate;
++    for (size_t u = batch_start; u < batch_end; ++u) {
++      const Unique& unique = uniques[u];
++      Item& item = items[u - batch_start];
++      bool vertex_new = false, pixel_new = false;
++      item.vertex = static_cast<VulkanShader::VulkanTranslation*>(
++          vertex_shaders[unique.first]->GetOrCreateTranslation(unique.vertex_modification,
++                                                               &vertex_new));
++      item.pixel = static_cast<VulkanShader::VulkanTranslation*>(
++          pixel_shaders[unique.first]->GetOrCreateTranslation(unique.pixel_modification,
++                                                              &pixel_new));
++      if (vertex_new) to_translate.push_back(item.vertex);
++      if (pixel_new) to_translate.push_back(item.pixel);
++    }
++    run_parallel(to_translate.size(), [&](size_t i) {
++      thread_local std::unique_ptr<SpirvShaderTranslator> translator;
++      if (!translator) translator = CreateShaderTranslator();
++      TranslateShaderToModule(*translator, *to_translate[i]);
++    });
++    {
++      std::unordered_set<VulkanShader*> set_up;
++      for (auto* translation : to_translate) {
++        auto& shader = static_cast<VulkanShader&>(translation->shader());
++        if (set_up.insert(&shader).second) SetUpBindingLayouts(shader);
++      }
++    }
++
++    run_parallel(items.size(), [&](size_t index) {
++      const Item& item = items[index];
++      if (item.vertex->is_valid() && item.pixel->is_valid()) {
++        const PipelineLayoutProvider* pipeline_layout;
++        {
++          std::lock_guard<std::mutex> lock(layout_mutex);
++          auto& pixel_shader = static_cast<const VulkanShader&>(item.pixel->shader());
++          auto& vertex_shader = static_cast<const VulkanShader&>(item.vertex->shader());
++          pipeline_layout = command_processor_.GetPipelineLayout(
++              pixel_shader.GetTextureBindingsAfterTranslation().size(),
++              pixel_shader.GetSamplerBindingsAfterTranslation().size(),
++              vertex_shader.GetTextureBindingsAfterTranslation().size(),
++              vertex_shader.GetSamplerBindingsAfterTranslation().size());
++        }
++        if (pipeline_layout) {
++          // A common state: a back-face-culled triangle list (with FSI, the
++          // render target and blend state live in the shader, not here).
++          PipelineDescription description;
++          description.vertex_shader_hash = item.vertex->shader().ucode_data_hash();
++          description.vertex_shader_modification = item.vertex->modification();
++          description.pixel_shader_hash = item.pixel->shader().ucode_data_hash();
++          description.pixel_shader_modification = item.pixel->modification();
++          description.primitive_topology = PipelinePrimitiveTopology::kTriangleList;
++          description.cull_back = 1;
++          std::pair<const PipelineDescription, Pipeline> pipeline(description, Pipeline());
++          PipelineCreationArguments creation_arguments;
++          creation_arguments.pipeline = &pipeline;
++          creation_arguments.pipeline_layout = pipeline_layout;
++          creation_arguments.vertex_shader = item.vertex;
++          creation_arguments.pixel_shader = item.pixel;
++          creation_arguments.render_pass = render_pass;
++          if (EnsurePipelineCreated(creation_arguments)) {
++            compiled.fetch_add(1);
++          }
++          VkPipeline created = pipeline.second.pipeline.load(std::memory_order_acquire);
++          if (created != VK_NULL_HANDLE) {
++            dfn.vkDestroyPipeline(vulkan_device->device(), created, nullptr);
++          }
++        }
++      }
++      progress.done.fetch_add(1);
++    });
++
++    // Free the batch's pixel shader SPIR-V.
++    for (size_t u = batch_start; u < batch_end; ++u) {
++      pixel_shaders[uniques[u].first]->DestroyTranslation(uniques[u].pixel_modification);
++      for (size_t i : uniques[u].covered) done_keys.push_back(pending[i].key);
++    }
++
++    // Record pairs only once their pipelines are in the saved VkPipelineCache,
++    // so a warm-up cut short by quitting resumes where it left off. The cache
++    // file is rewritten whole, so not after every batch.
++    bool last_batch = batch_end == uniques.size();
++    if (last_batch || std::chrono::steady_clock::now() - last_save > std::chrono::seconds(20)) {
++      SaveVkPipelineCache(true);
++      last_save = std::chrono::steady_clock::now();
++      if (FILE* file = rex::filesystem::OpenFile(warmup_list_path, list_started ? "ab" : "wb")) {
++        if (!list_started) fwrite(&salt, sizeof(salt), 1, file);
++        fwrite(done_keys.data(), sizeof(uint64_t), done_keys.size(), file);
++        fclose(file);
++        list_started = true;
++      }
++      done_keys.clear();
++    }
++  }
++
++  REXGPU_INFO("Shader warm-up: compiled {} pipelines in {:.1f} s", compiled.load(),
++              std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
++}
++
+ void VulkanPipelineCache::SaveVkPipelineCache(bool force) {
+   if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) return;
+   std::lock_guard<std::mutex> lock(vk_pipeline_cache_save_lock_);
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 61fa813..d2f0589 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/system/gpu_plugin.h>
+ #include <rex/system/shader_storage_progress.h>
++#include <rex/system/shader_warmup.h>
+ 
+ #include <filesystem>
+ #include <string>
+@@ -108,4 +109,19 @@ ShaderStorageProgress& shader_storage_progress() {
+   return progress;
+ }
+ 
++namespace {
++ShaderWarmupSource& WarmupSourceStorage() {
++  static ShaderWarmupSource source;
++  return source;
++}
++}  // namespace
++
++void SetShaderWarmupSource(ShaderWarmupSource source) {
++  WarmupSourceStorage() = std::move(source);
++}
++
++const ShaderWarmupSource& GetShaderWarmupSource() {
++  return WarmupSourceStorage();
++}
++
+ }  // namespace rex::system
