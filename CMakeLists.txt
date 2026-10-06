@@ -24,6 +24,7 @@ set(RB3PC_SOURCES
     src/main.cpp
     src/debug_hooks.cpp
     src/app_hooks.cpp
+    src/xekeys.cpp
     src/shm_cleanup.cpp
     src/boot_speed.cpp
     src/frame_stats.cpp
@@ -31,6 +32,7 @@ set(RB3PC_SOURCES
     src/gpu_wait.cpp
     src/profile.cpp
     src/shader_warmup.cpp
+    src/sha1.cpp
     src/xam_trace.cpp
     src/kernel_trace.cpp
 )
