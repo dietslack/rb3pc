@@ -1,0 +1,513 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 25e2209..2970173 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -51,6 +51,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   enum class SingleTransientDescriptorLayout {
+     kStorageBufferCompute,
+     kStorageBufferPairCompute,
++    kStorageImageCompute,
+     kCount,
+   };
+ 
+@@ -597,9 +598,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
+   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
+   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
++  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageImage;
+   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
+   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
+   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
++  ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_image_;
+   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
+   std::array<std::vector<VkDescriptorSet>, size_t(SingleTransientDescriptorLayout::kCount)>
+       single_transient_descriptors_free_;
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee..f0e5b32 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -191,6 +191,8 @@ class VulkanTextureCache final : public TextureCache {
+     enum class Usage {
+       kUndefined,
+       kTransferDestination,
++      // Written by a compute shader (StoreLoadedTexture).
++      kStorageDestination,
+       kGuestShaderSampled,
+       kSwapSampled,
+     };
+@@ -210,6 +212,13 @@ class VulkanTextureCache final : public TextureCache {
+     }
+ 
+     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
++
++    // For textures created with a storage view format (see
++    // VulkanTextureCache::GetStorageLoadFormat), the view a compute shader
++    // stores the loaded texels through; VK_NULL_HANDLE otherwise.
++    VkFormat storage_load_format() const { return storage_load_format_; }
++    void set_storage_load_format(VkFormat format) { storage_load_format_ = format; }
++    VkImageView GetStorageLoadView();
+     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+ 
+    private:
+@@ -266,6 +275,8 @@ class VulkanTextureCache final : public TextureCache {
+     Usage usage_ = Usage::kUndefined;
+ 
+     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
++    VkFormat storage_load_format_ = VK_FORMAT_UNDEFINED;
++    VkImageView storage_load_view_ = VK_NULL_HANDLE;
+     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
+     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
+     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
+@@ -347,6 +358,16 @@ class VulkanTextureCache final : public TextureCache {
+   HostFormatPair host_formats_[64];
+ 
+   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
++  // Stores loaded texels straight into a texture through a storage image
++  // view, instead of copying the load buffer to the image
++  // (vkCmdCopyBufferToImage was ~25% of the GPU's time in RB3). Indexed by
++  // log2(bytes per texel) - 2, for 4, 8 and 16 bytes.
++  VkPipelineLayout store_pipeline_layout_ = VK_NULL_HANDLE;
++  std::array<VkPipeline, 3> store_pipelines_{};
++  // The integer format with the same texel size as an uncompressed host
++  // format, for its storage view; VK_FORMAT_UNDEFINED if the direct store
++  // can't be used for it.
++  VkFormat GetStorageLoadFormat(VkFormat host_format) const;
+   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
+   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 3756159..0c4f7c3 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -570,6 +570,9 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
+ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
+     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
+ 
++const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageImage = {
++    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kLinkedTypeDescriptorPoolSetCount};
++
+ // 2x descriptors for texture images because of unsigned and signed bindings.
+ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeTextures[2] = {
+     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * kLinkedTypeDescriptorPoolSetCount},
+@@ -588,6 +591,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+               ->vulkan_device(),
+           &kDescriptorPoolSizeStorageBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
++      transient_descriptor_allocator_storage_image_(
++          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
++              ->vulkan_device(),
++          &kDescriptorPoolSizeStorageImage, 1, kLinkedTypeDescriptorPoolSetCount),
+       transient_descriptor_allocator_textures_(
+           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+               ->vulkan_device(),
+@@ -889,6 +896,21 @@ bool VulkanCommandProcessor::SetupContext() {
+         "buffers bound to the compute shader");
+     return false;
+   }
++  // Transient: storage image for compute shaders.
++  VkDescriptorSetLayoutBinding descriptor_set_layout_binding_storage_image =
++      descriptor_set_layout_binding_transient;
++  descriptor_set_layout_binding_storage_image.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++  descriptor_set_layout_create_info.bindingCount = 1;
++  descriptor_set_layout_create_info.pBindings = &descriptor_set_layout_binding_storage_image;
++  if (dfn.vkCreateDescriptorSetLayout(
++          device, &descriptor_set_layout_create_info, nullptr,
++          &descriptor_set_layouts_single_transient_[size_t(
++              SingleTransientDescriptorLayout::kStorageImageCompute)]) != VK_SUCCESS) {
++    REXGPU_ERROR(
++        "Failed to create a Vulkan descriptor set layout for a storage image "
++        "bound to the compute shader");
++    return false;
++  }
+ 
+   shared_memory_ =
+       std::make_unique<VulkanSharedMemory>(*this, *memory_, guest_shader_pipeline_stages_);
+@@ -3284,12 +3306,16 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
+     bool is_storage_buffer =
+         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferCompute ||
+         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute;
++    bool is_storage_image =
++        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageImageCompute;
+     ui::vulkan::LinkedTypeDescriptorSetAllocator& transient_descriptor_allocator =
+-        is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
+-                          : transient_descriptor_allocator_uniform_buffer_;
++        is_storage_image    ? transient_descriptor_allocator_storage_image_
++        : is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
++                            : transient_descriptor_allocator_uniform_buffer_;
+     VkDescriptorPoolSize descriptor_count;
+-    descriptor_count.type =
+-        is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    descriptor_count.type = is_storage_image    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
++                            : is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
++                                                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+     descriptor_count.descriptorCount =
+         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute
+             ? 2
+@@ -4410,7 +4436,6 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+                                      written_length)) {
+     return false;
+   }
+-
+   if (!written_length) {
+     return true;
+   }
+@@ -5521,6 +5546,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+   }
+   single_transient_descriptors_used_.clear();
+   transient_descriptor_allocator_storage_buffer_.Reset();
++  transient_descriptor_allocator_storage_image_.Reset();
+   transient_descriptor_allocator_uniform_buffer_.Reset();
+ }
+ 
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..c40244d 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -13,7 +13,9 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstring>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+@@ -478,6 +480,14 @@ VulkanTextureCache::~VulkanTextureCache() {
+       dfn.vkDestroyPipeline(device, load_pipeline, nullptr);
+     }
+   }
++  for (VkPipeline store_pipeline : store_pipelines_) {
++    if (store_pipeline != VK_NULL_HANDLE) {
++      dfn.vkDestroyPipeline(device, store_pipeline, nullptr);
++    }
++  }
++  if (store_pipeline_layout_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyPipelineLayout(device, store_pipeline_layout_, nullptr);
++  }
+   if (load_pipeline_layout_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyPipelineLayout(device, load_pipeline_layout_, nullptr);
+   }
+@@ -1160,6 +1170,20 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+   if (key.dimension == xenos::DataDimension::kCube) {
+     image_create_info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   }
++  // Single-level 2D textures (render-to-texture targets, mostly) get an
++  // integer storage view so loads can store into them directly.
++  VkFormat storage_load_format = VK_FORMAT_UNDEFINED;
++  if (key.dimension != xenos::DataDimension::k3D && key.dimension != xenos::DataDimension::kCube &&
++      key.GetDepthOrArraySize() == 1 && key.mip_max_level == 0) {
++    storage_load_format = GetStorageLoadFormat(formats[0]);
++    if (formats[1] != VK_FORMAT_UNDEFINED &&
++        GetStorageLoadFormat(formats[1]) != storage_load_format) {
++      storage_load_format = VK_FORMAT_UNDEFINED;
++    }
++  }
++  if (storage_load_format != VK_FORMAT_UNDEFINED) {
++    image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++  }
+   image_create_info.imageType = is_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+   image_create_info.format = formats[0];
+   image_create_info.extent.width = key.GetWidth();
+@@ -1174,19 +1198,28 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++  if (storage_load_format != VK_FORMAT_UNDEFINED) {
++    image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++  }
+   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   image_create_info.queueFamilyIndexCount = 0;
+   image_create_info.pQueueFamilyIndices = nullptr;
+   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+   VkImageFormatListCreateInfo image_format_list_create_info;
+-  if (formats[1] != VK_FORMAT_UNDEFINED &&
+-      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
++  VkFormat view_formats[3];
++  uint32_t view_format_count = 0;
++  view_formats[view_format_count++] = formats[0];
++  if (formats[1] != VK_FORMAT_UNDEFINED) view_formats[view_format_count++] = formats[1];
++  if (storage_load_format != VK_FORMAT_UNDEFINED) {
++    view_formats[view_format_count++] = storage_load_format;
++  }
++  if (view_format_count > 1 && vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
+     image_create_info_last->pNext = &image_format_list_create_info;
+     image_create_info_last = reinterpret_cast<VkImageCreateInfo*>(&image_format_list_create_info);
+     image_format_list_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+     image_format_list_create_info.pNext = nullptr;
+-    image_format_list_create_info.viewFormatCount = 2;
+-    image_format_list_create_info.pViewFormats = formats;
++    image_format_list_create_info.viewFormatCount = view_format_count;
++    image_format_list_create_info.pViewFormats = view_formats;
+   }
+ 
+   VmaAllocationCreateInfo allocation_create_info = {};
+@@ -1199,7 +1232,54 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+     return nullptr;
+   }
+ 
+-  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
++  auto texture = std::make_unique<VulkanTexture>(*this, key, image, allocation);
++  texture->set_storage_load_format(storage_load_format);
++  return texture;
++}
++
++VkFormat VulkanTextureCache::GetStorageLoadFormat(VkFormat host_format) const {
++  uint32_t size_log2;
++  switch (host_format) {
++    case VK_FORMAT_R8G8B8A8_UNORM:
++    case VK_FORMAT_R8G8B8A8_SNORM:
++    case VK_FORMAT_R8G8B8A8_UINT:
++    case VK_FORMAT_R8G8B8A8_SINT:
++    case VK_FORMAT_R8G8B8A8_SRGB:
++    case VK_FORMAT_B8G8R8A8_UNORM:
++    case VK_FORMAT_B8G8R8A8_SRGB:
++    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
++    case VK_FORMAT_A8B8G8R8_SNORM_PACK32:
++    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
++    case VK_FORMAT_R16G16_UNORM:
++    case VK_FORMAT_R16G16_SNORM:
++    case VK_FORMAT_R16G16_SFLOAT:
++    case VK_FORMAT_R32_SFLOAT:
++    case VK_FORMAT_R32_UINT:
++    case VK_FORMAT_R32_SINT:
++      size_log2 = 2;
++      break;
++    case VK_FORMAT_R16G16B16A16_UNORM:
++    case VK_FORMAT_R16G16B16A16_SNORM:
++    case VK_FORMAT_R16G16B16A16_SFLOAT:
++    case VK_FORMAT_R32G32_SFLOAT:
++    case VK_FORMAT_R32G32_UINT:
++      size_log2 = 3;
++      break;
++    case VK_FORMAT_R32G32B32A32_SFLOAT:
++    case VK_FORMAT_R32G32B32A32_UINT:
++      size_log2 = 4;
++      break;
++    default:
++      return VK_FORMAT_UNDEFINED;
++  }
++  if (store_pipelines_[size_log2 - 2] == VK_NULL_HANDLE) {
++    return VK_FORMAT_UNDEFINED;
++  }
++  static constexpr VkFormat kStorageFormats[] = {VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT,
++                                                 VK_FORMAT_R32G32B32A32_UINT};
++  return kStorageFormats[size_log2 - 2];
+ }
+ 
+ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
+@@ -1217,7 +1297,6 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                                                bool load_mips) {
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
+-
+   // Get the pipeline.
+   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
+   bool host_format_is_signed;
+@@ -1717,6 +1796,81 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     }
+   }
+ 
++  // Single-level textures with a storage view: store the loaded texels into
++  // the image with a compute shader rather than copying the buffer to it.
++  if (level_first == 0 && level_last == 0 && level_packed > 0 && !host_format.block_compressed &&
++      vulkan_texture.storage_load_format() != VK_FORMAT_UNDEFINED) {
++    uint32_t bytes_per_texel = load_shader_info.bytes_per_host_block;
++    uint32_t store_index = bytes_per_texel == 4 ? 0 : bytes_per_texel == 8 ? 1 : 2;
++    VkImageView storage_view = vulkan_texture.GetStorageLoadView();
++    VkDescriptorSet descriptor_set_store_source = command_processor_.AllocateSingleTransientDescriptor(
++        VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
++    VkDescriptorSet descriptor_set_store_dest = command_processor_.AllocateSingleTransientDescriptor(
++        VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
++    if ((bytes_per_texel == 4 || bytes_per_texel == 8 || bytes_per_texel == 16) &&
++        store_pipelines_[store_index] != VK_NULL_HANDLE && storage_view != VK_NULL_HANDLE &&
++        descriptor_set_store_source != VK_NULL_HANDLE &&
++        descriptor_set_store_dest != VK_NULL_HANDLE) {
++      VkDescriptorBufferInfo store_source_info = {scratch_buffer, 0, host_buffer_size};
++      VkDescriptorImageInfo store_dest_info = {VK_NULL_HANDLE, storage_view,
++                                               VK_IMAGE_LAYOUT_GENERAL};
++      VkWriteDescriptorSet store_writes[2] = {};
++      store_writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++      store_writes[0].dstSet = descriptor_set_store_source;
++      store_writes[0].descriptorCount = 1;
++      store_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++      store_writes[0].pBufferInfo = &store_source_info;
++      store_writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++      store_writes[1].dstSet = descriptor_set_store_dest;
++      store_writes[1].descriptorCount = 1;
++      store_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++      store_writes[1].pImageInfo = &store_dest_info;
++      dfn.vkUpdateDescriptorSets(device, 2, store_writes, 0, nullptr);
++
++      command_processor_.PushBufferMemoryBarrier(
++          scratch_buffer, 0, VK_WHOLE_SIZE,
++          scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
++          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++          scratch_buffer_acquisition.SetAccessMask(VK_ACCESS_SHADER_READ_BIT),
++          VK_ACCESS_SHADER_READ_BIT);
++      vulkan_texture.MarkAsUsed();
++      VulkanTexture::Usage store_old_usage =
++          vulkan_texture.SetUsage(VulkanTexture::Usage::kStorageDestination);
++      VkPipelineStageFlags store_src_stage_mask, store_dst_stage_mask;
++      VkAccessFlags store_src_access_mask, store_dst_access_mask;
++      VkImageLayout store_old_layout, store_new_layout;
++      GetTextureUsageMasks(store_old_usage, store_src_stage_mask, store_src_access_mask,
++                           store_old_layout);
++      GetTextureUsageMasks(VulkanTexture::Usage::kStorageDestination, store_dst_stage_mask,
++                           store_dst_access_mask, store_new_layout);
++      // The whole image is overwritten, so its old contents can be dropped.
++      command_processor_.PushImageMemoryBarrier(
++          vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
++          store_src_stage_mask ? store_src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++          store_dst_stage_mask, 0, store_dst_access_mask, VK_IMAGE_LAYOUT_UNDEFINED,
++          store_new_layout);
++      command_processor_.SubmitBarriers(true);
++
++      command_processor_.BindExternalComputePipeline(store_pipelines_[store_index]);
++      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                             store_pipeline_layout_, 0, 1,
++                                             &descriptor_set_store_source, 0, nullptr);
++      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                             store_pipeline_layout_, 1, 1,
++                                             &descriptor_set_store_dest, 0, nullptr);
++      uint32_t store_constants[4] = {
++          uint32_t(host_layout_base.offset_bytes / bytes_per_texel),
++          host_layout_base.x_pitch_blocks * host_block_width,
++          std::max(width * texture_resolution_scale_x, UINT32_C(1)),
++          std::max(height * texture_resolution_scale_y, UINT32_C(1))};
++      command_buffer.CmdVkPushConstants(store_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                        sizeof(store_constants), store_constants);
++      command_buffer.CmdVkDispatch((store_constants[2] + 15) / 16, (store_constants[3] + 7) / 8,
++                                   1);
++      return true;
++    }
++  }
++
+   // Submit copying from the copy buffer to the host texture.
+   command_processor_.PushBufferMemoryBarrier(
+       scratch_buffer, 0, VK_WHOLE_SIZE,
+@@ -1735,6 +1889,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                          texture_old_layout);
+     GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, texture_dst_stage_mask,
+                          texture_dst_access_mask, texture_new_layout);
++    // Every level is about to be overwritten, so the old contents can be
++    // discarded rather than preserved through the layout transition (RB3
++    // reloads one 512x512 shadow map ~115 times a frame).
++    if (level_first == 0 && level_last == texture_key.mip_max_level) {
++      texture_old_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++      texture_src_access_mask = 0;
++    }
+     command_processor_.PushImageMemoryBarrier(
+         vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+         texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+@@ -1857,9 +2018,33 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
+   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
+   }
++  if (storage_load_view_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyImageView(device, storage_load_view_, nullptr);
++  }
+   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
+ }
+ 
++VkImageView VulkanTextureCache::VulkanTexture::GetStorageLoadView() {
++  if (storage_load_view_ != VK_NULL_HANDLE || storage_load_format_ == VK_FORMAT_UNDEFINED) {
++    return storage_load_view_;
++  }
++  const VulkanTextureCache& vulkan_texture_cache =
++      static_cast<const VulkanTextureCache&>(texture_cache());
++  const ui::vulkan::VulkanDevice* const vulkan_device =
++      vulkan_texture_cache.command_processor_.GetVulkanDevice();
++  VkImageViewCreateInfo view_create_info = {};
++  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++  view_create_info.image = image_;
++  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++  view_create_info.format = storage_load_format_;
++  view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
++  if (vulkan_device->functions().vkCreateImageView(vulkan_device->device(), &view_create_info,
++                                                   nullptr, &storage_load_view_) != VK_SUCCESS) {
++    storage_load_view_ = VK_NULL_HANDLE;
++  }
++  return storage_load_view_;
++}
++
+ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
+                                                        bool is_array) {
+   xenos::DataDimension dimension = key().dimension;
+@@ -2955,6 +3140,62 @@ bool VulkanTextureCache::Initialize() {
+     }
+   }
+ 
++  // Direct stores of loaded texels (see store_pipelines_). Optional: textures
++  // fall back to the buffer-to-image copy without them.
++  {
++    VkDescriptorSetLayout store_set_layouts[] = {
++        command_processor_.GetSingleTransientDescriptorLayout(
++            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute),
++        command_processor_.GetSingleTransientDescriptorLayout(
++            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute)};
++    VkPushConstantRange store_push_constants = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                                sizeof(uint32_t) * 4};
++    VkPipelineLayoutCreateInfo store_layout_info = {};
++    store_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    store_layout_info.setLayoutCount = 2;
++    store_layout_info.pSetLayouts = store_set_layouts;
++    store_layout_info.pushConstantRangeCount = 1;
++    store_layout_info.pPushConstantRanges = &store_push_constants;
++    if (store_set_layouts[1] != VK_NULL_HANDLE &&
++        dfn.vkCreatePipelineLayout(device, &store_layout_info, nullptr, &store_pipeline_layout_) ==
++            VK_SUCCESS) {
++      static constexpr const char* kElement[] = {"uint", "uvec2", "uvec4"};
++      static constexpr const char* kImageFormat[] = {"r32ui", "rg32ui", "rgba32ui"};
++      static constexpr const char* kToVec4[] = {"uvec4(v, 0u, 0u, 0u)", "uvec4(v, 0u, 0u)", "v"};
++      for (size_t i = 0; i < store_pipelines_.size(); ++i) {
++        std::string source = fmt::format(R"(#version 450
++layout(local_size_x = 16, local_size_y = 8) in;
++layout(push_constant) uniform Constants {{
++  uint offset;  // in texels
++  uint pitch;   // in texels
++  uint width;
++  uint height;
++}} c;
++layout(std430, set = 0, binding = 0) readonly buffer Source {{ {0} texels[]; }} source;
++layout(set = 1, binding = 0, {1}) uniform writeonly uimage2D dest;
++void main() {{
++  uvec2 xy = gl_GlobalInvocationID.xy;
++  if (xy.x >= c.width || xy.y >= c.height) {{
++    return;
++  }}
++  {0} v = source.texels[c.offset + xy.y * c.pitch + xy.x];
++  imageStore(dest, ivec2(xy), {2});
++}}
++)",
++                                         kElement[i], kImageFormat[i], kToVec4[i]);
++        std::vector<uint32_t> spirv;
++        std::string error;
++        if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source, spirv,
++                                                   error)) {
++          REXGPU_WARN("VulkanTextureCache: Failed to compile the texture store shader: {}", error);
++          continue;
++        }
++        store_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
++            vulkan_device, store_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
++      }
++    }
++  }
++
+   // Use true null descriptors when supported; otherwise, keep compatibility
+   // fallback null images.
+   if (device_properties.nullDescriptor) {
+@@ -3224,6 +3465,11 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
+       access_mask = VK_ACCESS_TRANSFER_WRITE_BIT;
+       layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+       break;
++    case VulkanTexture::Usage::kStorageDestination:
++      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
++      layout = VK_IMAGE_LAYOUT_GENERAL;
++      break;
+     case VulkanTexture::Usage::kGuestShaderSampled:
+       stage_mask = guest_shader_pipeline_stages_;
+       access_mask = VK_ACCESS_SHADER_READ_BIT;
