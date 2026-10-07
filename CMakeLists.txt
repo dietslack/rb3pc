@@ -28,6 +28,8 @@ set(RB3PC_SOURCES
     src/shm_cleanup.cpp
     src/boot_speed.cpp
     src/frame_stats.cpp
+    src/title_icon.cpp
+    src/loading_screen.cpp
     src/rb3_assets.cpp
     src/save_tweaks.cpp
     src/gpu_wait.cpp

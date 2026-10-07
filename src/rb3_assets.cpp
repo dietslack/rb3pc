@@ -201,6 +201,96 @@ Rgba8Image DecodeDxt(const EmbeddedBitmap& bmp) {
   return img;
 }
 
+// RndFont rev 17 ends with: Vector2 tex cell size, u32 count, count x
+// (u16 char, f32 u, f32 v, f32 width, f32 advance), next-font name.
+bool ParseFontGlyphs(std::string_view obj, BitmapFont& font) {
+  auto* p = reinterpret_cast<const uint8_t*>(obj.data());
+  size_t end = obj.size();
+  for (size_t name_len = 0; name_len < 128 && end >= 16 + name_len; ++name_len) {
+    size_t tail = end - 4 - name_len;
+    if (Be32(p + tail) != name_len) continue;
+    for (size_t count = 1; count < 2048 && tail >= 12 + count * 18; ++count) {
+      size_t start = tail - count * 18;
+      if (Be32(p + start - 4) != count) continue;
+      font.cell_u = BeF32(p + start - 12);
+      font.cell_v = BeF32(p + start - 8);
+      for (size_t i = 0; i < count; ++i) {
+        const uint8_t* e = p + start + i * 18;
+        font.glyphs[Be16(e)] = {BeF32(e + 2), BeF32(e + 6), BeF32(e + 10), BeF32(e + 14)};
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
+
+Rb3UiAssets LoadRb3UiAssets(const fs::path& game_root, const std::vector<UiImageRequest>& images,
+                            const std::vector<UiFontRequest>& fonts) {
+  Rb3UiAssets assets;
+  Ark ark;
+  if (!ark.Open(game_root)) {
+    REXLOG_WARN("UI assets: couldn't read {}/gen/main_xbox.hdr", game_root.string());
+    return assets;
+  }
+
+  std::unordered_map<std::string, std::vector<uint8_t>> milos;
+  std::unordered_map<std::string, std::unordered_map<std::string, MiloObject>> dirs;
+  auto directory = [&](const std::string& path) -> const auto& {
+    auto it = dirs.find(path);
+    if (it != dirs.end()) return it->second;
+    auto& milo = milos[path] = InflateMilo(ark.Read(path));
+    return dirs[path] = MiloDirectory(milo);
+  };
+  auto texture = [&](const std::string& milo, const std::string& tex) -> std::optional<Rgba8Image> {
+    const auto& dir = directory(milo);
+    auto it = dir.find(tex);
+    if (it == dir.end() || it->second.type != "Tex") return std::nullopt;
+    auto bmp = FindBitmap(it->second.data);
+    if (!bmp) return std::nullopt;
+    return DecodeDxt(*bmp);
+  };
+
+  size_t missing = 0;
+  for (const auto& request : images) {
+    if (auto image = texture(request.milo, request.tex)) {
+      assets.images[request.key] = std::move(*image);
+    } else {
+      REXLOG_WARN("UI assets: no texture {} in {}", request.tex, request.milo);
+      ++missing;
+    }
+  }
+  for (const auto& request : fonts) {
+    BitmapFont font;
+    const auto& dir = directory(request.milo);
+    auto it = dir.find(request.font);
+    auto atlas = texture(request.milo, request.tex);
+    if (atlas && it != dir.end() && ParseFontGlyphs(it->second.data, font)) {
+      font.atlas = std::move(*atlas);
+      assets.fonts[request.key] = std::move(font);
+    } else {
+      REXLOG_WARN("UI assets: no font {} in {}", request.font, request.milo);
+      ++missing;
+    }
+  }
+
+  // In the rooftop "shell" vignette (from ui/image/rb3_logo.bmp).
+  {
+    auto milo = InflateMilo(ark.Read("world/vignette/shell/gen/sv8_a.milo_xbox"));
+    for (auto obj : SplitObjects(milo)) {
+      if (obj.substr(0, 300).find("rb3_logo.bmp") == std::string_view::npos) continue;
+      if (auto bmp = FindBitmap(obj)) {
+        assets.logo = DecodeDxt(*bmp);
+        break;
+      }
+    }
+  }
+
+  REXLOG_INFO("UI assets: logo {}, {} images, {} fonts, {} missing",
+              assets.logo ? "loaded" : "missing", assets.images.size(), assets.fonts.size(),
+              missing);
+  return assets;
+}
 
 }  // namespace rb3pc
