@@ -28,6 +28,7 @@ set(RB3PC_SOURCES
     src/shm_cleanup.cpp
     src/boot_speed.cpp
     src/frame_stats.cpp
+    src/rb3_assets.cpp
     src/save_tweaks.cpp
     src/gpu_wait.cpp
     src/profile.cpp
@@ -46,6 +47,10 @@ else()
 endif()
 
 rexglue_setup_target(rb3pc)
+
+# zlib: inflating .milo archives for the loading screen's game assets.
+find_package(ZLIB REQUIRED)
+target_link_libraries(rb3pc PRIVATE ZLIB::ZLIB)
 
 # Ship the SDK's shared libraries (runtime, Xenos GPU plugin, Tracy) next to
 # the executable. The GPU plugin is only searched for there.
