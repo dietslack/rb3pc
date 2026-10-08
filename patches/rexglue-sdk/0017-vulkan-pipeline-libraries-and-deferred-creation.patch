@@ -1,0 +1,536 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 2970173..7a9df45 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -812,6 +812,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // (current_guest_graphics_pipeline_ is VK_NULL_HANDLE in this case).
+   // TODO(Triang3l): Change to a deferred compilation handle.
+   VkPipeline current_guest_graphics_pipeline_;
++  // The still-pending pipeline last bound with CmdBindGraphicsPipelineDeferred
++  // (an opaque VulkanPipelineCache pipeline handle).
++  const void* current_guest_graphics_pipeline_deferred_ = nullptr;
+   VkPipeline current_external_graphics_pipeline_;
+   VkPipeline current_external_compute_pipeline_;
+ 
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a848..1f68981 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <atomic>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -101,6 +103,15 @@ class DeferredCommandBuffer {
+     args.pipeline = pipeline;
+   }
+ 
++  // Binds a graphics pipeline that may still be being created: read when the
++  // command buffer is executed. If it's still VK_NULL_HANDLE then (creation
++  // failed), draws are skipped until the next graphics pipeline bind.
++  void CmdBindGraphicsPipelineDeferred(const std::atomic<VkPipeline>* pipeline) {
++    auto& args = *reinterpret_cast<ArgsBindPipelineDeferred*>(
++        WriteCommand(Command::kBindPipelineDeferred, sizeof(ArgsBindPipelineDeferred)));
++    args.pipeline = pipeline;
++  }
++
+   void CmdVkBindVertexBuffers(uint32_t first_binding, uint32_t binding_count,
+                               const VkBuffer* buffers, const VkDeviceSize* offsets) {
+     size_t arguments_size = rex::align(sizeof(ArgsVkBindVertexBuffers), alignof(VkBuffer));
+@@ -358,6 +369,7 @@ class DeferredCommandBuffer {
+     kVkBindDescriptorSets,
+     kVkBindIndexBuffer,
+     kVkBindPipeline,
++    kBindPipelineDeferred,
+     kVkBindVertexBuffers,
+     kVkClearAttachments,
+     kVkClearColorImage,
+@@ -437,6 +449,10 @@ class DeferredCommandBuffer {
+     VkIndexType index_type;
+   };
+ 
++  struct ArgsBindPipelineDeferred {
++    const std::atomic<VkPipeline>* pipeline;
++  };
++
+   struct ArgsVkBindPipeline {
+     VkPipelineBindPoint pipeline_bind_point;
+     VkPipeline pipeline;
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 5db5dd0..56e3450 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -94,6 +94,9 @@ class VulkanPipelineCache {
+       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
+   bool IsCreatingPipelines() const;
++  // Where a pipeline handle from ConfigurePipeline keeps its VkPipeline, for
++  // binding it once a deferred creation has completed.
++  static const std::atomic<VkPipeline>* GetPipelineHandleSlot(void* handle);
+   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
+                                     const PipelineLayoutProvider*& pipeline_layout_out,
+                                     bool* is_placeholder_out = nullptr) const;
+@@ -238,13 +241,19 @@ class VulkanPipelineCache {
+     // destroyed by it while the pipeline cache is active.
+     std::atomic<const PipelineLayoutProvider*> pipeline_layout{nullptr};
+     std::atomic<bool> is_placeholder{false};
++    // Queued for creation on the creation threads, which a draw doesn't wait
++    // for (vulkan_deferred_pipeline_creation): its bind is resolved when the
++    // submission is executed, after the pipeline cache's EndSubmission has
++    // waited for the queue.
++    std::atomic<bool> creation_pending{false};
+     Pipeline() = default;
+     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
+         : pipeline_layout(pipeline_layout_provider) {}
+     Pipeline(const Pipeline& other)
+         : pipeline(other.pipeline.load(std::memory_order_acquire)),
+           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
+-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {}
++          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
++          creation_pending(other.creation_pending.load(std::memory_order_acquire)) {}
+     Pipeline& operator=(const Pipeline& other) {
+       if (this == &other) {
+         return *this;
+@@ -254,6 +263,8 @@ class VulkanPipelineCache {
+                             std::memory_order_release);
+       is_placeholder.store(other.is_placeholder.load(std::memory_order_acquire),
+                            std::memory_order_release);
++      creation_pending.store(other.creation_pending.load(std::memory_order_acquire),
++                             std::memory_order_release);
+       return *this;
+     }
+   };
+@@ -274,6 +285,12 @@ class VulkanPipelineCache {
+     VkShaderModule geometry_shader = VK_NULL_HANDLE;
+     // VK_NULL_HANDLE when dynamic rendering is used.
+     VkRenderPass render_pass = VK_NULL_HANDLE;
++    // With VK_EXT_graphics_pipeline_library (see EnsurePipelineCreated):
++    // kLink builds the pipeline by fast-linking a vertex-side and a
++    // pixel-side library (each reused across pipelines); kFragmentOnly just
++    // compiles the pixel-side library into the VkPipelineCache (warm-up).
++    enum class LibraryMode : uint8_t { kNone, kLink, kFragmentOnly };
++    LibraryMode library_mode = LibraryMode::kNone;
+   };
+   struct PipelineCreationArgumentsPriorityComparator {
+     bool operator()(const PipelineCreationArguments& a, const PipelineCreationArguments& b) const {
+@@ -339,6 +356,10 @@ class VulkanPipelineCache {
+                                VulkanShader::VulkanTranslation& translation);
+   void SetUpBindingLayouts(VulkanShader& shader);
+   std::unique_ptr<SpirvShaderTranslator> CreateShaderTranslator() const;
++  // Pipeline libraries for LibraryMode::kLink, by a hash of what they're
++  // built from; destroyed at shutdown.
++  std::mutex pipeline_libraries_mutex_;
++  std::unordered_map<uint64_t, VkPipeline> pipeline_libraries_;
+   // Compiles a pipeline for each shader pair from the title's warm-up source
+   // (rex/system/shader_warmup.h) that the list at warmup_list_path doesn't
+   // have yet, so the driver's compiled pixel shaders are in the persistent
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 6aba119..1f1b68b 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -161,6 +161,11 @@ class VulkanDevice {
+ 
+     bool nonSeamlessCubeMap = false;
+ 
++    // VK_EXT_graphics_pipeline_library (#321, with VK_KHR_pipeline_library)
++
++    bool graphicsPipelineLibrary = false;
++    bool graphicsPipelineLibraryFastLinking = false;
++
+     // VK_EXT_custom_border_color
+ 
+     bool customBorderColors = false;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 0c4f7c3..8f3ffa7 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3560,6 +3560,7 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
+   deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   current_external_graphics_pipeline_ = pipeline;
+   current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
++  current_guest_graphics_pipeline_deferred_ = nullptr;
+   current_guest_graphics_pipeline_layout_ = VK_NULL_HANDLE;
+ }
+ 
+@@ -3891,13 +3892,26 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     frame_used_async_placeholder_pipeline_ = true;
+     return true;
+   }
+-  if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+-    return draw_fail("pipeline_lookup");
+-  }
+-  if (current_guest_graphics_pipeline_ != pipeline) {
+-    deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+-    current_guest_graphics_pipeline_ = pipeline;
+-    current_external_graphics_pipeline_ = VK_NULL_HANDLE;
++  if (pipeline == VK_NULL_HANDLE && pipeline_handle && pipeline_layout_provider) {
++    // Still being created on the creation threads (see
++    // vulkan_deferred_pipeline_creation); bound when the submission executes.
++    if (current_guest_graphics_pipeline_deferred_ != pipeline_handle) {
++      deferred_command_buffer_.CmdBindGraphicsPipelineDeferred(
++          pipeline_cache_->GetPipelineHandleSlot(pipeline_handle));
++      current_guest_graphics_pipeline_deferred_ = pipeline_handle;
++      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
++      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
++    }
++  } else {
++    if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
++      return draw_fail("pipeline_lookup");
++    }
++    if (current_guest_graphics_pipeline_ != pipeline) {
++      deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++      current_guest_graphics_pipeline_ = pipeline;
++      current_guest_graphics_pipeline_deferred_ = nullptr;
++      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
++    }
+   }
+ 
+   // Update the graphics pipeline, and if the new graphics pipeline has a
+@@ -5196,6 +5210,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     current_framebuffer_ = nullptr;
+     in_render_pass_ = false;
+     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
++    current_guest_graphics_pipeline_deferred_ = nullptr;
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_compute_pipeline_ = VK_NULL_HANDLE;
+     current_guest_graphics_pipeline_layout_ = nullptr;
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 08427c5..2c36ff8 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -224,6 +224,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+   bool timing = REXCVAR_GET(vulkan_gpu_timing) &&
+                 GpuTimer::Get().Begin(command_processor_, command_buffer);
+   VkPipeline compute_pipeline = VK_NULL_HANDLE;
++  bool skip_draws = false;
+   auto work_of = [](Command command) {
+     switch (command) {
+       case Command::kVkDraw:
+@@ -315,6 +316,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+       case Command::kVkBindPipeline: {
+         auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
+         dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point, args.pipeline);
++        if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
++          skip_draws = false;
++        }
++      } break;
++
++      case Command::kBindPipelineDeferred: {
++        auto& args = *reinterpret_cast<const ArgsBindPipelineDeferred*>(stream);
++        VkPipeline pipeline = args.pipeline->load(std::memory_order_acquire);
++        skip_draws = pipeline == VK_NULL_HANDLE;
++        if (!skip_draws) {
++          dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++        }
+       } break;
+ 
+       case Command::kVkBindVertexBuffers: {
+@@ -405,12 +418,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkDraw: {
+         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
++        if (skip_draws) break;
+         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
+                       args.first_instance);
+       } break;
+ 
+       case Command::kVkDrawIndexed: {
+         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
++        if (skip_draws) break;
+         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
+                              args.first_index, args.vertex_offset, args.first_instance);
+       } break;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e5c41b3..abbe5d9 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -59,6 +59,16 @@ REXCVAR_DEFINE_INT32(
+     .range(-1, 32)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_deferred_pipeline_creation, true, "GPU/Vulkan",
++                    "Create new pipelines on the creation threads, all at once, and bind them "
++                    "when the submission is executed, instead of one at a time as draws need "
++                    "them (no draw is skipped)");
++
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_library, true, "GPU/Vulkan",
++                    "Build new pipelines during gameplay by linking separately compiled vertex "
++                    "and pixel shader parts (VK_EXT_graphics_pipeline_library), which the shader "
++                    "warm-up pre-compiles, instead of compiling each pipeline whole");
++
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -915,6 +925,10 @@ void VulkanPipelineCache::Shutdown() {
+     }
+   }
+   pipelines_.clear();
++  for (const auto& library_pair : pipeline_libraries_) {
++    dfn.vkDestroyPipeline(device, library_pair.second, nullptr);
++  }
++  pipeline_libraries_.clear();
+ 
+   // Destroy all internal shaders.
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+@@ -1210,6 +1224,16 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   auto it = pipelines_.find(description);
+   if (it != pipelines_.end()) {
+     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
++    if (found_pipeline == VK_NULL_HANDLE &&
++        it->second.creation_pending.load(std::memory_order_acquire)) {
++      last_pipeline_ = &*it;
++      pipeline_out = VK_NULL_HANDLE;
++      pipeline_layout_out = it->second.pipeline_layout.load(std::memory_order_acquire);
++      if (pipeline_handle_out) {
++        *pipeline_handle_out = &it->second;
++      }
++      return pipeline_layout_out != nullptr;
++    }
+     if (found_pipeline == VK_NULL_HANDLE) {
+       PipelineCreationArguments creation_arguments;
+       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
+@@ -1258,7 +1282,24 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     }
+   }
+ 
+-  if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
++  creation_arguments_real.library_mode = PipelineCreationArguments::LibraryMode::kLink;
++  bool queued_deferred_creation = false;
++  if (!queued_async_creation && REXCVAR_GET(vulkan_deferred_pipeline_creation) &&
++      !creation_threads_.empty()) {
++    // Draws only need the layout now; several new pipelines in a frame then
++    // compile in parallel rather than one after another.
++    pipeline.second.pipeline_layout.store(creation_arguments_real.pipeline_layout,
++                                          std::memory_order_release);
++    pipeline.second.creation_pending.store(true, std::memory_order_release);
++    {
++      std::lock_guard<std::mutex> lock(creation_request_lock_);
++      creation_queue_.push(creation_arguments_real);
++    }
++    creation_request_cond_.notify_one();
++    queued_deferred_creation = true;
++  }
++  if (!queued_async_creation && !queued_deferred_creation &&
++      !EnsurePipelineCreated(creation_arguments_real)) {
+     pipelines_.erase(description);
+     return false;
+   }
+@@ -1284,9 +1325,16 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   if (pipeline_handle_out) {
+     *pipeline_handle_out = &pipeline.second;
+   }
++  if (queued_deferred_creation) {
++    return pipeline_layout_out != nullptr;
++  }
+   return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+ }
+ 
++const std::atomic<VkPipeline>* VulkanPipelineCache::GetPipelineHandleSlot(void* handle) {
++  return &static_cast<Pipeline*>(handle)->pipeline;
++}
++
+ bool VulkanPipelineCache::IsCreatingPipelines() const {
+   std::lock_guard<std::mutex> lock(creation_request_lock_);
+   if (creation_threads_.empty()) {
+@@ -3577,9 +3625,138 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+ 
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+-  VkPipeline pipeline;
+-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
+-                                                         &pipeline_create_info, nullptr, &pipeline);
++  VkPipeline pipeline = VK_NULL_HANDLE;
++  VkResult create_result = VK_ERROR_UNKNOWN;
++
++  // Graphics pipeline libraries: the pixel shader (the expensive part with
++  // FSI, where it carries the EDRAM blending) is compiled as its own library
++  // and linked with the vertex side without link-time optimization. A new
++  // vertex shader / state combination then costs a small vertex library and
++  // a fast link instead of a full compile (20-55 ms on NVIDIA even with the
++  // pixel shader in the VkPipelineCache), and the warm-up can pre-compile the
++  // pixel side for every shader the game has.
++  using LibraryMode = PipelineCreationArguments::LibraryMode;
++  bool use_libraries =
++      creation_arguments.library_mode != LibraryMode::kNone && REXCVAR_GET(vulkan_pipeline_library) &&
++      vulkan_device->properties().graphicsPipelineLibrary &&
++      vulkan_device->properties().graphicsPipelineLibraryFastLinking &&
++      edram_fragment_shader_interlock && !tessellated &&
++      fragment_shader_override == VK_NULL_HANDLE && shader_stage_count >= 2 &&
++      shader_stages[shader_stage_count - 1].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
++  bool linked = false;
++  if (use_libraries) {
++    auto create_library = [&](VkGraphicsPipelineLibraryFlagsEXT parts, uint32_t stage_count,
++                              const VkPipelineShaderStageCreateInfo* stages) -> VkPipeline {
++      VkGraphicsPipelineLibraryCreateInfoEXT library_info = {};
++      library_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT;
++      library_info.pNext = use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
++      library_info.flags = parts;
++      VkGraphicsPipelineCreateInfo library_create_info = pipeline_create_info;
++      library_create_info.pNext = &library_info;
++      library_create_info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
++      library_create_info.stageCount = stage_count;
++      library_create_info.pStages = stages;
++      VkPipeline library;
++      if (dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1, &library_create_info,
++                                        nullptr, &library) != VK_SUCCESS) {
++        return VK_NULL_HANDLE;
++      }
++      vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed);
++      return library;
++    };
++    constexpr VkGraphicsPipelineLibraryFlagsEXT kVertexParts =
++        VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
++        VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
++    constexpr VkGraphicsPipelineLibraryFlagsEXT kFragmentParts =
++        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
++        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
++    const VkPipelineShaderStageCreateInfo& fragment_stage = shader_stages[shader_stage_count - 1];
++
++    if (creation_arguments.library_mode == LibraryMode::kFragmentOnly) {
++      VkPipeline library = create_library(kFragmentParts, 1, &fragment_stage);
++      if (library == VK_NULL_HANDLE) {
++        return false;
++      }
++      dfn.vkDestroyPipeline(device, library, nullptr);
++      return true;
++    }
++
++    // What each library is built from (with FSI, the depth / stencil and
++    // blend state are fixed, so the pixel side only varies by these).
++    struct {
++      uint64_t parts;
++      uint64_t module;
++      uint64_t geometry_module;
++      uint64_t layout;
++      uint64_t render_pass;
++      uint32_t state[8];
++    } vertex_key = {}, fragment_key = {};
++    vertex_key.parts = kVertexParts;
++    vertex_key.module = uint64_t(shader_stages[0].module);
++    vertex_key.geometry_module = uint64_t(creation_arguments.geometry_shader);
++    vertex_key.layout = uint64_t(pipeline_create_info.layout);
++    vertex_key.render_pass = uint64_t(pipeline_create_info.renderPass);
++    vertex_key.state[0] = uint32_t(input_assembly_state.topology);
++    vertex_key.state[1] = input_assembly_state.primitiveRestartEnable;
++    vertex_key.state[2] = uint32_t(rasterization_state.polygonMode);
++    vertex_key.state[3] = rasterization_state.cullMode;
++    vertex_key.state[4] = uint32_t(rasterization_state.frontFace);
++    vertex_key.state[5] = rasterization_state.depthClampEnable |
++                          (rasterization_state.rasterizerDiscardEnable << 1) |
++                          (rasterization_state.depthBiasEnable << 2);
++    vertex_key.state[6] = uint32_t(use_dynamic_rendering);
++    fragment_key.parts = kFragmentParts;
++    fragment_key.module = uint64_t(fragment_stage.module);
++    fragment_key.layout = vertex_key.layout;
++    fragment_key.render_pass = vertex_key.render_pass;
++    fragment_key.state[0] = uint32_t(multisample_state.rasterizationSamples);
++    fragment_key.state[1] = multisample_state.sampleShadingEnable;
++    fragment_key.state[2] = multisample_state.pSampleMask ? *multisample_state.pSampleMask : ~0u;
++    fragment_key.state[3] = uint32_t(use_dynamic_rendering);
++    auto get_library = [&](const auto& key, VkGraphicsPipelineLibraryFlagsEXT parts,
++                           uint32_t stage_count,
++                           const VkPipelineShaderStageCreateInfo* stages) -> VkPipeline {
++      uint64_t hash = XXH3_64bits(&key, sizeof(key));
++      {
++        std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
++        auto it = pipeline_libraries_.find(hash);
++        if (it != pipeline_libraries_.end()) {
++          return it->second;
++        }
++      }
++      VkPipeline library = create_library(parts, stage_count, stages);
++      if (library == VK_NULL_HANDLE) {
++        return VK_NULL_HANDLE;
++      }
++      std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
++      auto [it, inserted] = pipeline_libraries_.emplace(hash, library);
++      if (!inserted) {
++        dfn.vkDestroyPipeline(device, library, nullptr);
++      }
++      return it->second;
++    };
++    VkPipeline libraries[2] = {
++        get_library(vertex_key, kVertexParts, shader_stage_count - 1, shader_stages.data()),
++        get_library(fragment_key, kFragmentParts, 1, &fragment_stage)};
++    if (libraries[0] != VK_NULL_HANDLE && libraries[1] != VK_NULL_HANDLE) {
++      VkPipelineLibraryCreateInfoKHR link_info = {};
++      link_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
++      link_info.libraryCount = 2;
++      link_info.pLibraries = libraries;
++      VkGraphicsPipelineCreateInfo link_create_info = {};
++      link_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++      link_create_info.pNext = &link_info;
++      link_create_info.layout = pipeline_create_info.layout;
++      link_create_info.basePipelineIndex = -1;
++      create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
++                                                    &link_create_info, nullptr, &pipeline);
++      linked = create_result == VK_SUCCESS;
++    }
++  }
++  if (!linked) {
++    create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
++                                                  &pipeline_create_info, nullptr, &pipeline);
++  }
+   if (create_result == VK_SUCCESS) {
+     vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed);
+   }
+@@ -3640,6 +3817,7 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+     }
+ 
+     bool created = EnsurePipelineCreated(creation_arguments);
++    creation_arguments.pipeline->second.creation_pending.store(false, std::memory_order_release);
+     if (!created) {
+       bool has_placeholder =
+           creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+@@ -3674,6 +3852,7 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+       creation_queue_.pop();
+     }
+     bool created = EnsurePipelineCreated(creation_arguments);
++    creation_arguments.pipeline->second.creation_pending.store(false, std::memory_order_release);
+     if (!created) {
+       bool has_placeholder =
+           creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+@@ -3863,6 +4042,12 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const auto& device_properties = vulkan_device->properties();
+ 
++  // With pipeline libraries, gameplay links pipelines from a pixel-side
++  // library, so that's what gets pre-compiled (see EnsurePipelineCreated).
++  bool warm_libraries = REXCVAR_GET(vulkan_pipeline_library) &&
++                        device_properties.graphicsPipelineLibrary &&
++                        device_properties.graphicsPipelineLibraryFastLinking;
++
+   // The list is only valid for the VkPipelineCache it was built into: the same
+   // GPU, driver and shader translation settings.
+   struct {
+@@ -3870,6 +4055,7 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+     uint32_t pipeline_version, modification_version;
+     uint32_t resolution_scale_x, resolution_scale_y;
+     uint32_t msaa_2x_attachments, msaa_2x_no_attachments;
++    uint32_t pipeline_libraries;
+   } salt_source = {device_properties.vendorID,
+                    device_properties.deviceID,
+                    device_properties.driverVersion,
+@@ -3878,7 +4064,8 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+                    render_target_cache_.draw_resolution_scale_x(),
+                    render_target_cache_.draw_resolution_scale_y(),
+                    uint32_t(render_target_cache_.msaa_2x_attachments_supported()),
+-                   uint32_t(render_target_cache_.msaa_2x_no_attachments_supported())};
++                   uint32_t(render_target_cache_.msaa_2x_no_attachments_supported()),
++                   uint32_t(warm_libraries)};
+   const uint64_t salt = XXH3_64bits(&salt_source, sizeof(salt_source));
+   // One list per salt, so switching e.g. the resolution scale back and forth
+   // doesn't throw away the other setting's list.
+@@ -4128,6 +4315,10 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+           creation_arguments.vertex_shader = item.vertex;
+           creation_arguments.pixel_shader = item.pixel;
+           creation_arguments.render_pass = render_pass;
++          if (warm_libraries) {
++            creation_arguments.library_mode =
++                PipelineCreationArguments::LibraryMode::kFragmentOnly;
++          }
+           if (EnsurePipelineCreated(creation_arguments)) {
+             compiled.fetch_add(1);
+           }
