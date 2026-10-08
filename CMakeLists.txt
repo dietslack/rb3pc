@@ -24,8 +24,10 @@ set(RB3PC_SOURCES
     src/main.cpp
     src/debug_hooks.cpp
     src/app_hooks.cpp
+    src/instrument_input.cpp
     src/xekeys.cpp
     src/shm_cleanup.cpp
+    src/input_bindings.cpp
     src/boot_speed.cpp
     src/frame_stats.cpp
     src/title_icon.cpp

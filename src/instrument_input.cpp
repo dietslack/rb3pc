@@ -1,0 +1,366 @@
+#include "instrument_input.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <SDL3/SDL.h>
+
+#include <rex/cvar.h>
+#include <rex/input/device_assignment.h>
+#include <rex/input/flags.h>
+#include <rex/input/input_driver.h>
+#include <rex/input/input_system.h>
+#include <rex/input/mnk/mnk_input_driver.h>
+#include <rex/input/nop/nop_input_driver.h>
+#include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/logging.h>
+
+
+// By SDL connection order. "auto" uses SDL's joystick type, else gamepad.
+// "none" hides the device; the next one takes its player slot.
+#define RB3PC_CONTROLLER_TYPE_CVAR(n)                                                     \
+  REXCVAR_DEFINE_STRING(controller_type_##n, "auto", "Instruments",                      \
+                        "Instrument type for connected controller " #n                    \
+                        ": auto, gamepad, guitar, drums or none")                         \
+      .allowed({"auto", "gamepad", "guitar", "drums", "none"})
+RB3PC_CONTROLLER_TYPE_CVAR(1);
+RB3PC_CONTROLLER_TYPE_CVAR(2);
+RB3PC_CONTROLLER_TYPE_CVAR(3);
+RB3PC_CONTROLLER_TYPE_CVAR(4);
+
+REXCVAR_DEFINE_BOOL(mouse_keyboard, true, "Instruments",
+                    "Use the mouse and keyboard in the game's menus (as player 1's controller)");
+
+REXCVAR_DEFINE_BOOL(instrument_input_log, false, "Instruments",
+                    "Log controller state changes after remapping (for tuning)");
+
+REXCVAR_DEFINE_STRING(debug_input_script, "", "Instruments",
+                      "Testing aid: presses buttons on controller 1 at set times, e.g. "
+                      "\"35:start,40:a,42.5:down\" (seconds after launch; buttons a b x y "
+                      "start back up down left right lb rb)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace rb3pc {
+
+namespace {
+
+using rex::X_RESULT;
+using rex::X_STATUS;
+using rex::input::DeviceId;
+using rex::input::DeviceInfo;
+using rex::input::X_INPUT_CAPABILITIES;
+using rex::input::X_INPUT_STATE;
+
+// XInput subtypes RB3's controller classifier (0x8251EB20) recognizes.
+constexpr uint8_t kSubTypeGuitar = 0x06;    // -> strat_xbox (flags 0)
+constexpr uint8_t kSubTypeDrumKit = 0x08;   // -> hx_drums_xbox_rb2 (flags bit 0)
+
+std::string ControllerTypeSetting(size_t index) {
+  switch (index) {
+    case 0: return REXCVAR_GET(controller_type_1);
+    case 1: return REXCVAR_GET(controller_type_2);
+    case 2: return REXCVAR_GET(controller_type_3);
+    case 3: return REXCVAR_GET(controller_type_4);
+    default: return "auto";
+  }
+}
+
+// Two of the same controller share a GUID, so `nth` tells them apart.
+SDL_JoystickID SdlIdForGuid(const std::string& guid, size_t nth) {
+  SDL_JoystickID found = 0;
+  int count = 0;
+  SDL_JoystickID* ids = SDL_GetJoysticks(&count);
+  for (int i = 0; ids && i < count; ++i) {
+    char text[33] = {};
+    SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), text, sizeof(text));
+    if (guid == text && nth-- == 0) {
+      found = ids[i];
+      break;
+    }
+  }
+  SDL_free(ids);
+  return found;
+}
+
+class InstrumentInputDriver;
+InstrumentInputDriver* g_driver = nullptr;
+
+struct ScriptedPress {
+  double at;
+  uint16_t button;
+};
+constexpr double kScriptPress = 0.2;
+
+std::vector<ScriptedPress> ParseInputScript(const std::string& script) {
+  using namespace rex::input;
+  static const std::pair<const char*, uint16_t> kButtons[] = {
+      {"a", X_INPUT_GAMEPAD_A},
+      {"b", X_INPUT_GAMEPAD_B},
+      {"x", X_INPUT_GAMEPAD_X},
+      {"y", X_INPUT_GAMEPAD_Y},
+      {"start", X_INPUT_GAMEPAD_START},
+      {"back", X_INPUT_GAMEPAD_BACK},
+      {"up", X_INPUT_GAMEPAD_DPAD_UP},
+      {"down", X_INPUT_GAMEPAD_DPAD_DOWN},
+      {"left", X_INPUT_GAMEPAD_DPAD_LEFT},
+      {"right", X_INPUT_GAMEPAD_DPAD_RIGHT},
+      {"lb", X_INPUT_GAMEPAD_LEFT_SHOULDER},
+      {"rb", X_INPUT_GAMEPAD_RIGHT_SHOULDER},
+  };
+  std::vector<ScriptedPress> presses;
+  size_t pos = 0;
+  while (pos < script.size()) {
+    size_t comma = script.find(',', pos);
+    std::string item = script.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                     : comma - pos);
+    pos = comma == std::string::npos ? script.size() : comma + 1;
+    size_t colon = item.find(':');
+    if (colon == std::string::npos) continue;
+    double at = std::atof(item.substr(0, colon).c_str());
+    std::string name = item.substr(colon + 1);
+    for (const auto& [button_name, bit] : kButtons) {
+      if (name == button_name) presses.push_back({at, bit});
+    }
+  }
+  return presses;
+}
+
+uint16_t ScriptedButtons() {
+  static const auto start = std::chrono::steady_clock::now();
+  static const auto presses = ParseInputScript(REXCVAR_GET(debug_input_script));
+  if (presses.empty()) return 0;
+  double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  uint16_t buttons = 0;
+  for (const auto& press : presses) {
+    if (t >= press.at && t < press.at + kScriptPress) buttons |= press.button;
+  }
+  return buttons;
+}
+
+// Wraps the SDK's SDL driver: instruments report a Rock Band subtype, and a
+// controller with a bindings profile is read raw through it (input_bindings.cpp).
+class InstrumentInputDriver final : public rex::input::InputDriver {
+ public:
+  InstrumentInputDriver(std::unique_ptr<rex::input::sdl::SDLInputDriver> sdl)
+      : InputDriver(nullptr, 0), sdl_(std::move(sdl)) {
+    sdl_->set_is_active_callback([this] { return is_active(); });
+    g_driver = this;
+  }
+  ~InstrumentInputDriver() override { g_driver = nullptr; }
+
+  std::vector<ControllerInfo> Controllers() {
+    std::lock_guard lock(mutex_);
+    std::vector<ControllerInfo> out;
+    for (const auto& device : devices_) {
+      out.push_back({device.index, device.name, device.guid, device.sdl_id, device.instrument,
+                     device.setting});
+    }
+    return out;
+  }
+
+  X_STATUS Setup() override { return X_STATUS_SUCCESS; }
+
+  void OnWindowAvailable(rex::ui::Window* window) override { sdl_->OnWindowAvailable(window); }
+
+  void EnumerateDevices(std::vector<DeviceInfo>& out) override {
+    size_t first = out.size();
+    sdl_->EnumerateDevices(out);
+    // Called constantly; only resolve new or moved devices.
+    std::lock_guard lock(mutex_);
+    std::vector<Device> devices;
+    for (size_t i = first; i < out.size(); ++i) {
+      size_t index = i - first;
+      auto known = std::find_if(devices_.begin(), devices_.end(), [&](const Device& d) {
+        return d.id == out[i].id && d.index == index;
+      });
+      if (known != devices_.end()) {
+        devices.push_back(std::move(*known));
+        continue;
+      }
+      size_t same_guid = std::count_if(devices.begin(), devices.end(),
+                                       [&](const Device& d) { return d.guid == out[i].guid; });
+      Device device{out[i].id, index, out[i].guid, out[i].name};
+      device.sdl_id = SdlIdForGuid(device.guid, same_guid);
+      device.instrument = Resolve(device);
+      devices.push_back(std::move(device));
+    }
+    devices_ = std::move(devices);
+    // Hide controllers set to "none"; they stay in devices_ for the launcher.
+    for (size_t i = devices_.size(); i-- > 0;) {
+      if (ControllerTypeSetting(devices_[i].index) == "none" && first + i < out.size()) {
+        out.erase(out.begin() + std::ptrdiff_t(first + i));
+      }
+    }
+  }
+
+  X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags,
+                                 X_INPUT_CAPABILITIES* out_caps) override {
+    X_RESULT result = sdl_->GetDeviceCapabilities(id, flags, out_caps);
+    if (result != X_ERROR_SUCCESS) {
+      return result;
+    }
+    switch (InstrumentFor(id)) {
+      case Instrument::kGuitar:
+        out_caps->sub_type = kSubTypeGuitar;
+        out_caps->flags = 0;
+        break;
+      case Instrument::kDrums:
+        out_caps->sub_type = kSubTypeDrumKit;
+        out_caps->flags = 1;
+        break;
+      case Instrument::kGamepad:
+        break;
+    }
+    return result;
+  }
+
+  X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override {
+    X_RESULT result = sdl_->GetDeviceState(id, out_state);
+    if (result != X_ERROR_SUCCESS) {
+      return result;
+    }
+    Instrument instrument = InstrumentFor(id);
+    std::string guid;
+    SDL_JoystickID sdl_id = 0;
+    {
+      std::lock_guard lock(mutex_);
+      for (const auto& device : devices_) {
+        if (device.id == id) {
+          guid = device.guid;
+          sdl_id = device.sdl_id;
+        }
+      }
+    }
+    if (auto profile = BindingStore::Get().Find(guid)) {
+      if (SDL_Joystick* joystick = sdl_id ? SDL_GetJoystickFromID(sdl_id) : nullptr) {
+        PadState pad = Evaluate(*profile, joystick);
+        auto& out = out_state->gamepad;
+        out.buttons = pad.buttons;
+        out.left_trigger = pad.left_trigger;
+        out.right_trigger = pad.right_trigger;
+        out.thumb_lx = pad.thumb_lx;
+        out.thumb_ly = pad.thumb_ly;
+        out.thumb_rx = pad.thumb_rx;
+        out.thumb_ry = pad.thumb_ry;
+      }
+    }
+    if (IsFirstController(id)) {
+      // SDK doesn't advance packet_number while unfocused.
+      static uint16_t last_scripted = 0;
+      static uint32_t script_packets = 0;
+      uint16_t scripted = ScriptedButtons();
+      if (scripted != last_scripted) {
+        last_scripted = scripted;
+        ++script_packets;
+      }
+      out_state->gamepad.buttons = uint16_t(out_state->gamepad.buttons) | scripted;
+      out_state->packet_number = uint32_t(out_state->packet_number) + script_packets;
+    }
+    if (REXCVAR_GET(instrument_input_log)) {
+      LogState(id, instrument, *out_state);
+    }
+    return result;
+  }
+
+  bool IsFirstController(DeviceId id) {
+    std::lock_guard lock(mutex_);
+    for (const auto& device : devices_) {
+      if (ControllerTypeSetting(device.index) != "none") return device.id == id;
+    }
+    return false;
+  }
+
+  X_RESULT SetDeviceVibration(DeviceId id, rex::input::X_INPUT_VIBRATION* vibration) override {
+    return sdl_->SetDeviceVibration(id, vibration);
+  }
+
+  X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
+                              rex::input::X_INPUT_KEYSTROKE* out_keystroke) override {
+    return sdl_->GetDeviceKeystroke(id, flags, out_keystroke);
+  }
+
+ private:
+  struct Device {
+    DeviceId id;
+    size_t index;
+    std::string guid;
+    std::string name;
+    SDL_JoystickID sdl_id = 0;
+    Instrument instrument = Instrument::kGamepad;
+    std::string setting;  // controller_type_N value the instrument came from
+    X_INPUT_STATE last_logged{};
+  };
+
+  Instrument Resolve(Device& device) {
+    device.setting = ControllerTypeSetting(device.index);
+    Instrument instrument = Instrument::kGamepad;
+    if (device.setting == "guitar") {
+      instrument = Instrument::kGuitar;
+    } else if (device.setting == "drums") {
+      instrument = Instrument::kDrums;
+    } else if (device.setting == "auto") {
+      switch (device.sdl_id ? SDL_GetJoystickTypeForID(device.sdl_id)
+                            : SDL_JOYSTICK_TYPE_UNKNOWN) {
+        case SDL_JOYSTICK_TYPE_GUITAR: instrument = Instrument::kGuitar; break;
+        case SDL_JOYSTICK_TYPE_DRUM_KIT: instrument = Instrument::kDrums; break;
+        default: break;
+      }
+    }
+    REXLOG_INFO("Instruments: controller {} \"{}\" -> {} (controller_type_{} = {})",
+                device.index + 1, device.name,
+                device.setting == "none" ? "ignored" : InstrumentName(instrument),
+                device.index + 1, device.setting);
+    return instrument;
+  }
+
+  Instrument InstrumentFor(DeviceId id) {
+    std::lock_guard lock(mutex_);
+    for (auto& device : devices_) {
+      if (device.id != id) {
+        continue;
+      }
+      if (device.setting != ControllerTypeSetting(device.index)) {
+        device.instrument = Resolve(device);
+      }
+      return device.instrument;
+    }
+    return Instrument::kGamepad;
+  }
+
+  void LogState(DeviceId id, Instrument instrument, const X_INPUT_STATE& state) {
+    std::lock_guard lock(mutex_);
+    for (auto& device : devices_) {
+      if (device.id != id) {
+        continue;
+      }
+      const auto& pad = state.gamepad;
+      const auto& last = device.last_logged.gamepad;
+      if (pad.buttons == last.buttons && pad.left_trigger == last.left_trigger &&
+          pad.right_trigger == last.right_trigger && pad.thumb_lx == last.thumb_lx &&
+          pad.thumb_ly == last.thumb_ly && pad.thumb_rx == last.thumb_rx &&
+          pad.thumb_ry == last.thumb_ry) {
+        return;
+      }
+      device.last_logged = state;
+      REXLOG_INFO(
+          "Instruments: controller {} ({}) buttons={:04X} lt={} rt={} lx={} ly={} rx={} ry={}",
+          device.index + 1, InstrumentName(instrument), uint16_t(pad.buttons),
+          pad.left_trigger, pad.right_trigger, int16_t(pad.thumb_lx), int16_t(pad.thumb_ly),
+          int16_t(pad.thumb_rx), int16_t(pad.thumb_ry));
+      return;
+    }
+  }
+
+  std::unique_ptr<rex::input::sdl::SDLInputDriver> sdl_;
+  std::mutex mutex_;
+  std::vector<Device> devices_;
+};
+
+}  // namespace
+
+}  // namespace rb3pc
