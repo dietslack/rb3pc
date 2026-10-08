@@ -1,0 +1,29 @@
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index b5c824d..e5c41b3 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -3880,10 +3880,14 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+                    uint32_t(render_target_cache_.msaa_2x_attachments_supported()),
+                    uint32_t(render_target_cache_.msaa_2x_no_attachments_supported())};
+   const uint64_t salt = XXH3_64bits(&salt_source, sizeof(salt_source));
++  // One list per salt, so switching e.g. the resolution scale back and forth
++  // doesn't throw away the other setting's list.
++  std::filesystem::path list_path = warmup_list_path;
++  list_path += fmt::format(".{:016X}", salt);
+ 
+   // The list: the salt, then the key of every pair already compiled.
+   std::unordered_set<uint64_t> warmed;
+-  if (FILE* file = rex::filesystem::OpenFile(warmup_list_path, "rb")) {
++  if (FILE* file = rex::filesystem::OpenFile(list_path, "rb")) {
+     uint64_t file_salt = 0;
+     if (fread(&file_salt, sizeof(file_salt), 1, file) == 1 && file_salt == salt) {
+       uint64_t key;
+@@ -4149,7 +4153,7 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+     if (last_batch || std::chrono::steady_clock::now() - last_save > std::chrono::seconds(20)) {
+       SaveVkPipelineCache(true);
+       last_save = std::chrono::steady_clock::now();
+-      if (FILE* file = rex::filesystem::OpenFile(warmup_list_path, list_started ? "ab" : "wb")) {
++      if (FILE* file = rex::filesystem::OpenFile(list_path, list_started ? "ab" : "wb")) {
+         if (!list_started) fwrite(&salt, sizeof(salt), 1, file);
+         fwrite(done_keys.data(), sizeof(uint64_t), done_keys.size(), file);
+         fclose(file);
