@@ -28,6 +28,7 @@ set(RB3PC_SOURCES
     src/xekeys.cpp
     src/shm_cleanup.cpp
     src/input_bindings.cpp
+    src/bindings_dialog.cpp
     src/boot_speed.cpp
     src/frame_stats.cpp
     src/title_icon.cpp
