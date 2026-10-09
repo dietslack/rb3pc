@@ -211,4 +211,241 @@ std::string Source::Describe() const {
   }
 }
 
+PadState Evaluate(const Profile& profile, SDL_Joystick* joystick) {
+  PadState state;
+  if (!joystick) return state;
+  for (size_t i = 0; i < kOutputCount; ++i) {
+    const Source& source = profile.sources[i];
+    if (source.kind == Source::Kind::kNone) continue;
+    auto output = Output(i);
+    switch (output) {
+      case Output::kLeftX: state.thumb_lx = StickValue(source, joystick); break;
+      case Output::kLeftY: state.thumb_ly = StickValue(source, joystick); break;
+      case Output::kRightX: state.thumb_rx = StickValue(source, joystick); break;
+      case Output::kRightY: state.thumb_ry = StickValue(source, joystick); break;
+      case Output::kLeftTrigger: state.left_trigger = TriggerValue(source, joystick); break;
+      case Output::kRightTrigger: state.right_trigger = TriggerValue(source, joystick); break;
+      default:
+        if (Pressed(source, joystick)) state.buttons |= Info(output).button;
+        break;
+    }
+  }
+  if (profile.disable_tilt) {
+    state.thumb_ry = 0;
+  }
+  return state;
+}
+
+Profile DefaultProfile(SDL_JoystickID id) {
+  Profile profile;
+  char guid[33] = {};
+  SDL_GUIDToString(SDL_GetJoystickGUIDForID(id), guid, sizeof(guid));
+  profile.guid = guid;
+  const char* name = SDL_GetJoystickNameForID(id);
+  profile.name = name ? name : "";
+
+  // Y axes flipped: SDL's point down, XInput's up.
+  struct Element {
+    std::string_view name;
+    Output output;
+    bool invert;
+  };
+  static constexpr Element kElements[] = {
+      {"a", Output::kA, false}, {"b", Output::kB, false}, {"x", Output::kX, false},
+      {"y", Output::kY, false}, {"leftshoulder", Output::kLeftShoulder, false},
+      {"rightshoulder", Output::kRightShoulder, false}, {"dpup", Output::kDpadUp, false},
+      {"dpdown", Output::kDpadDown, false}, {"dpleft", Output::kDpadLeft, false},
+      {"dpright", Output::kDpadRight, false}, {"start", Output::kStart, false},
+      {"back", Output::kBack, false}, {"guide", Output::kGuide, false},
+      {"leftstick", Output::kLeftThumb, false}, {"rightstick", Output::kRightThumb, false},
+      {"leftx", Output::kLeftX, false}, {"lefty", Output::kLeftY, true},
+      {"rightx", Output::kRightX, false}, {"righty", Output::kRightY, true},
+      {"lefttrigger", Output::kLeftTrigger, false},
+      {"righttrigger", Output::kRightTrigger, false},
+  };
+
+  char* mapping = SDL_GetGamepadMappingForID(id);
+  if (!mapping) return profile;
+  std::string_view rest(mapping);
+  while (!rest.empty()) {
+    auto comma = rest.find(',');
+    auto entry = rest.substr(0, comma);
+    rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+    auto colon = entry.find(':');
+    if (colon == std::string_view::npos) continue;
+    auto key = entry.substr(0, colon);
+    auto value = entry.substr(colon + 1);
+    for (const auto& element : kElements) {
+      if (key != element.name || value.size() < 2) continue;
+      Source source;
+      if (value[0] == 'b') {
+        source.kind = Source::Kind::kButton;
+        source.index = uint8_t(ParseInt(value.substr(1)));
+      } else if (value[0] == 'a') {
+        source.kind = Source::Kind::kAxis;
+        source.index = uint8_t(ParseInt(value.substr(1)));
+        source.invert = element.invert;
+      } else if (value[0] == 'h') {  // h<hat>.<mask>
+        auto dot = value.find('.');
+        if (dot == std::string_view::npos) continue;
+        source.kind = Source::Kind::kHat;
+        source.index = uint8_t(ParseInt(value.substr(1, dot - 1)));
+        source.direction = int8_t(ParseInt(value.substr(dot + 1)));
+      }
+      profile.sources[size_t(element.output)] = source;
+    }
+  }
+  SDL_free(mapping);
+  return profile;
+}
+
+// Whammy (right stick X, -32768 at rest per joypad.dta) and pickup switch
+// (left trigger). A mid-resting axis like a PS3 whammy must bind as half axis.
+bool IsOneWayGuitarControl(Output output, Instrument instrument) {
+  return instrument == Instrument::kGuitar &&
+         (output == Output::kRightX || output == Output::kLeftTrigger);
+}
+
+Capture::Capture(SDL_Joystick* joystick, Output output, Instrument instrument)
+    : output_(output), one_way_(IsOneWayGuitarControl(output, instrument)) {
+  if (!joystick) return;
+  for (int i = 0; i < SDL_GetNumJoystickButtons(joystick); ++i) {
+    buttons_.push_back(SDL_GetJoystickButton(joystick, i));
+  }
+  for (int i = 0; i < SDL_GetNumJoystickAxes(joystick); ++i) {
+    axes_.push_back(SDL_GetJoystickAxis(joystick, i));
+  }
+  for (int i = 0; i < SDL_GetNumJoystickHats(joystick); ++i) {
+    hats_.push_back(SDL_GetJoystickHat(joystick, i));
+  }
+}
+
+std::optional<Source> Capture::Poll(SDL_Joystick* joystick) {
+  if (!joystick) return std::nullopt;
+  Source source;
+  for (size_t i = 0; i < buttons_.size(); ++i) {
+    bool down = SDL_GetJoystickButton(joystick, int(i));
+    if (down && !buttons_[i]) {
+      source.kind = Source::Kind::kButton;
+      source.index = uint8_t(i);
+      return source;
+    }
+    buttons_[i] = down;
+  }
+  for (size_t i = 0; i < hats_.size(); ++i) {
+    uint8_t hat = SDL_GetJoystickHat(joystick, int(i));
+    uint8_t pressed = hat & ~hats_[i];
+    for (const auto& name : kHatNames) {
+      if (pressed & name.bit) {
+        source.kind = Source::Kind::kHat;
+        source.index = uint8_t(i);
+        source.direction = int8_t(name.bit);
+        return source;
+      }
+    }
+    hats_[i] = hat;
+  }
+  for (size_t i = 0; i < axes_.size(); ++i) {
+    int value = SDL_GetJoystickAxis(joystick, int(i));
+    int delta = value - axes_[i];
+    if (std::abs(delta) < kCaptureMoveThreshold) continue;
+    source.kind = Source::Kind::kAxis;
+    source.index = uint8_t(i);
+    bool rests_mid_range = std::abs(int(axes_[i])) < kCaptureMoveThreshold;
+    if (IsAnalog(output_) && !(one_way_ && rests_mid_range)) {
+      source.invert = delta < 0;
+    } else {
+      source.direction = delta > 0 ? 1 : -1;
+    }
+    return source;
+  }
+  return std::nullopt;
+}
+
+BindingStore& BindingStore::Get() {
+  static BindingStore store;
+  return store;
+}
+
+void BindingStore::SetDirectory(std::filesystem::path dir) {
+  std::lock_guard lock(mutex_);
+  dir_ = std::move(dir);
+  cache_.clear();
+}
+
+std::optional<Profile> BindingStore::Find(const std::string& guid) {
+  std::lock_guard lock(mutex_);
+  auto it = cache_.find(guid);
+  if (it == cache_.end()) {
+    it = cache_.emplace(guid, Load(guid)).first;
+  }
+  return it->second;
+}
+
+std::optional<Profile> BindingStore::Load(const std::string& guid) {
+  auto path = dir_ / (guid + ".toml");
+  std::error_code ec;
+  if (dir_.empty() || !std::filesystem::exists(path, ec)) {
+    return std::nullopt;
+  }
+  try {
+    auto table = toml::parse_file(path.string());
+    Profile profile;
+    profile.guid = guid;
+    profile.name = table["name"].value_or(std::string{});
+    profile.disable_tilt = table["options"]["disable_tilt"].value_or(false);
+    if (auto* bindings = table["bindings"].as_table()) {
+      for (size_t i = 0; i < kOutputCount; ++i) {
+        if (auto text = (*bindings)[OutputKey(Output(i))].value<std::string>()) {
+          profile.sources[i] = Source::Parse(*text);
+        }
+      }
+    }
+    REXLOG_INFO("Bindings: loaded {} ({})", path.string(), profile.name);
+    return profile;
+  } catch (const toml::parse_error& e) {
+    REXLOG_ERROR("Bindings: failed to parse {}: {}", path.string(), e.what());
+    return std::nullopt;
+  }
+}
+
+bool BindingStore::Save(const Profile& profile) {
+  std::lock_guard lock(mutex_);
+  std::error_code ec;
+  std::filesystem::create_directories(dir_, ec);
+  toml::table bindings;
+  for (size_t i = 0; i < kOutputCount; ++i) {
+    auto text = profile.sources[i].ToString();
+    if (!text.empty()) {
+      bindings.insert_or_assign(OutputKey(Output(i)), text);
+    }
+  }
+  toml::table options;
+  options.insert_or_assign("disable_tilt", profile.disable_tilt);
+  toml::table table;
+  table.insert_or_assign("name", profile.name);
+  table.insert_or_assign("options", std::move(options));
+  table.insert_or_assign("bindings", std::move(bindings));
+
+  auto path = dir_ / (profile.guid + ".toml");
+  std::ofstream out(path);
+  out << "# rb3pc controller bindings for " << profile.name << "\n"
+      << "# Values: button:N, axis:N, axis:N:inv, axis:N:+, axis:N:-, hat:N:up|down|left|right\n\n"
+      << table << "\n";
+  if (!out) {
+    REXLOG_ERROR("Bindings: failed to write {}", path.string());
+    return false;
+  }
+  cache_[profile.guid] = profile;
+  REXLOG_INFO("Bindings: saved {}", path.string());
+  return true;
+}
+
+void BindingStore::Remove(const std::string& guid) {
+  std::lock_guard lock(mutex_);
+  std::error_code ec;
+  std::filesystem::remove(dir_ / (guid + ".toml"), ec);
+  cache_[guid] = std::nullopt;
+}
+
 }  // namespace rb3pc
