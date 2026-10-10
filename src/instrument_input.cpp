@@ -363,4 +363,81 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
 
 }  // namespace
 
+std::vector<ControllerInfo> ConnectedControllers() {
+  return g_driver ? g_driver->Controllers() : std::vector<ControllerInfo>{};
+}
+
+void SetControllerType(size_t index, const std::string& type) {
+  if (index < 4) {
+    rex::cvar::SetFlagByName("controller_type_" + std::to_string(index + 1), type);
+  }
+}
+
+bool MouseKeyboardEnabled() { return REXCVAR_GET(mouse_keyboard); }
+
+void SetMouseKeyboardEnabled(bool on) {
+  rex::cvar::SetFlagByName("mouse_keyboard", on ? "true" : "false");
+  rex::cvar::SetFlagByName("mnk_mode", on ? "true" : "false");
+}
+
+void ApplyMouseKeyboardDefaults() {
+  // MnK merges into player 1. SDK defaults are a shooter's; replace with menu
+  // binds. Enablement is our own cvar since mnk_mode's default is off, so a
+  // saved off there is indistinguishable from unset.
+  SetMouseKeyboardEnabled(MouseKeyboardEnabled());
+  static const std::pair<const char*, const char*> kDefaults[] = {
+      {"mnk_mouse", "false"},       // no mouse look
+      {"mnk_wheel_dpad", "true"},   // the wheel moves through lists (SDK patch 0024)
+      {"keybind_dpad_up", "Up"},
+      {"keybind_dpad_down", "Down"},
+      {"keybind_dpad_left", "Left"},
+      {"keybind_dpad_right", "Right"},
+      {"keybind_a", "Return,NumpadEnter,Space,1,LMB"},  // green: select
+      {"keybind_b", "Escape,Backspace,2,RMB"},          // red: back
+      {"keybind_y", "3"},                               // yellow
+      {"keybind_x", "4"},                               // blue
+      {"keybind_left_shoulder", "5"},                   // orange
+      {"keybind_start", "Tab,P,MMB"},                   // overshell menu / pause
+      {"keybind_back", ""},
+      {"keybind_right_shoulder", ""},
+      {"keybind_left_trigger", ""},
+      {"keybind_right_trigger", ""},
+      {"keybind_lstick_up", ""},
+      {"keybind_lstick_down", ""},
+      {"keybind_lstick_left", ""},
+      {"keybind_lstick_right", ""},
+      {"keybind_lstick_press", ""},
+      {"keybind_rstick_up", ""},
+      {"keybind_rstick_down", ""},
+      {"keybind_rstick_left", ""},
+      {"keybind_rstick_right", ""},
+      {"keybind_rstick_press", ""},
+  };
+  for (const auto& [name, value] : kDefaults) {
+    if (!rex::cvar::HasNonDefaultValue(name)) rex::cvar::SetFlagByName(name, value);
+  }
+}
+
+std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
+  auto input = std::make_unique<rex::input::InputSystem>(nullptr);
+
+  if (!tool_mode) {
+    if (REXCVAR_GET(input_backend) == "sdl") {
+      auto sdl_driver = std::make_unique<rex::input::sdl::SDLInputDriver>(nullptr, 0);
+      if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
+        input->AddDriver(std::make_unique<InstrumentInputDriver>(std::move(sdl_driver)));
+      }
+    }
+    auto mnk_driver = std::make_unique<rex::input::mnk::MnkInputDriver>(nullptr, 0);
+    if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
+      input->AddDriver(std::move(mnk_driver));
+    }
+  }
+
+  uint8_t nop_index = tool_mode ? 0 : 1;
+  input->AddDriver(std::make_unique<rex::input::nop::NopInputDriver>(nullptr, nop_index));
+  input->SetDeviceAssignment(std::make_unique<rex::input::SlotAssignment>());
+  return input;
+}
+
 }  // namespace rb3pc
