@@ -1,0 +1,646 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 7a9df45..87a1dcd 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -331,11 +331,30 @@ class VulkanCommandProcessor : public CommandProcessor {
+    public:
+     explicit PipelineLayout(VkPipelineLayout pipeline_layout,
+                             VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref,
+-                            VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref)
++                            VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref,
++                            bool independent_sets = false)
+         : pipeline_layout_(pipeline_layout),
+           descriptor_set_layout_textures_vertex_ref_(descriptor_set_layout_textures_vertex_ref),
+-          descriptor_set_layout_textures_pixel_ref_(descriptor_set_layout_textures_pixel_ref) {}
++          descriptor_set_layout_textures_pixel_ref_(descriptor_set_layout_textures_pixel_ref),
++          independent_sets_(independent_sets) {}
+     VkPipelineLayout GetPipelineLayout() const override { return pipeline_layout_; }
++    const VulkanPipelineCache::PipelineLayoutProvider* GetIndependentSetsLayout() const override {
++      return independent_sets_layout_.get();
++    }
++    VkPipelineLayout GetLibraryPipelineLayout(bool vertex_side) const override {
++      return vertex_side ? library_layout_vertex_ : library_layout_pixel_;
++    }
++    // Pipeline layouts with and without independent sets aren't compatible
++    // for binding descriptor sets.
++    bool independent_sets() const { return independent_sets_; }
++    const PipelineLayout* independent_sets_layout() const { return independent_sets_layout_.get(); }
++    void SetIndependentSetsLayout(std::unique_ptr<PipelineLayout> layout) {
++      independent_sets_layout_ = std::move(layout);
++    }
++    void SetLibraryPipelineLayouts(VkPipelineLayout vertex_side, VkPipelineLayout pixel_side) {
++      library_layout_vertex_ = vertex_side;
++      library_layout_pixel_ = pixel_side;
++    }
+     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref() const {
+       return descriptor_set_layout_textures_vertex_ref_;
+     }
+@@ -347,6 +366,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+     VkPipelineLayout pipeline_layout_;
+     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref_;
+     VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref_;
++    bool independent_sets_;
++    std::unique_ptr<PipelineLayout> independent_sets_layout_;
++    // Owned by the command processor (library_pipeline_layouts_).
++    VkPipelineLayout library_layout_vertex_ = VK_NULL_HANDLE;
++    VkPipelineLayout library_layout_pixel_ = VK_NULL_HANDLE;
+   };
+ 
+   struct UsedSingleTransientDescriptor {
+@@ -592,6 +616,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Pipeline layouts are referenced by VulkanPipelineCache.
+   std::unordered_map<PipelineLayoutKey, PipelineLayout, PipelineLayoutKey::Hasher>
+       pipeline_layouts_;
++  // Layouts with only the vertex-side or the pixel-side descriptor sets for
++  // pipeline libraries, by side and texture descriptor set layout.
++  std::unordered_map<uint64_t, VkPipelineLayout> library_pipeline_layouts_;
++  VkPipelineLayout GetLibraryPipelineLayout(bool vertex_side,
++                                            VkDescriptorSetLayout textures_set_layout);
+ 
+   // No specific reason for 32768, just the "too much" descriptor count from
+   // Direct3D 12 PIX warnings.
+@@ -817,6 +846,9 @@ class VulkanCommandProcessor : public CommandProcessor {
+   const void* current_guest_graphics_pipeline_deferred_ = nullptr;
+   VkPipeline current_external_graphics_pipeline_;
+   VkPipeline current_external_compute_pipeline_;
++  // Cull mode and front face last set as dynamic state (cull mode | front face
++  // << 8), or -1 if not set since a pipeline with them static was bound.
++  int32_t current_dynamic_cull_front_ = -1;
+ 
+   // Pipeline layout of the current guest graphics pipeline.
+   const PipelineLayout* current_guest_graphics_pipeline_layout_;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 1f68981..3467a37 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -305,6 +305,14 @@ class DeferredCommandBuffer {
+     std::memcpy(args_ptr + sizeof(ArgsVkPushConstants), values, size);
+   }
+ 
++  // VK_EXT_extended_dynamic_state / Vulkan 1.3.
++  void CmdVkSetCullModeAndFrontFace(VkCullModeFlags cull_mode, VkFrontFace front_face) {
++    auto& args = *reinterpret_cast<ArgsVkSetCullModeAndFrontFace*>(WriteCommand(
++        Command::kVkSetCullModeAndFrontFace, sizeof(ArgsVkSetCullModeAndFrontFace)));
++    args.cull_mode = cull_mode;
++    args.front_face = front_face;
++  }
++
+   void CmdVkSetBlendConstants(const float* blend_constants) {
+     auto& args = *reinterpret_cast<ArgsVkSetBlendConstants*>(
+         WriteCommand(Command::kVkSetBlendConstants, sizeof(ArgsVkSetBlendConstants)));
+@@ -387,6 +395,7 @@ class DeferredCommandBuffer {
+     kVkPushConstants,
+     kVkResetQueryPool,
+     kVkSetBlendConstants,
++    kVkSetCullModeAndFrontFace,
+     kVkSetDepthBias,
+     kVkSetScissor,
+     kVkSetStencilCompareMask,
+@@ -564,6 +573,11 @@ class DeferredCommandBuffer {
+     // Followed by `size` bytes of values.
+   };
+ 
++  struct ArgsVkSetCullModeAndFrontFace {
++    VkCullModeFlags cull_mode;
++    VkFrontFace front_face;
++  };
++
+   struct ArgsVkSetBlendConstants {
+     float blend_constants[4];
+   };
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 56e3450..0aaa7fc 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -18,6 +18,7 @@
+ #include <deque>
+ #include <filesystem>
+ #include <functional>
++#include <future>
+ #include <memory>
+ #include <mutex>
+ #include <queue>
+@@ -53,6 +54,16 @@ class VulkanPipelineCache {
+    public:
+     virtual ~PipelineLayoutProvider() {}
+     virtual VkPipelineLayout GetPipelineLayout() const = 0;
++    // Pipeline libraries (see EnsurePipelineCreated): the same layout created
++    // with independent descriptor sets, so the vertex-side library doesn't
++    // depend on the pixel shader's textures and vice versa. nullptr if
++    // unavailable.
++    virtual const PipelineLayoutProvider* GetIndependentSetsLayout() const { return nullptr; }
++    // For an independent-sets layout: the layout with only the sets used by
++    // the vertex side or the pixel side.
++    virtual VkPipelineLayout GetLibraryPipelineLayout(bool vertex_side) const {
++      return VK_NULL_HANDLE;
++    }
+ 
+    protected:
+     PipelineLayoutProvider() = default;
+@@ -94,9 +105,16 @@ class VulkanPipelineCache {
+       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
+   bool IsCreatingPipelines() const;
++  // Whether new pipelines can be linked from vertex-side and pixel-side
++  // libraries (VK_EXT_graphics_pipeline_library with fast linking, FSI).
++  bool PipelineLibrariesUsable() const;
+   // Where a pipeline handle from ConfigurePipeline keeps its VkPipeline, for
+   // binding it once a deferred creation has completed.
+   static const std::atomic<VkPipeline>* GetPipelineHandleSlot(void* handle);
++  // Whether the pipeline takes its cull mode and front face as dynamic state,
++  // and their values for it.
++  static bool GetPipelineDynamicCullFront(void* handle, VkCullModeFlags& cull_mode_out,
++                                          VkFrontFace& front_face_out);
+   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
+                                     const PipelineLayoutProvider*& pipeline_layout_out,
+                                     bool* is_placeholder_out = nullptr) const;
+@@ -246,6 +264,11 @@ class VulkanPipelineCache {
+     // submission is executed, after the pipeline cache's EndSubmission has
+     // waited for the queue.
+     std::atomic<bool> creation_pending{false};
++    // Created with dynamic cull mode and front face (pipelines linked from
++    // libraries), which the draw then sets to these. Known before creation.
++    bool dynamic_cull_front = false;
++    VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
++    VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+     Pipeline() = default;
+     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
+         : pipeline_layout(pipeline_layout_provider) {}
+@@ -253,7 +276,10 @@ class VulkanPipelineCache {
+         : pipeline(other.pipeline.load(std::memory_order_acquire)),
+           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
+           is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+-          creation_pending(other.creation_pending.load(std::memory_order_acquire)) {}
++          creation_pending(other.creation_pending.load(std::memory_order_acquire)),
++          dynamic_cull_front(other.dynamic_cull_front),
++          cull_mode(other.cull_mode),
++          front_face(other.front_face) {}
+     Pipeline& operator=(const Pipeline& other) {
+       if (this == &other) {
+         return *this;
+@@ -265,6 +291,9 @@ class VulkanPipelineCache {
+                            std::memory_order_release);
+       creation_pending.store(other.creation_pending.load(std::memory_order_acquire),
+                              std::memory_order_release);
++      dynamic_cull_front = other.dynamic_cull_front;
++      cull_mode = other.cull_mode;
++      front_face = other.front_face;
+       return *this;
+     }
+   };
+@@ -291,6 +320,8 @@ class VulkanPipelineCache {
+     // compiles the pixel-side library into the VkPipelineCache (warm-up).
+     enum class LibraryMode : uint8_t { kNone, kLink, kFragmentOnly };
+     LibraryMode library_mode = LibraryMode::kNone;
++    // Cull mode and front face as dynamic state (Pipeline::dynamic_cull_front).
++    bool dynamic_cull_front = false;
+   };
+   struct PipelineCreationArgumentsPriorityComparator {
+     bool operator()(const PipelineCreationArguments& a, const PipelineCreationArguments& b) const {
+@@ -359,7 +390,9 @@ class VulkanPipelineCache {
+   // Pipeline libraries for LibraryMode::kLink, by a hash of what they're
+   // built from; destroyed at shutdown.
+   std::mutex pipeline_libraries_mutex_;
+-  std::unordered_map<uint64_t, VkPipeline> pipeline_libraries_;
++  // Shared so a library being created by one thread is waited for, not
++  // created again, by another.
++  std::unordered_map<uint64_t, std::shared_future<VkPipeline>> pipeline_libraries_;
+   // Compiles a pipeline for each shader pair from the title's warm-up source
+   // (rex/system/shader_warmup.h) that the list at warmup_list_path doesn't
+   // have yet, so the driver's compiled pixel shaders are in the persistent
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 1f1b68b..b518626 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -166,6 +166,11 @@ class VulkanDevice {
+     bool graphicsPipelineLibrary = false;
+     bool graphicsPipelineLibraryFastLinking = false;
+ 
++    // Dynamic cull mode and front face (VK_EXT_extended_dynamic_state, core
++    // in Vulkan 1.3; only used with 1.3).
++
++    bool extendedDynamicStateCullFront = false;
++
+     // VK_EXT_custom_border_color
+ 
+     bool customBorderColors = false;
+@@ -227,6 +232,8 @@ class VulkanDevice {
+ #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
+ #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
++    // VK_EXT_extended_dynamic_state (#268, promoted to 1.3)
++#include <rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc>
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ #undef XE_UI_VULKAN_FUNCTION
+   };
+diff --git a/include/rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc b/include/rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc
+new file mode 100644
+index 0000000..a43901d
+--- /dev/null
++++ b/include/rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc
+@@ -0,0 +1,4 @@
++// VK_EXT_extended_dynamic_state functions used in ReXGlue (only loaded with
++// Vulkan 1.3, where they're core).
++XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetCullModeEXT, vkCmdSetCullMode)
++XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetFrontFaceEXT, vkCmdSetFrontFace)
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 8f3ffa7..d5fd1df 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2054,8 +2054,15 @@ void VulkanCommandProcessor::ShutdownContext() {
+ 
+   for (const auto& pipeline_layout_pair : pipeline_layouts_) {
+     dfn.vkDestroyPipelineLayout(device, pipeline_layout_pair.second.GetPipelineLayout(), nullptr);
++    if (const PipelineLayout* independent = pipeline_layout_pair.second.independent_sets_layout()) {
++      dfn.vkDestroyPipelineLayout(device, independent->GetPipelineLayout(), nullptr);
++    }
+   }
+   pipeline_layouts_.clear();
++  for (const auto& library_layout_pair : library_pipeline_layouts_) {
++    dfn.vkDestroyPipelineLayout(device, library_layout_pair.second, nullptr);
++  }
++  library_pipeline_layouts_.clear();
+   for (const auto& descriptor_set_layout_pair : descriptor_set_layouts_textures_) {
+     dfn.vkDestroyDescriptorSetLayout(device, descriptor_set_layout_pair.second, nullptr);
+   }
+@@ -3462,8 +3469,63 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
+       std::piecewise_construct, std::forward_as_tuple(pipeline_layout_key),
+       std::forward_as_tuple(pipeline_layout, descriptor_set_layout_textures_vertex,
+                             descriptor_set_layout_textures_pixel));
++  PipelineLayout& new_layout = emplaced_pair.first->second;
++
++  // For pipelines linked from libraries: the same sets with
++  // VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, so the vertex-side
++  // library can be created with only the vertex-side sets and reused with any
++  // pixel shader (and the other way around).
++  if (pipeline_cache_ && pipeline_cache_->PipelineLibrariesUsable()) {
++    VkPipelineLayout library_layout_vertex =
++        GetLibraryPipelineLayout(true, descriptor_set_layout_textures_vertex);
++    VkPipelineLayout library_layout_pixel =
++        GetLibraryPipelineLayout(false, descriptor_set_layout_textures_pixel);
++    pipeline_layout_create_info.flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
++    VkPipelineLayout independent_layout;
++    if (library_layout_vertex != VK_NULL_HANDLE && library_layout_pixel != VK_NULL_HANDLE &&
++        dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
++                                   &independent_layout) == VK_SUCCESS) {
++      auto independent = std::make_unique<PipelineLayout>(
++          independent_layout, descriptor_set_layout_textures_vertex,
++          descriptor_set_layout_textures_pixel, true);
++      independent->SetLibraryPipelineLayouts(library_layout_vertex, library_layout_pixel);
++      new_layout.SetIndependentSetsLayout(std::move(independent));
++    }
++  }
++
+   // unordered_map insertion doesn't invalidate element references.
+-  return &emplaced_pair.first->second;
++  return &new_layout;
++}
++
++VkPipelineLayout VulkanCommandProcessor::GetLibraryPipelineLayout(
++    bool vertex_side, VkDescriptorSetLayout textures_set_layout) {
++  uint64_t key = (uint64_t(textures_set_layout) << 1) | uint64_t(vertex_side);
++  auto it = library_pipeline_layouts_.find(key);
++  if (it != library_pipeline_layouts_.end()) {
++    return it->second;
++  }
++  VkDescriptorSetLayout descriptor_set_layouts[SpirvShaderTranslator::kDescriptorSetCount] = {};
++  descriptor_set_layouts[SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
++      descriptor_set_layout_shared_memory_and_edram_;
++  descriptor_set_layouts[SpirvShaderTranslator::kDescriptorSetConstants] =
++      descriptor_set_layout_constants_;
++  descriptor_set_layouts[vertex_side ? SpirvShaderTranslator::kDescriptorSetTexturesVertex
++                                     : SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
++      textures_set_layout;
++  VkPipelineLayoutCreateInfo pipeline_layout_create_info = {
++      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++  pipeline_layout_create_info.flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
++  pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
++  pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  VkPipelineLayout pipeline_layout;
++  if (vulkan_device->functions().vkCreatePipelineLayout(
++          vulkan_device->device(), &pipeline_layout_create_info, nullptr, &pipeline_layout) !=
++      VK_SUCCESS) {
++    return VK_NULL_HANDLE;
++  }
++  library_pipeline_layouts_.emplace(key, pipeline_layout);
++  return pipeline_layout;
+ }
+ 
+ VulkanCommandProcessor::ScratchBufferAcquisition VulkanCommandProcessor::AcquireScratchGpuBuffer(
+@@ -3559,6 +3621,7 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
+   }
+   deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   current_external_graphics_pipeline_ = pipeline;
++  current_dynamic_cull_front_ = -1;
+   current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+   current_guest_graphics_pipeline_deferred_ = nullptr;
+   current_guest_graphics_pipeline_layout_ = VK_NULL_HANDLE;
+@@ -3913,6 +3976,23 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+     }
+   }
++  // Pipelines linked from libraries take the cull mode and front face as
++  // dynamic state, so the vertex-side library is shared between them. Binding
++  // a pipeline with them static invalidates them.
++  {
++    VkCullModeFlags cull_mode;
++    VkFrontFace front_face;
++    if (pipeline_handle &&
++        VulkanPipelineCache::GetPipelineDynamicCullFront(pipeline_handle, cull_mode, front_face)) {
++      int32_t cull_front = int32_t(cull_mode) | (int32_t(front_face) << 8);
++      if (current_dynamic_cull_front_ != cull_front) {
++        deferred_command_buffer_.CmdVkSetCullModeAndFrontFace(cull_mode, front_face);
++        current_dynamic_cull_front_ = cull_front;
++      }
++    } else {
++      current_dynamic_cull_front_ = -1;
++    }
++  }
+ 
+   // Update the graphics pipeline, and if the new graphics pipeline has a
+   // different layout, invalidate incompatible descriptor sets before updating
+@@ -3934,6 +4014,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         descriptor_sets_kept = std::min(
+             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+       }
++      if (current_guest_graphics_pipeline_layout_->independent_sets() !=
++          pipeline_layout->independent_sets()) {
++        descriptor_sets_kept = 0;
++      }
++      current_graphics_descriptor_sets_bound_up_to_date_ &=
++          (UINT32_C(1) << descriptor_sets_kept) - 1;
+     } else {
+       // No or unknown pipeline layout previously bound - all bindings are in an
+       // indeterminate state.
+@@ -5213,6 +5299,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     current_guest_graphics_pipeline_deferred_ = nullptr;
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_compute_pipeline_ = VK_NULL_HANDLE;
++    current_dynamic_cull_front_ = -1;
+     current_guest_graphics_pipeline_layout_ = nullptr;
+     current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+ 
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 2c36ff8..0dfe065 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -526,6 +526,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+         dfn.vkCmdSetBlendConstants(command_buffer, args.blend_constants);
+       } break;
+ 
++      case Command::kVkSetCullModeAndFrontFace: {
++        auto& args = *reinterpret_cast<const ArgsVkSetCullModeAndFrontFace*>(stream);
++        dfn.vkCmdSetCullMode(command_buffer, args.cull_mode);
++        dfn.vkCmdSetFrontFace(command_buffer, args.front_face);
++      } break;
++
+       case Command::kVkSetDepthBias: {
+         auto& args = *reinterpret_cast<const ArgsVkSetDepthBias*>(stream);
+         dfn.vkCmdSetDepthBias(command_buffer, args.depth_bias_constant_factor,
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index abbe5d9..b02b804 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -926,7 +926,10 @@ void VulkanPipelineCache::Shutdown() {
+   }
+   pipelines_.clear();
+   for (const auto& library_pair : pipeline_libraries_) {
+-    dfn.vkDestroyPipeline(device, library_pair.second, nullptr);
++    VkPipeline library = library_pair.second.get();
++    if (library != VK_NULL_HANDLE) {
++      dfn.vkDestroyPipeline(device, library, nullptr);
++    }
+   }
+   pipeline_libraries_.clear();
+ 
+@@ -1236,6 +1239,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     }
+     if (found_pipeline == VK_NULL_HANDLE) {
+       PipelineCreationArguments creation_arguments;
++      it->second.dynamic_cull_front = false;
+       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
+           !EnsurePipelineCreated(creation_arguments)) {
+         return false;
+@@ -1283,6 +1287,24 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   }
+ 
+   creation_arguments_real.library_mode = PipelineCreationArguments::LibraryMode::kLink;
++  // Linked from libraries: with independent descriptor sets and the cull mode
++  // and front face as dynamic state, one vertex-side library serves every
++  // pixel shader, cull mode and winding the vertex shader is drawn with.
++  if (!queued_async_creation && PipelineLibrariesUsable()) {
++    if (const PipelineLayoutProvider* independent_layout =
++            creation_arguments_real.pipeline_layout->GetIndependentSetsLayout()) {
++      creation_arguments_real.pipeline_layout = independent_layout;
++    }
++    if (command_processor_.GetVulkanDevice()->properties().extendedDynamicStateCullFront) {
++      creation_arguments_real.dynamic_cull_front = true;
++      pipeline.second.dynamic_cull_front = true;
++      pipeline.second.cull_mode = (description.cull_front ? VK_CULL_MODE_FRONT_BIT : 0) |
++                                  (description.cull_back ? VK_CULL_MODE_BACK_BIT : 0);
++      pipeline.second.front_face = description.front_face_clockwise
++                                       ? VK_FRONT_FACE_CLOCKWISE
++                                       : VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    }
++  }
+   bool queued_deferred_creation = false;
+   if (!queued_async_creation && REXCVAR_GET(vulkan_deferred_pipeline_creation) &&
+       !creation_threads_.empty()) {
+@@ -1335,6 +1357,22 @@ const std::atomic<VkPipeline>* VulkanPipelineCache::GetPipelineHandleSlot(void*
+   return &static_cast<Pipeline*>(handle)->pipeline;
+ }
+ 
++bool VulkanPipelineCache::GetPipelineDynamicCullFront(void* handle, VkCullModeFlags& cull_mode_out,
++                                                      VkFrontFace& front_face_out) {
++  const Pipeline& pipeline = *static_cast<const Pipeline*>(handle);
++  cull_mode_out = pipeline.cull_mode;
++  front_face_out = pipeline.front_face;
++  return pipeline.dynamic_cull_front;
++}
++
++bool VulkanPipelineCache::PipelineLibrariesUsable() const {
++  const ui::vulkan::VulkanDevice::Properties& device_properties =
++      command_processor_.GetVulkanDevice()->properties();
++  return REXCVAR_GET(vulkan_pipeline_library) && device_properties.graphicsPipelineLibrary &&
++         device_properties.graphicsPipelineLibraryFastLinking &&
++         render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
++}
++
+ bool VulkanPipelineCache::IsCreatingPipelines() const {
+   std::lock_guard<std::mutex> lock(creation_request_lock_);
+   if (creation_threads_.empty()) {
+@@ -3540,7 +3578,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     color_blend_state.pAttachments = color_blend_attachments;
+   }
+ 
+-  std::array<VkDynamicState, 7> dynamic_states;
++  std::array<VkDynamicState, 9> dynamic_states;
+   VkPipelineDynamicStateCreateInfo dynamic_state;
+   dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+   dynamic_state.pNext = nullptr;
+@@ -3560,6 +3598,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_WRITE_MASK;
+     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+   }
++  if (creation_arguments.dynamic_cull_front) {
++    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_CULL_MODE;
++    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_FRONT_FACE;
++  }
+ 
+   VkPipelineTessellationStateCreateInfo tessellation_state = {};
+   if (tessellated) {
+@@ -3645,8 +3687,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+       shader_stages[shader_stage_count - 1].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+   bool linked = false;
+   if (use_libraries) {
++    // With independent descriptor sets, each side only has its own sets.
++    VkPipelineLayout library_layouts[2];
++    for (uint32_t i = 0; i < 2; ++i) {
++      library_layouts[i] = creation_arguments.pipeline_layout->GetLibraryPipelineLayout(i == 0);
++      if (library_layouts[i] == VK_NULL_HANDLE) {
++        library_layouts[i] = pipeline_create_info.layout;
++      }
++    }
+     auto create_library = [&](VkGraphicsPipelineLibraryFlagsEXT parts, uint32_t stage_count,
+-                              const VkPipelineShaderStageCreateInfo* stages) -> VkPipeline {
++                              const VkPipelineShaderStageCreateInfo* stages,
++                              VkPipelineLayout layout) -> VkPipeline {
+       VkGraphicsPipelineLibraryCreateInfoEXT library_info = {};
+       library_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT;
+       library_info.pNext = use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
+@@ -3656,6 +3707,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+       library_create_info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+       library_create_info.stageCount = stage_count;
+       library_create_info.pStages = stages;
++      library_create_info.layout = layout;
+       VkPipeline library;
+       if (dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1, &library_create_info,
+                                         nullptr, &library) != VK_SUCCESS) {
+@@ -3673,7 +3725,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     const VkPipelineShaderStageCreateInfo& fragment_stage = shader_stages[shader_stage_count - 1];
+ 
+     if (creation_arguments.library_mode == LibraryMode::kFragmentOnly) {
+-      VkPipeline library = create_library(kFragmentParts, 1, &fragment_stage);
++      VkPipeline library = create_library(kFragmentParts, 1, &fragment_stage, library_layouts[1]);
+       if (library == VK_NULL_HANDLE) {
+         return false;
+       }
+@@ -3694,50 +3746,52 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     vertex_key.parts = kVertexParts;
+     vertex_key.module = uint64_t(shader_stages[0].module);
+     vertex_key.geometry_module = uint64_t(creation_arguments.geometry_shader);
+-    vertex_key.layout = uint64_t(pipeline_create_info.layout);
++    vertex_key.layout = uint64_t(library_layouts[0]);
+     vertex_key.render_pass = uint64_t(pipeline_create_info.renderPass);
+     vertex_key.state[0] = uint32_t(input_assembly_state.topology);
+     vertex_key.state[1] = input_assembly_state.primitiveRestartEnable;
+     vertex_key.state[2] = uint32_t(rasterization_state.polygonMode);
+-    vertex_key.state[3] = rasterization_state.cullMode;
+-    vertex_key.state[4] = uint32_t(rasterization_state.frontFace);
++    if (!creation_arguments.dynamic_cull_front) {
++      vertex_key.state[3] = rasterization_state.cullMode;
++      vertex_key.state[4] = uint32_t(rasterization_state.frontFace);
++    }
++    vertex_key.state[7] = uint32_t(creation_arguments.dynamic_cull_front);
+     vertex_key.state[5] = rasterization_state.depthClampEnable |
+                           (rasterization_state.rasterizerDiscardEnable << 1) |
+                           (rasterization_state.depthBiasEnable << 2);
+     vertex_key.state[6] = uint32_t(use_dynamic_rendering);
+     fragment_key.parts = kFragmentParts;
+     fragment_key.module = uint64_t(fragment_stage.module);
+-    fragment_key.layout = vertex_key.layout;
++    fragment_key.layout = uint64_t(library_layouts[1]);
+     fragment_key.render_pass = vertex_key.render_pass;
+     fragment_key.state[0] = uint32_t(multisample_state.rasterizationSamples);
+     fragment_key.state[1] = multisample_state.sampleShadingEnable;
+     fragment_key.state[2] = multisample_state.pSampleMask ? *multisample_state.pSampleMask : ~0u;
+     fragment_key.state[3] = uint32_t(use_dynamic_rendering);
+     auto get_library = [&](const auto& key, VkGraphicsPipelineLibraryFlagsEXT parts,
+-                           uint32_t stage_count,
+-                           const VkPipelineShaderStageCreateInfo* stages) -> VkPipeline {
++                           uint32_t stage_count, const VkPipelineShaderStageCreateInfo* stages,
++                           VkPipelineLayout layout) -> VkPipeline {
+       uint64_t hash = XXH3_64bits(&key, sizeof(key));
++      std::promise<VkPipeline> library_promise;
+       {
+-        std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
++        std::unique_lock<std::mutex> lock(pipeline_libraries_mutex_);
+         auto it = pipeline_libraries_.find(hash);
+         if (it != pipeline_libraries_.end()) {
+-          return it->second;
++          // Possibly still being created by another thread.
++          std::shared_future<VkPipeline> library = it->second;
++          lock.unlock();
++          return library.get();
+         }
++        pipeline_libraries_.emplace(hash, library_promise.get_future().share());
+       }
+-      VkPipeline library = create_library(parts, stage_count, stages);
+-      if (library == VK_NULL_HANDLE) {
+-        return VK_NULL_HANDLE;
+-      }
+-      std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
+-      auto [it, inserted] = pipeline_libraries_.emplace(hash, library);
+-      if (!inserted) {
+-        dfn.vkDestroyPipeline(device, library, nullptr);
+-      }
+-      return it->second;
++      VkPipeline library = create_library(parts, stage_count, stages, layout);
++      library_promise.set_value(library);
++      return library;
+     };
+     VkPipeline libraries[2] = {
+-        get_library(vertex_key, kVertexParts, shader_stage_count - 1, shader_stages.data()),
+-        get_library(fragment_key, kFragmentParts, 1, &fragment_stage)};
++        get_library(vertex_key, kVertexParts, shader_stage_count - 1, shader_stages.data(),
++                    library_layouts[0]),
++        get_library(fragment_key, kFragmentParts, 1, &fragment_stage, library_layouts[1])};
+     if (libraries[0] != VK_NULL_HANDLE && libraries[1] != VK_NULL_HANDLE) {
+       VkPipelineLibraryCreateInfoKHR link_info = {};
+       link_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+@@ -4065,7 +4119,8 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+                    render_target_cache_.draw_resolution_scale_y(),
+                    uint32_t(render_target_cache_.msaa_2x_attachments_supported()),
+                    uint32_t(render_target_cache_.msaa_2x_no_attachments_supported()),
+-                   uint32_t(warm_libraries)};
++                   // 2: independent sets and dynamic cull mode (patch 0018).
++                   warm_libraries ? 2u : 0u};
+   const uint64_t salt = XXH3_64bits(&salt_source, sizeof(salt_source));
+   // One list per salt, so switching e.g. the resolution scale back and forth
+   // doesn't throw away the other setting's list.
+@@ -4316,8 +4371,14 @@ void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list
+           creation_arguments.pixel_shader = item.pixel;
+           creation_arguments.render_pass = render_pass;
+           if (warm_libraries) {
++            // As ConfigurePipeline creates them.
+             creation_arguments.library_mode =
+                 PipelineCreationArguments::LibraryMode::kFragmentOnly;
++            if (const PipelineLayoutProvider* independent_layout =
++                    pipeline_layout->GetIndependentSetsLayout()) {
++              creation_arguments.pipeline_layout = independent_layout;
++            }
++            creation_arguments.dynamic_cull_front = device_properties.extendedDynamicStateCullFront;
+           }
+           if (EnsurePipelineCreated(creation_arguments)) {
+             compiled.fetch_add(1);
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 7ad65da..64e5a2a 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -677,6 +677,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     if (with_gpu_emulation) {
+       XE_UI_VULKAN_FEATURE_2(features_1_3, shaderDemoteToHelperInvocation);
+       XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
++      XE_UI_VULKAN_FEATURE_IMPLIED(extendedDynamicStateCullFront)
+     }
+   } else {
+     if (ext_1_3_KHR_dynamic_rendering) {
+@@ -799,6 +800,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+ #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
+ #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
++#include <rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc>
+   }
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ 
