@@ -31,6 +31,7 @@ set(RB3PC_SOURCES
     src/bindings_dialog.cpp
     src/boot_speed.cpp
     src/frame_stats.cpp
+    src/display_dialog.cpp
     src/title_icon.cpp
     src/loading_screen.cpp
     src/rb3_assets.cpp
