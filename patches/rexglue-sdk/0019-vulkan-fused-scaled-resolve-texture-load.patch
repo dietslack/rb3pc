@@ -1,0 +1,285 @@
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index f0e5b32..6c48a11 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -364,6 +364,16 @@ class VulkanTextureCache final : public TextureCache {
+   // log2(bytes per texel) - 2, for 4, 8 and 16 bytes.
+   VkPipelineLayout store_pipeline_layout_ = VK_NULL_HANDLE;
+   std::array<VkPipeline, 3> store_pipelines_{};
++  // Resolution-scaled resolve results with 32 bits per texel (colour, and
++  // 24-bit unorm or float depth) decoded from the scaled resolve buffer
++  // straight into the image in one pass, rather than loaded to a buffer and
++  // then stored (RB3 resolves and samples one 512x512 shadow map ~115 times a
++  // frame). Indexed by FusedLoadTransform.
++  enum class FusedLoadTransform : uint32_t { kNone, kDepthUnorm, kDepthFloat, kCount };
++  VkPipelineLayout fused_load_pipeline_layout_ = VK_NULL_HANDLE;
++  std::array<VkPipeline, size_t(FusedLoadTransform::kCount)> fused_load_pipelines_{};
++  bool TryLoadScaledResolveFused(VulkanTexture& texture, LoadShaderIndex load_shader,
++                                 const HostFormat& host_format);
+   // The integer format with the same texel size as an uncompressed host
+   // format, for its storage view; VK_FORMAT_UNDEFINED if the direct store
+   // can't be used for it.
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index c40244d..bb8ad8c 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -36,6 +36,9 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
++REXCVAR_DEFINE_BOOL(vulkan_fused_texture_load, true, "GPU/Vulkan",
++                    "Decode resolution-scaled 32bpp resolve results straight into the texture "
++                    "in one compute pass, instead of to a buffer and then to the texture");
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -485,6 +488,14 @@ VulkanTextureCache::~VulkanTextureCache() {
+       dfn.vkDestroyPipeline(device, store_pipeline, nullptr);
+     }
+   }
++  for (VkPipeline fused_load_pipeline : fused_load_pipelines_) {
++    if (fused_load_pipeline != VK_NULL_HANDLE) {
++      dfn.vkDestroyPipeline(device, fused_load_pipeline, nullptr);
++    }
++  }
++  if (fused_load_pipeline_layout_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyPipelineLayout(device, fused_load_pipeline_layout_, nullptr);
++  }
+   if (store_pipeline_layout_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyPipelineLayout(device, store_pipeline_layout_, nullptr);
+   }
+@@ -1316,6 +1327,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   if (pipeline == VK_NULL_HANDLE) {
+     return false;
+   }
++  if (load_base && (!load_mips || texture_key.mip_max_level == 0) &&
++      TryLoadScaledResolveFused(vulkan_texture, load_shader, host_format)) {
++    return true;
++  }
+   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
+   LoadShaderIndex load_shader_float_convert = kLoadShaderIndexUnknown;
+   if (host_format.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+@@ -1947,6 +1962,106 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   return true;
+ }
+ 
++bool VulkanTextureCache::TryLoadScaledResolveFused(VulkanTexture& texture,
++                                                   LoadShaderIndex load_shader,
++                                                   const HostFormat& host_format) {
++  TextureKey texture_key = texture.key();
++  FusedLoadTransform transform;
++  switch (load_shader) {
++    case kLoadShaderIndex32bpb:
++      transform = FusedLoadTransform::kNone;
++      break;
++    case kLoadShaderIndexDepthUnorm:
++      transform = FusedLoadTransform::kDepthUnorm;
++      break;
++    case kLoadShaderIndexDepthFloat:
++      transform = FusedLoadTransform::kDepthFloat;
++      break;
++    default:
++      return false;
++  }
++  if (!REXCVAR_GET(vulkan_fused_texture_load)) {
++    return false;
++  }
++  VkPipeline pipeline = fused_load_pipelines_[size_t(transform)];
++  const texture_util::TextureGuestLayout& guest_layout = texture.guest_layout();
++  // A single 2D level, not in a packed mip tail, of a resolve result.
++  if (pipeline == VK_NULL_HANDLE || !texture_key.scaled_resolve || !texture_key.tiled ||
++      texture_key.dimension != xenos::DataDimension::k2DOrStacked ||
++      texture_key.GetDepthOrArraySize() != 1 || texture_key.mip_max_level != 0 ||
++      guest_layout.packed_level == 0 || texture.force_load_3d_tiling() ||
++      host_format.block_compressed || FormatInfo::Get(texture_key.format)->bytes_per_block() != 4 ||
++      texture.storage_load_format() != VK_FORMAT_R32_UINT) {
++    return false;
++  }
++  VkImageView storage_view = texture.GetStorageLoadView();
++  if (storage_view == VK_NULL_HANDLE) {
++    return false;
++  }
++  uint64_t source_start, source_range;
++  if (!GetScaledResolveRange(texture_key.base_page << 12, texture.GetGuestBaseSize(), 4,
++                             source_start, source_range)) {
++    return false;
++  }
++  VkDescriptorSet descriptor_set_source = command_processor_.AllocateSingleTransientDescriptor(
++      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
++  VkDescriptorSet descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
++      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
++  if (descriptor_set_source == VK_NULL_HANDLE || descriptor_set_dest == VK_NULL_HANDLE) {
++    return false;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  VkDescriptorBufferInfo source_info = {scaled_resolve_buffer_, source_start, source_range};
++  VkDescriptorImageInfo dest_info = {VK_NULL_HANDLE, storage_view, VK_IMAGE_LAYOUT_GENERAL};
++  VkWriteDescriptorSet writes[2] = {};
++  writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++  writes[0].dstSet = descriptor_set_source;
++  writes[0].descriptorCount = 1;
++  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++  writes[0].pBufferInfo = &source_info;
++  writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++  writes[1].dstSet = descriptor_set_dest;
++  writes[1].descriptorCount = 1;
++  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++  writes[1].pImageInfo = &dest_info;
++  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 2, writes, 0,
++                                                    nullptr);
++
++  UseScaledResolveBufferForRead();
++  texture.MarkAsUsed();
++  VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kStorageDestination);
++  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
++  VkAccessFlags src_access_mask, dst_access_mask;
++  VkImageLayout old_layout, new_layout;
++  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
++  GetTextureUsageMasks(VulkanTexture::Usage::kStorageDestination, dst_stage_mask,
++                       dst_access_mask, new_layout);
++  // The whole image is overwritten, so its old contents can be dropped.
++  command_processor_.PushImageMemoryBarrier(
++      texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
++      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask, 0,
++      dst_access_mask, VK_IMAGE_LAYOUT_UNDEFINED, new_layout);
++  command_processor_.SubmitBarriers(true);
++
++  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  command_processor_.BindExternalComputePipeline(pipeline);
++  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                         fused_load_pipeline_layout_, 0, 1,
++                                         &descriptor_set_source, 0, nullptr);
++  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                         fused_load_pipeline_layout_, 1, 1, &descriptor_set_dest,
++                                         0, nullptr);
++  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
++  uint32_t constants[5] = {
++      (uint32_t(texture_key.endianness) << 2) | (scale_x << 4) | (scale_y << 7),
++      guest_layout.base.row_pitch_bytes / 4, texture_key.GetWidth() * scale_x,
++      texture_key.GetHeight() * scale_y, 0};
++  command_buffer.CmdVkPushConstants(fused_load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                    sizeof(constants), constants);
++  command_buffer.CmdVkDispatch((constants[2] + 31) / 32, (constants[3] + 15) / 16, 1);
++  return true;
++}
++
+ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
+   uint32_t bindings_remaining = fetch_constant_mask;
+   uint32_t binding_index;
+@@ -3196,6 +3311,116 @@ void main() {{
+     }
+   }
+ 
++  // Fused loading of resolution-scaled 32bpp resolve results (see
++  // fused_load_pipelines_). A port of Xenia's texture_load_32bpb with
++  // XE_TEXTURE_LOAD_RESOLUTION_SCALED (texture_load.xesli,
++  // texture_address.xesli) and the depth transforms of texture_load_depth_*,
++  // writing through the texture's r32ui storage view.
++  if (IsDrawResolutionScaled() && store_pipeline_layout_ != VK_NULL_HANDLE) {
++    VkDescriptorSetLayout fused_set_layouts[] = {
++        command_processor_.GetSingleTransientDescriptorLayout(
++            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute),
++        command_processor_.GetSingleTransientDescriptorLayout(
++            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute)};
++    VkPushConstantRange fused_push_constants = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                                sizeof(uint32_t) * 5};
++    VkPipelineLayoutCreateInfo fused_layout_info = {};
++    fused_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    fused_layout_info.setLayoutCount = 2;
++    fused_layout_info.pSetLayouts = fused_set_layouts;
++    fused_layout_info.pushConstantRangeCount = 1;
++    fused_layout_info.pPushConstantRanges = &fused_push_constants;
++    if (dfn.vkCreatePipelineLayout(device, &fused_layout_info, nullptr,
++                                   &fused_load_pipeline_layout_) == VK_SUCCESS) {
++      static constexpr const char* kTransforms[] = {
++          // None.
++          "v",
++          // XeUNorm24To32: n / 2^24 with the top bit added back in, exact.
++          "floatBitsToUint(vec4((v >> 8u) + (v >> 31u)) * (1.0 / 16777216.0))",
++          // XeFloat20e4To32.
++          "Float20e4To32(v >> 8u)",
++      };
++      for (size_t i = 0; i < fused_load_pipelines_.size(); ++i) {
++        std::string source = fmt::format(R"(#version 450
++// 4 texels along X per invocation (16 bytes, consecutive in a scaled group).
++layout(local_size_x = 8, local_size_y = 16) in;
++layout(push_constant) uniform Constants {{
++  uint endian_scale;  // endian in 2:3, scale X in 4:6, scale Y in 7:9
++  uint guest_pitch_aligned;  // in blocks, unscaled
++  uint width;  // scaled
++  uint height;  // scaled
++  uint pad;
++}} c;
++layout(std430, set = 0, binding = 0) readonly buffer Source {{ uvec4 data[]; }} source;
++layout(set = 1, binding = 0, r32ui) uniform writeonly uimage2D dest;
++
++// Xenos 2D tiled address of a block (XeTextureTiledOffset2D).
++int TiledOffset2D(ivec2 p, uint pitch_aligned, uint bpb_log2) {{
++  int macro = ((p.x >> 5) + (p.y >> 5) * int(pitch_aligned >> 5u)) << (bpb_log2 + 7u);
++  int micro = ((p.x & 7) + ((p.y & 14) << 2)) << bpb_log2;
++  int offset = macro + ((micro & ~15) << 1) + (micro & 15) + ((p.y & 1) << 4);
++  return ((offset & ~511) << 3) + ((p.y & 16) << 7) + ((offset & 448) << 2) +
++         (((((p.y & 8) >> 2) + (p.x >> 3)) & 3) << 6) + (offset & 63);
++}}
++
++uvec4 Float20e4To32(uvec4 f24u32) {{
++  uvec4 mantissa = f24u32 & 0xFFFFFu;
++  uvec4 exponent = f24u32 >> 20u;
++  bvec4 is_denormalized = equal(exponent, uvec4(0u));
++  uvec4 mantissa_lzcnt = uvec4(20u) - uvec4(findMSB(mantissa));
++  exponent = mix(exponent, uvec4(1u) - mantissa_lzcnt, is_denormalized);
++  mantissa = mix(mantissa, (mantissa << mantissa_lzcnt) & 0xFFFFFu, is_denormalized);
++  return mix(((exponent + 112u) << 23u) | (mantissa << 3u), uvec4(0u),
++             equal(f24u32, uvec4(0u)));
++}}
++
++void main() {{
++  uvec2 position = uvec2(gl_GlobalInvocationID.x << 2u, gl_GlobalInvocationID.y);
++  if (position.x >= c.width || position.y >= c.height) {{
++    return;
++  }}
++  uvec2 scale = (uvec2(c.endian_scale) >> uvec2(4u, 7u)) & 7u;
++  // Resolution-scaled layout: each 16-byte (4-texel) group of guest memory
++  // holds scale.x * scale.y host groups of 4 texels, column-major.
++  uvec2 host_group = uvec2(position.x >> 2u, position.y);
++  uvec2 guest_group = host_group / scale;
++  uvec2 group_in_guest = host_group - guest_group * scale;
++  uint address = uint(TiledOffset2D(ivec2(guest_group.x << 2u, guest_group.y),
++                                    c.guest_pitch_aligned, 2u));
++  address = address * (scale.x * scale.y) +
++            ((group_in_guest.x * scale.y + group_in_guest.y) << 4u);
++  uvec4 v = source.data[address >> 4u];
++  // XeEndianSwap32.
++  uint endian = (c.endian_scale >> 2u) & 3u;
++  if (endian == 1u || endian == 2u) {{
++    v = ((v & 0x00FF00FFu) << 8u) | ((v & 0xFF00FF00u) >> 8u);
++  }}
++  if (endian == 2u || endian == 3u) {{
++    v = (v << 16u) | (v >> 16u);
++  }}
++  v = {0};
++  for (uint i = 0u; i < 4u; ++i) {{
++    if (position.x + i < c.width) {{
++      imageStore(dest, ivec2(position.x + i, position.y), uvec4(v[i], 0u, 0u, 0u));
++    }}
++  }}
++}}
++)",
++                                         kTransforms[i]);
++        std::vector<uint32_t> spirv;
++        std::string error;
++        if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source, spirv,
++                                                   error)) {
++          REXGPU_WARN("VulkanTextureCache: Failed to compile the fused load shader: {}", error);
++          continue;
++        }
++        fused_load_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
++            vulkan_device, fused_load_pipeline_layout_, spirv.data(),
++            spirv.size() * sizeof(uint32_t));
++      }
++    }
++  }
++
+   // Use true null descriptors when supported; otherwise, keep compatibility
+   // fallback null images.
+   if (device_properties.nullDescriptor) {

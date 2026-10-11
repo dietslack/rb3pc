@@ -1,0 +1,113 @@
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 0dfe065..3a5a78b 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -89,9 +89,12 @@ class GpuTimer {
+   void Before(const VulkanCommandProcessor& cp, VkCommandBuffer command_buffer, GpuWork work,
+               VkPipeline pipeline) {
+     if (!active_) return;
+-    if (work == GpuWork::kDraw) ++draws_;
+-    std::pair<GpuWork, VkPipeline> label{work, work == GpuWork::kDispatch ? pipeline
+-                                                                          : VK_NULL_HANDLE};
++    if (work == GpuWork::kDraw) {
++      ++draws_;
++      ++draws_by_pipeline_[pipeline];
++    }
++    std::pair<GpuWork, VkPipeline> label{
++        work, work == GpuWork::kDispatch || work == GpuWork::kDraw ? pipeline : VK_NULL_HANDLE};
+     if (label != current_) {
+       current_ = label;
+       Stamp(cp, command_buffer, label);
+@@ -158,6 +161,7 @@ class GpuTimer {
+         auto [work, pipeline] = slot.labels[i];
+         totals_[size_t(work)] += ms;
+         if (work == GpuWork::kDispatch) dispatch_by_pipeline_[pipeline] += ms;
++        if (work == GpuWork::kDraw) draw_by_pipeline_[pipeline] += ms;
+       }
+       total_span_ += double(stamps[count - 1] - stamps[0]) * period_ms;
+     }
+@@ -176,6 +180,19 @@ class GpuTimer {
+     for (size_t i = 0; i < top.size() && i < 6; ++i) {
+       pipelines += fmt::format(" {:x}:{:.0f}", uint64_t(top[i].second), top[i].first / seconds);
+     }
++    std::vector<std::pair<double, VkPipeline>> top_draws;
++    for (auto& [pipeline, ms] : draw_by_pipeline_) top_draws.push_back({ms, pipeline});
++    std::sort(top_draws.rbegin(), top_draws.rend());
++    std::string draw_pipelines;
++    for (size_t i = 0; i < top_draws.size() && i < 10; ++i) {
++      draw_pipelines += fmt::format(" {:x}:{:.1f}/{:.0f}", uint64_t(top_draws[i].second),
++                                    top_draws[i].first / seconds,
++                                    draws_by_pipeline_[top_draws[i].second] / seconds);
++    }
++    REXGPU_INFO("GPU draw time by pipeline (ms/s / draws/s), {} pipelines:{}",
++                top_draws.size(), draw_pipelines);
++    draw_by_pipeline_.clear();
++    draws_by_pipeline_.clear();
+     REXGPU_INFO(
+         "GPU time (ms/s): busy {:.0f},{}, {:.0f} draws/s, {:.0f} copies/s ({:.0f} regions, "
+         "{:.1f} MB/s), {:.0f} image copies/s ({:.1f} Mtexels/s); dispatch pipelines:{}",
+@@ -194,6 +211,8 @@ class GpuTimer {
+   std::pair<GpuWork, VkPipeline> current_{GpuWork::kOther, VK_NULL_HANDLE};
+   std::array<double, size_t(GpuWork::kCount)> totals_{};
+   std::map<VkPipeline, double> dispatch_by_pipeline_;
++  std::map<VkPipeline, double> draw_by_pipeline_;
++  std::map<VkPipeline, uint64_t> draws_by_pipeline_;
+   double total_span_ = 0;
+   uint64_t draws_ = 0;
+   uint64_t copies_ = 0, copy_regions_ = 0, copy_bytes_ = 0, image_copies_ = 0, image_texels_ = 0;
+@@ -224,6 +243,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+   bool timing = REXCVAR_GET(vulkan_gpu_timing) &&
+                 GpuTimer::Get().Begin(command_processor_, command_buffer);
+   VkPipeline compute_pipeline = VK_NULL_HANDLE;
++  VkPipeline graphics_pipeline = VK_NULL_HANDLE;
+   bool skip_draws = false;
+   auto work_of = [](Command command) {
+     switch (command) {
+@@ -254,11 +274,17 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+         auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
+         if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+           compute_pipeline = args.pipeline;
++        } else {
++          graphics_pipeline = args.pipeline;
+         }
++      } else if (header.command == Command::kBindPipelineDeferred) {
++        graphics_pipeline = reinterpret_cast<const ArgsBindPipelineDeferred*>(stream)
++                                ->pipeline->load(std::memory_order_acquire);
+       }
+       GpuWork work = work_of(header.command);
+       if (work != GpuWork::kOther) {
+-        GpuTimer::Get().Before(command_processor_, command_buffer, work, compute_pipeline);
++        GpuTimer::Get().Before(command_processor_, command_buffer, work,
++                               work == GpuWork::kDraw ? graphics_pipeline : compute_pipeline);
+       }
+     }
+ 
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index b02b804..cb464d5 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -64,6 +64,8 @@ REXCVAR_DEFINE_BOOL(vulkan_deferred_pipeline_creation, true, "GPU/Vulkan",
+                     "when the submission is executed, instead of one at a time as draws need "
+                     "them (no draw is skipped)");
+ 
++REXCVAR_DECLARE(bool, vulkan_gpu_timing);
++
+ REXCVAR_DEFINE_BOOL(vulkan_pipeline_library, true, "GPU/Vulkan",
+                     "Build new pipelines during gameplay by linking separately compiled vertex "
+                     "and pixel shader parts (VK_EXT_graphics_pipeline_library), which the shader "
+@@ -3829,6 +3831,15 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+         uint32_t(use_dynamic_rendering));
+     return false;
+   }
++  if (REXCVAR_GET(vulkan_gpu_timing)) {
++    REXGPU_INFO(
++        "Graphics pipeline {:x}: VS {:016X}, PS {:016X}, primitive {}, linked {}, msaa {}",
++        uint64_t(pipeline), creation_arguments.vertex_shader->shader().ucode_data_hash(),
++        creation_arguments.pixel_shader ? creation_arguments.pixel_shader->shader().ucode_data_hash()
++                                        : 0,
++        uint32_t(description.primitive_topology), int(linked),
++        uint32_t(description.render_pass_key.msaa_samples));
++  }
+   bool was_placeholder =
+       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+   VkPipeline old_pipeline =
