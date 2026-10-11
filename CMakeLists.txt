@@ -24,6 +24,7 @@ set(RB3PC_SOURCES
     src/main.cpp
     src/debug_hooks.cpp
     src/app_hooks.cpp
+    src/screenshot.cpp
     src/instrument_input.cpp
     src/xekeys.cpp
     src/shm_cleanup.cpp
