@@ -1,0 +1,369 @@
+diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
+index 8200139..6163923 100644
+--- a/include/rex/codegen/config.h
++++ b/include/rex/codegen/config.h
+@@ -111,6 +111,10 @@ struct RecompilerConfig {
+   std::unordered_map<uint32_t, FunctionConfig> functions;  ///< Function/chunk configuration
+   std::unordered_map<uint32_t, JumpTable> switchTables;
+   std::unordered_map<uint32_t, MidAsmHook> midAsmHooks;
++  // Instruction address -> the instruction words it may hold at runtime. For
++  // executables that exist in several slightly patched builds: the emitted
++  // code switches on the word actually loaded there.
++  std::unordered_map<uint32_t, std::vector<uint32_t>> instructionVariants;
+   uint32_t longJmpAddress = 0;
+   uint32_t setJmpAddress = 0;
+ 
+diff --git a/include/rex/codegen/function_scanner.h b/include/rex/codegen/function_scanner.h
+index d5a3654..2932aaa 100644
+--- a/include/rex/codegen/function_scanner.h
++++ b/include/rex/codegen/function_scanner.h
+@@ -251,12 +251,16 @@ struct BlockDiscoveryResult {
+  * @param entryPoint Starting address of the function
+  * @param containingRegion Code region containing the entry point
+  * @param knownFunctions Set of known function entry points (to detect tail calls)
++ * @param hookJumpTargets Instruction address -> addresses a mid-asm hook there
++ *        may jump to. They're followed like branch targets, so code only a
++ *        hook reaches is still emitted.
+  * @return BlockDiscoveryResult containing blocks, branches, and jump tables
+  */
+ BlockDiscoveryResult discoverBlocks(
+     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
+     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize = 0,
+-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables = nullptr);
++    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables = nullptr,
++    const std::unordered_map<uint32_t, std::vector<uint32_t>>* hookJumpTargets = nullptr);
+ 
+ //=============================================================================
+ // Jump Table Detection
+diff --git a/src/codegen/builders.h b/src/codegen/builders.h
+index 24894f2..32afad2 100644
+--- a/src/codegen/builders.h
++++ b/src/codegen/builders.h
+@@ -163,6 +163,7 @@ bool build_srw(BuilderContext& ctx);
+ // Unconditional branch
+ bool build_b(BuilderContext& ctx);
+ bool build_bl(BuilderContext& ctx);
++bool build_bcl(BuilderContext& ctx);
+ bool build_blr(BuilderContext& ctx);
+ bool build_blrl(BuilderContext& ctx);
+ 
+diff --git a/src/codegen/builders/builder_context.h b/src/codegen/builders/builder_context.h
+index 33ac6d0..af9f838 100644
+--- a/src/codegen/builders/builder_context.h
++++ b/src/codegen/builders/builder_context.h
+@@ -219,7 +219,9 @@ struct BuilderContext {
+    *
+    * Searches the FunctionNode's calls and tailCalls for a matching site.
+    */
+-  const CallTarget* findCallTarget(uint32_t site) const;
++  // With `address`, prefers the edge to that target: an instruction variant
++  // site can call different functions depending on the word loaded.
++  const CallTarget* findCallTarget(uint32_t site, uint32_t address = 0) const;
+ 
+   /**
+    * @brief Emit C++ code for a function call.
+diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
+index f78e0d8..8500c46 100644
+--- a/src/codegen/builders/context.cpp
++++ b/src/codegen/builders/context.cpp
+@@ -154,7 +154,23 @@ bool BuilderContext::mmio_check_x_form() {
+   return locals.is_mmio_base(insn.operands[1]) || locals.is_mmio_base(insn.operands[2]);
+ }
+ 
+-const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
++const CallTarget* BuilderContext::findCallTarget(uint32_t site, uint32_t address) const {
++  if (address) {
++    auto targetAddress = [](const CallTarget& t) -> uint32_t {
++      if (t.isFunction())
++        return t.asFunction()->base();
++      if (t.isImport())
++        return std::get<CallTarget::ToImport>(t.value).address;
++      return std::get<CallTarget::Unresolved>(t.value).address;
++    };
++    for (const auto* edges : {&fn.calls(), &fn.tailCalls()}) {
++      for (const auto& edge : *edges) {
++        if (edge.site == site && targetAddress(edge.target) == address)
++          return &edge.target;
++      }
++    }
++  }
++
+   // Search in calls (bl instructions)
+   for (const auto& edge : fn.calls()) {
+     if (edge.site == site) {
+@@ -193,7 +209,7 @@ void BuilderContext::emit_function_call(uint32_t address) {
+   }
+ 
+   // Try to use pre-resolved call target from FunctionGraph
+-  if (const auto* target = findCallTarget(base)) {
++  if (const auto* target = findCallTarget(base, address)) {
+     if (target->isFunction()) {
+       auto* targetFn = target->asFunction();
+       const auto& name = targetFn->name();
+@@ -293,7 +309,7 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
+     case TargetKind::Function:
+     case TargetKind::Import:
+       // Conditional tail call to another function - check pre-resolved call target
+-      if (const auto* callTarget = findCallTarget(base)) {
++      if (const auto* callTarget = findCallTarget(base, target)) {
+         if (callTarget->isFunction()) {
+           auto* targetFn = callTarget->asFunction();
+           emitCtx.reference(targetFn->name());
+diff --git a/src/codegen/builders/control_flow.cpp b/src/codegen/builders/control_flow.cpp
+index 26957fc..43e68d4 100644
+--- a/src/codegen/builders/control_flow.cpp
++++ b/src/codegen/builders/control_flow.cpp
+@@ -58,8 +58,9 @@ bool build_b(BuilderContext& ctx) {
+   return true;
+ }
+ 
+-bool build_bl(BuilderContext& ctx) {
+-  uint32_t target = ctx.insn.operands[0];
++namespace {
++
++bool build_call(BuilderContext& ctx, uint32_t target) {
+ 
+   // Always set LR (unless skipLr)
+   if (!ctx.config().skipLr)
+@@ -91,6 +92,22 @@ bool build_bl(BuilderContext& ctx) {
+   return true;
+ }
+ 
++}  // namespace
++
++bool build_bl(BuilderContext& ctx) { return build_call(ctx, ctx.insn.operands[0]); }
++
++// bcl BO,BI,target. Only the branch-always form (BO = 1z1zz, e.g. 20) is
++// handled: it's a bl with a 16-bit displacement.
++bool build_bcl(BuilderContext& ctx) {
++  uint32_t bo = ctx.insn.operands[0];
++  if ((bo & 0x14) != 0x14) {
++    REXCODEGEN_WARN("Unimplemented: conditional bcl (BO={}) at 0x{:08X}", bo, ctx.base);
++    ctx.println("\tREX_FATAL(\"Unimplemented conditional bcl at 0x{:08X}\");", ctx.base);
++    return true;
++  }
++  return build_call(ctx, ctx.insn.operands[2]);
++}
++
+ bool build_blr(BuilderContext& ctx) {
+   ctx.println("\treturn;");
+   return true;
+diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
+index 5da54a0..2cfa355 100644
+--- a/src/codegen/config.cpp
++++ b/src/codegen/config.cpp
+@@ -307,6 +307,26 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+     }
+   }
+ 
++  // [[instruction_variant]] is keyed by "address"; "words" lists every
++  // instruction the address may hold in the builds this code must run.
++  if (auto variantArray = toml["instruction_variant"].as_array()) {
++    for (auto& entry : *variantArray) {
++      auto* table = entry.as_table();
++      auto address_opt = table ? (*table)["address"].value<uint32_t>() : std::nullopt;
++      auto* words = table ? (*table)["words"].as_array() : nullptr;
++      if (!address_opt || !words) {
++        REXCODEGEN_ERROR("Invalid [[instruction_variant]] entry: needs address and words");
++        continue;
++      }
++      std::vector<uint32_t> list;
++      for (auto& word : *words) {
++        if (auto w = word.value<int64_t>())
++          list.push_back(static_cast<uint32_t>(*w));
++      }
++      cfg.instructionVariants.insert_or_assign(*address_opt, std::move(list));
++    }
++  }
++
+   // [[midasm_hook]] -- keyed by "address"
+   if (auto midAsmHookArray = toml["midasm_hook"].as_array()) {
+     for (auto& entry : *midAsmHookArray) {
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index fc918bb..ab0cb4a 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -409,6 +409,21 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+           labels.emplace(label);
+       }
+ 
++      // Labels for where an instruction variant may branch, or fall through
++      auto variantIt = ctx.config.instructionVariants.find(static_cast<uint32_t>(addr));
++      if (variantIt != ctx.config.instructionVariants.end()) {
++        labels.emplace(addr + 4);
++        for (uint32_t w : variantIt->second) {
++          if (!PPC_BL(w)) {
++            const size_t op = PPC_OP(w);
++            if (op == PPC_OP_B)
++              labels.emplace(addr + PPC_BI(w));
++            else if (op == PPC_OP_BC)
++              labels.emplace(addr + PPC_BD(w));
++          }
++        }
++      }
++
+       // Labels and extern declarations from mid-asm hooks
+       auto hookIt = ctx.config.midAsmHooks.find(static_cast<uint32_t>(addr));
+       if (hookIt != ctx.config.midAsmHooks.end()) {
+@@ -587,7 +602,37 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+           builderCtx.emit_mid_asm_hook();
+         }
+ 
+-        if (!DispatchInstruction(id, builderCtx)) {
++        auto variantIt = ctx.config.instructionVariants.find(blockBase);
++        if (variantIt != ctx.config.instructionVariants.end()) {
++          // The word loaded at runtime picks which instruction this is.
++          emit_println(body, "\tswitch (REX_LOAD_U32(0x{:X})) {{", blockBase);
++          for (uint32_t word : variantIt->second) {
++            uint32_t stored = load_and_swap<uint32_t>(&word);  // big-endian, as in the image
++            ppc_insn variant;
++            Disassemble(&stored, 4, blockBase, variant);
++            emit_println(body, "\tcase 0x{:X}: {{", word);
++            if (variant.opcode == nullptr) {
++              emit_println(body, "\t\tREX_FATAL(\"Undecodable variant at 0x{:08X}\");", blockBase);
++            } else {
++              emit_println(body, "\t// {} {}", variant.opcode->name, variant.op_str);
++              BuilderContext variantCtx{body,           ctx,      *this,   variant, blockBase, &stored,
++                                        localVariables, csrState, activeJt};
++              if (!DispatchInstruction(variant.opcode->id, variantCtx)) {
++                REXCODEGEN_WARN("Unrecognized variant at 0x{:X}: {}", blockBase,
++                                variant.opcode->name);
++                allRecompiled = false;
++              }
++            }
++            emit_println(body, "\t\tbreak;\n\t}}");
++            csrState = CSRState::Unknown;
++          }
++          emit_println(body, "\tdefault:");
++          emit_println(body,
++                       "\t\tREX_FATAL(\"Unknown instruction 0x{{:08X}} at 0x{:08X}\", "
++                       "static_cast<uint32_t>(REX_LOAD_U32(0x{:X})));",
++                       blockBase, blockBase);
++          emit_println(body, "\t}}");
++        } else if (!DispatchInstruction(id, builderCtx)) {
+           REXCODEGEN_WARN("Unrecognized instruction at 0x{:X}: {}", blockBase, insn.opcode->name);
+           allRecompiled = false;
+         }
+diff --git a/src/codegen/function_scanner.cpp b/src/codegen/function_scanner.cpp
+index d7ba519..a836e49 100644
+--- a/src/codegen/function_scanner.cpp
++++ b/src/codegen/function_scanner.cpp
+@@ -1815,7 +1815,8 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
+ BlockDiscoveryResult discoverBlocks(
+     DecodedBinary& decoded, uint32_t entryPoint, const CodeRegion& containingRegion,
+     const std::unordered_set<uint32_t>& knownFunctions, uint32_t pdataSize,
+-    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables) {
++    const std::unordered_map<uint32_t, JumpTable>* manualSwitchTables,
++    const std::unordered_map<uint32_t, std::vector<uint32_t>>* hookJumpTargets) {
+   BlockDiscoveryResult result;
+   std::unordered_set<uint32_t> visited;
+   std::unordered_set<uint32_t> blockStarts;
+@@ -1862,6 +1863,21 @@ BlockDiscoveryResult discoverBlocks(
+       // Mark as visited
+       visited.insert(addr);
+ 
++      // A mid-asm hook here may jump elsewhere in the function.
++      if (hookJumpTargets) {
++        if (auto hookIt = hookJumpTargets->find(addr); hookIt != hookJumpTargets->end()) {
++          for (uint32_t t : hookIt->second) {
++            if (t < entryPoint || t >= funcEnd)
++              continue;
++            result.labels.insert(t);
++            if (!visited.contains(t) && !blockStarts.contains(t)) {
++              blockStarts.insert(t);
++              worklist.push(t);
++            }
++          }
++        }
++      }
++
+       // Collect instruction pointer
+       result.instructions.push_back(insn);
+ 
+diff --git a/src/codegen/instruction_dispatch.cpp b/src/codegen/instruction_dispatch.cpp
+index 40ae269..e629b3b 100644
+--- a/src/codegen/instruction_dispatch.cpp
++++ b/src/codegen/instruction_dispatch.cpp
+@@ -132,6 +132,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
+       //=====================================================================
+       {PPC_INST_B, build_b},
+       {PPC_INST_BL, build_bl},
++      {PPC_INST_BCL, build_bcl},
+       {PPC_INST_BLR, build_blr},
+       {PPC_INST_BLRL, build_blrl},
+       {PPC_INST_BCTR, build_bctr},
+diff --git a/src/codegen/phase_discover.cpp b/src/codegen/phase_discover.cpp
+index 1c73548..a771c85 100644
+--- a/src/codegen/phase_discover.cpp
++++ b/src/codegen/phase_discover.cpp
+@@ -95,8 +95,34 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
+   }
+ 
+   // Pass pdataSize so forward branches within function extent are correctly identified
++  // Where mid-asm hooks may jump, and where an instruction variant may
++  // branch or fall through, so blocks only they reach are kept.
++  const auto hookJumpTargets = [&] {
++    std::unordered_map<uint32_t, std::vector<uint32_t>> targets;
++    for (const auto& [addr, hook] : ctx.Config().midAsmHooks) {
++      for (uint32_t t : {hook.jumpAddress, hook.jumpAddressOnTrue, hook.jumpAddressOnFalse}) {
++        if (t)
++          targets[addr].push_back(t);
++      }
++    }
++    for (const auto& [addr, words] : ctx.Config().instructionVariants) {
++      targets[addr].push_back(addr + 4);
++      for (uint32_t w : words) {
++        uint32_t op = w >> 26;
++        bool absolute = w & 2, link = w & 1;
++        if (op == 18 && !link && !absolute) {  // b
++          int32_t off = static_cast<int32_t>(w << 6) >> 6 & ~3;
++          targets[addr].push_back(addr + off);
++        } else if (op == 16 && !link && !absolute) {  // bc
++          int32_t off = static_cast<int16_t>(w & 0xFFFC);
++          targets[addr].push_back(addr + off);
++        }
++      }
++    }
++    return targets;
++  }();
+   auto result = discoverBlocks(decoded, funcAddr, *region, knownFunctions, pdataSize,
+-                               &ctx.Config().switchTables);
++                               &ctx.Config().switchTables, &hookJumpTargets);
+ 
+   if (result.blocks.empty()) {
+     REXCODEGEN_WARN("Analyze: no blocks found for function 0x{:08X}", funcAddr);
+@@ -122,6 +148,34 @@ void discoverFunction(CodegenContext& ctx, uint32_t funcAddr,
+     }
+   }
+ 
++  // Calls an instruction variant may make (bl, or bcl that always branches)
++  // are calls like any other.
++  for (const auto* insn : node->instructions()) {
++    {
++      uint32_t site = insn->address;
++      auto variantIt = ctx.Config().instructionVariants.find(site);
++      if (variantIt == ctx.Config().instructionVariants.end())
++        continue;
++      for (uint32_t w : variantIt->second) {
++        uint32_t op = w >> 26;
++        if (!(w & 1) || (w & 2))
++          continue;  // not a relative branch-and-link
++        int32_t off;
++        if (op == 18) {
++          off = static_cast<int32_t>(w << 6) >> 6 & ~3;
++        } else if (op == 16 && ((w >> 21) & 0x14) == 0x14) {
++          off = static_cast<int16_t>(w & 0xFFFC);
++        } else {
++          continue;
++        }
++        uint32_t target = site + off;
++        if (!graph.isEntryPoint(target) && !graph.isImport(target))
++          graph.addFunction(target, 4, FunctionAuthority::DISCOVERED, true);
++        result.unresolvedBranches.push_back({site, target, true, false});
++      }
++    }
++  }
++
+   // Add unresolved branches for later resolution
+   for (const auto& branch : result.unresolvedBranches) {
+     graph.addUnresolvedJumpToFunction(funcAddr, branch.site, branch.target, branch.isCall,
