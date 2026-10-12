@@ -36,6 +36,7 @@ set(RB3PC_SOURCES
     src/title_icon.cpp
     src/loading_screen.cpp
     src/rb3_assets.cpp
+    src/rb3_ui.cpp
     src/save_tweaks.cpp
     src/gpu_wait.cpp
     src/profile.cpp
