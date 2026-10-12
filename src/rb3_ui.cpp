@@ -172,4 +172,78 @@ void Rb3UiRenderer::DrawTextShadowed(ImDrawList* draw, UiFont font, const std::s
   DrawText(draw, font, text, size, x, y, color);
 }
 
+void Rb3UiRenderer::DrawBackdrop(ImDrawList* draw, ImVec2 display, float scale,
+                                 ImVec2 logo_center) const {
+  // The wallpaper is dark blue in the file; the game shows it teal.
+  draw->AddRectFilledMultiColor(ImVec2(0, 0), display, IM_COL32(10, 42, 54, 255),
+                                IM_COL32(10, 42, 54, 255), IM_COL32(3, 14, 20, 255),
+                                IM_COL32(3, 14, 20, 255));
+  DrawTiled(draw, "wallpaper", ImVec2(0, 0), display, 300.0f * scale,
+            IM_COL32(150, 235, 245, 120));
+  float burst = 900.0f * scale;
+  DrawImage(draw, "sunburst",
+            ImVec2(logo_center.x - burst * 0.5f, logo_center.y - burst * 0.5f),
+            ImVec2(logo_center.x + burst * 0.5f, logo_center.y + burst * 0.5f),
+            IM_COL32(140, 230, 240, 26));
+  float band = display.y * 0.22f;
+  ImU32 dark = IM_COL32(0, 0, 0, 170), clear = IM_COL32(0, 0, 0, 0);
+  draw->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(display.x, band), dark, dark, clear, clear);
+  draw->AddRectFilledMultiColor(ImVec2(0, display.y - band), display, clear, clear, dark, dark);
+  float side = display.x * 0.18f;
+  draw->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(side, display.y), dark, clear, clear, dark);
+  draw->AddRectFilledMultiColor(ImVec2(display.x - side, 0), display, clear, dark, dark, clear);
+}
+
+void Rb3UiRenderer::DrawAccentBar(ImDrawList* draw, ImVec2 min, ImVec2 max, float scale) const {
+  // Tinting the greyscale texture alone comes out olive.
+  float rounding = std::min(5.0f * scale, (max.y - min.y) * 0.5f);
+  draw->AddRectFilled(min, max, kUiAccent, rounding);
+  DrawNineSlice(draw, "highlight_bar", min, max, 40.0f, std::min(9.0f * scale, rounding * 2),
+                IM_COL32(255, 255, 255, 80));
+}
+
+void Rb3UiRenderer::DrawLogo(ImDrawList* draw, ImVec2 min, ImVec2 max) const {
+  if (logo_) draw->AddImage(reinterpret_cast<ImTextureID>(logo_.get()), min, max);
+}
+
+bool Rb3UiRenderer::HasImage(const std::string& key) const { return images_.contains(key); }
+
+void Rb3UiRenderer::DrawImage(ImDrawList* draw, const std::string& key, ImVec2 min, ImVec2 max,
+                              ImU32 tint, ImVec2 uv0, ImVec2 uv1) const {
+  auto it = images_.find(key);
+  if (it == images_.end()) return;
+  draw->AddImage(reinterpret_cast<ImTextureID>(it->second.texture.get()), min, max, uv0, uv1,
+                 tint);
+}
+
+void Rb3UiRenderer::DrawNineSlice(ImDrawList* draw, const std::string& key, ImVec2 min,
+                                  ImVec2 max, float border, float border_size,
+                                  ImU32 tint) const {
+  auto it = images_.find(key);
+  if (it == images_.end()) return;
+  const Texture& t = it->second;
+  auto id = reinterpret_cast<ImTextureID>(t.texture.get());
+  float bw = std::min(border_size, (max.x - min.x) * 0.5f);
+  float bh = std::min(border_size, (max.y - min.y) * 0.5f);
+  float xs[4] = {min.x, min.x + bw, max.x - bw, max.x};
+  float ys[4] = {min.y, min.y + bh, max.y - bh, max.y};
+  float us[4] = {0, border / t.width, 1 - border / t.width, 1};
+  float vs[4] = {0, border / t.height, 1 - border / t.height, 1};
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      if (xs[col + 1] <= xs[col] || ys[row + 1] <= ys[row]) continue;
+      draw->AddImage(id, ImVec2(xs[col], ys[row]), ImVec2(xs[col + 1], ys[row + 1]),
+                     ImVec2(us[col], vs[row]), ImVec2(us[col + 1], vs[row + 1]), tint);
+    }
+  }
+}
+
+void Rb3UiRenderer::DrawTiled(ImDrawList* draw, const std::string& key, ImVec2 min, ImVec2 max,
+                              float tile, ImU32 tint) const {
+  auto it = images_.find(key);
+  if (it == images_.end() || tile <= 0) return;
+  draw->AddImage(reinterpret_cast<ImTextureID>(it->second.texture.get()), min, max,
+                 ImVec2(0, 0), ImVec2((max.x - min.x) / tile, (max.y - min.y) / tile), tint);
+}
+
 }  // namespace rb3pc
