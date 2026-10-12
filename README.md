@@ -23,3 +23,4 @@ Windows builds haven't been tried yet.
 |---------|----------|
 | [ReXGlue](https://github.com/rexglue/rexglue-sdk) | The recompiler and Xbox 360 runtime this port is built on |
 | [Xenia](https://github.com/xenia-project/xenia) | The Xbox 360 emulator that ReXGlue's runtime and graphics come from |
+| [Rock Band 3 decompilation](https://github.com/DarkRTA/rb3) | Reference for the game's internals: class layouts, function names, file formats |

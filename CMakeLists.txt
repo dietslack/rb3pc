@@ -40,6 +40,7 @@ set(RB3PC_SOURCES
     src/save_tweaks.cpp
     src/gpu_wait.cpp
     src/profile.cpp
+    src/script_patches.cpp
     src/audio_options.cpp
     src/shader_warmup.cpp
     src/ark.cpp

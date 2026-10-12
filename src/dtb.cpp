@@ -141,4 +141,98 @@ std::vector<uint8_t> SerializeDtb(const DtbArray& root) {
   return out;
 }
 
+std::optional<std::vector<DtbNode>> ParseDta(std::string_view text) {
+  size_t pos = 0;
+  // Parses nodes until `close` (or the end, for the top level).
+  auto parse = [&](auto& self, char close) -> std::optional<std::vector<DtbNode>> {
+    std::vector<DtbNode> nodes;
+    while (true) {
+      while (pos < text.size()) {
+        if (std::isspace(static_cast<unsigned char>(text[pos]))) {
+          ++pos;
+        } else if (text[pos] == ';') {
+          while (pos < text.size() && text[pos] != '\n') ++pos;
+        } else {
+          break;
+        }
+      }
+      if (pos >= text.size()) {
+        if (close) return std::nullopt;
+        return nodes;
+      }
+      char c = text[pos];
+      if (c == ')' || c == '}' || c == ']') {
+        if (c != close) return std::nullopt;
+        ++pos;
+        return nodes;
+      }
+      DtbNode n;
+      if (c == '(' || c == '{' || c == '[') {
+        ++pos;
+        char match = c == '(' ? ')' : c == '{' ? '}' : ']';
+        auto inner = self(self, match);
+        if (!inner) return std::nullopt;
+        n.type = c == '(' ? DtbNode::kArray : c == '{' ? DtbNode::kCommand : DtbNode::kProperty;
+        n.array = std::make_shared<DtbArray>();
+        n.array->nodes = std::move(*inner);
+      } else if (c == '"') {
+        size_t end = text.find('"', pos + 1);
+        if (end == std::string_view::npos) return std::nullopt;
+        n.type = DtbNode::kString;
+        n.text = std::string(text.substr(pos + 1, end - pos - 1));
+        pos = end + 1;
+      } else {
+        size_t end = pos;
+        while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end])) &&
+               !std::strchr("(){}[];\"", text[end])) {
+          ++end;
+        }
+        std::string_view token = text.substr(pos, end - pos);
+        pos = end;
+        int32_t i;
+        float f;
+        if (token[0] == '$') {
+          n.type = DtbNode::kVar;
+          n.text = std::string(token.substr(1));
+        } else if (auto r = std::from_chars(token.data(), token.data() + token.size(), i);
+                   r.ec == std::errc() && r.ptr == token.data() + token.size()) {
+          n.type = DtbNode::kInt;
+          n.integer = uint32_t(i);
+        } else if (auto r = std::from_chars(token.data(), token.data() + token.size(), f);
+                   r.ec == std::errc() && r.ptr == token.data() + token.size()) {
+          n.type = DtbNode::kFloat;
+          n.real = f;
+        } else {
+          n.type = DtbNode::kSymbol;
+          n.text = std::string(token);
+        }
+      }
+      nodes.push_back(std::move(n));
+    }
+  };
+  return parse(parse, 0);
+}
+
+DtbArray* FindArray(DtbArray& root, const std::vector<std::string>& prefix) {
+  if (root.nodes.size() >= prefix.size()) {
+    bool match = true;
+    for (size_t i = 0; i < prefix.size() && match; ++i) {
+      const DtbNode& n = root.nodes[i];
+      const std::string& want = prefix[i];
+      if (!want.empty() && want[0] == '$') {
+        match = n.type == DtbNode::kVar && n.text == want.substr(1);
+      } else {
+        match = n.IsSymbol(want);
+      }
+    }
+    if (match) return &root;
+  }
+  for (auto& n : root.nodes) {
+    if (n.array) {
+      if (DtbArray* found = FindArray(*n.array, prefix)) return found;
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace rb3pc
