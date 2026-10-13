@@ -4,7 +4,7 @@ A PC port of Rock Band 3.
 
 The Xbox 360 version of the game is converted ahead of time into a regular
 PC program, then fixed up and extended so it plays well on a computer: windowed or
-fullscreen play.
+fullscreen play and mouse support.
 
 Made by slack. I only have a Linux system, so pretty much everything so far
 expects Linux. Windows compatibility is probably low for now, but it will be

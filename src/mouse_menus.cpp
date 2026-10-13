@@ -1062,4 +1062,609 @@ bool ReviewPickAt(const uint8_t* base, float px, float py, uint32_t& review, int
   return false;
 }
 
+// Overlay highlights, [0,1] screen rects set on the game thread.
+enum class HighlightStyle { kButton, kIcon, kThumb, kThumbHeld };
+struct Highlight {
+  float x0, y0, x1, y1;
+  HighlightStyle style;
+  std::vector<GlyphRun> runs;
+};
+std::mutex g_highlight_mutex;
+std::vector<Highlight> g_highlights;
+Clock::time_point g_highlights_time{};
+
+bool ScreenRect(const uint8_t* base, uint32_t comp, uint32_t cam, LocalBox box, HighlightStyle style,
+                Highlight& out) {
+  out = {2, 2, -1, -1, style, {}};
+  for (Vec3 corner : {Vec3{box.left, 0, box.top}, Vec3{box.right, 0, box.top},
+                      Vec3{box.left, 0, box.bottom}, Vec3{box.right, 0, box.bottom}}) {
+    float sx, sy, depth;
+    if (!Project(base, cam, Transform(base, comp + kCompXfm, corner), sx, sy, depth)) return false;
+    out.x0 = std::min(out.x0, sx);
+    out.y0 = std::min(out.y0, sy);
+    out.x1 = std::max(out.x1, sx);
+    out.y1 = std::max(out.y1, sy);
+  }
+  return true;
+}
+
+// Player 1's overshell tab (bottom left: name, instrument, "MENU" with the
+// Start icon): the labels of the leftmost OvershellDir (vtable 0x8202CFC4,
+// one per player slot; the keyboard and mouse are player 1) drawn in the
+// bottom strip, where the tab sits while the overshell is closed. A click on
+// it presses Start, which opens the overshell. Its highlight goes on the
+// MENU row (the labels below the name, right of the instrument icon).
+constexpr uint32_t kOvershellDirVtable = rb3pc::exe::kDeluxe ? 0x8202DBFC : 0x8202CFC4;
+constexpr float kOvershellStrip = 0.86f;  // the closed tab is below this
+
+bool OvershellOpen(const uint8_t* base) {
+  uint32_t focused = FocusedComponent(base);
+  uint32_t object = focused ? Load32(base, focused + 0x30) : 0;
+  if (object <= focused || object >= focused + 0x400) return false;
+  uint32_t dir = Load32(base, object + 0x1C);
+  return dir >= 0x40000000 && dir < 0x50000000 && Load32(base, dir) == kOvershellDirVtable;
+}
+
+bool OvershellTabAt(const uint8_t* base, float px, float py, Highlight& highlight) {
+  struct Label {
+    uint32_t comp, dir, cam;
+    Highlight rect;
+  };
+  std::vector<Label> labels;
+  for (const auto& [comp, drawn] : g_drawn) {
+    uint32_t object = Load32(base, comp + 0x30);
+    if (object < comp || object > comp + 0x400) continue;
+    uint32_t dir = Load32(base, object + 0x1C);
+    if (dir < 0x40000000 || dir >= 0x50000000 || Load32(base, dir) != kOvershellDirVtable) continue;
+    uint32_t text = Load32(base, comp + 324);
+    LocalBox box;
+    Highlight rect;
+    if (text < 0x40000000 || text >= 0x50000000 || !GlyphBox(base, text, box) ||
+        !ScreenRect(base, comp, drawn.cam, box, HighlightStyle::kButton, rect) || rect.y0 < kOvershellStrip) {
+      continue;
+    }
+    labels.push_back({comp, dir, drawn.cam, std::move(rect)});
+  }
+  if (labels.empty()) return false;
+  // Player 1's slot: the leftmost.
+  uint32_t dir = std::min_element(labels.begin(), labels.end(), [](const Label& a, const Label& b) {
+                   return a.rect.x0 < b.rect.x0;
+                 })->dir;
+  float x0 = 2, y0 = 2, x1 = -1, y1 = -1;
+  for (const auto& l : labels) {
+    if (l.dir != dir) continue;
+    x0 = std::min(x0, l.rect.x0), y0 = std::min(y0, l.rect.y0);
+    x1 = std::max(x1, l.rect.x1), y1 = std::max(y1, l.rect.y1);
+  }
+  float pad = (y1 - y0) * 0.15f;
+  if (px < x0 - pad || px > x1 + pad || py < y0 - pad || py > y1 + pad) return false;
+  // Not while this overshell is open (its menu has the focus): its rows are
+  // its own to click.
+  uint32_t focused = FocusedComponent(base);
+  uint32_t object = focused ? Load32(base, focused + 0x30) : 0;
+  if (object > focused && object < focused + 0x400 && Load32(base, object + 0x1C) == dir) return false;
+  // The MENU row: below the middle of the tab, right of its first quarter.
+  highlight = {2, 2, -1, -1, HighlightStyle::kButton, {}};
+  for (const auto& l : labels) {
+    if (l.dir != dir || (l.rect.y0 + l.rect.y1) * 0.5f < (y0 + y1) * 0.5f ||
+        (l.rect.x0 + l.rect.x1) * 0.5f < x0 + (x1 - x0) * 0.25f) {
+      continue;
+    }
+    highlight.x0 = std::min(highlight.x0, l.rect.x0), highlight.y0 = std::min(highlight.y0, l.rect.y0);
+    highlight.x1 = std::max(highlight.x1, l.rect.x1), highlight.y1 = std::max(highlight.y1, l.rect.y1);
+    CollectGlyphRuns(base, l.comp, Load32(base, l.comp + 324), l.cam, highlight.runs);
+  }
+  return true;
+}
+
+// Per JoypadControllerTypePadNum. Instruments page down with LB, no page up.
+bool PadIsGamepad(PPCContext& ctx, uint8_t* base) {
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x200) & ~0xFu;
+  ctx.r1.u64 = sp;
+  ctx.r3.u64 = sp + 0x80;  // returned Symbol
+  ctx.r4.u64 = 0;
+  MM_CONTROLLER_TYPE(ctx, base);
+  uint32_t symbol = Load32(base, sp + 0x80);
+  ctx = saved;
+  if (!symbol) return true;
+  std::string type(reinterpret_cast<const char*>(base + symbol));
+  return type == "analog" || type == "digital" || type == "dualshock" || type == "stagekit_xbox" ||
+         type == "none";
+}
+
+uint16_t ActionButton(uint32_t action, bool gamepad) {
+  using namespace rex::input;
+  switch (action) {
+    case kActionConfirm: return X_INPUT_GAMEPAD_A;
+    case kActionCancel: return X_INPUT_GAMEPAD_B;
+    case kActionOption: return X_INPUT_GAMEPAD_Y;
+    case kActionShellOption: return X_INPUT_GAMEPAD_X;
+    case kActionStart: return X_INPUT_GAMEPAD_START;
+    case kActionViewModify: return X_INPUT_GAMEPAD_BACK;
+    case kActionPageDown: return gamepad ? X_INPUT_GAMEPAD_RIGHT_SHOULDER : X_INPUT_GAMEPAD_LEFT_SHOULDER;
+    case kActionPageUp: return gamepad ? X_INPUT_GAMEPAD_LEFT_SHOULDER : 0;
+    case kActionUp: return X_INPUT_GAMEPAD_DPAD_UP;
+    case kActionDown: return X_INPUT_GAMEPAD_DPAD_DOWN;
+    case kActionLeft: return X_INPUT_GAMEPAD_DPAD_LEFT;
+    case kActionRight: return X_INPUT_GAMEPAD_DPAD_RIGHT;
+    default: return 0;
+  }
+}
+
+
+void UpdatePointer(PPCContext& ctx, uint8_t* base) {
+  static bool wheel_hooked = [] {
+    rex::input::mnk::SetWheelHandler([](int32_t notches) {
+      if (!g_pointer_on_list) return false;
+      g_wheel_notches += notches;
+      return true;
+    });
+    rex::input::mnk::SetClickHandler([](int mouse_button, uint16_t& buttons) {
+      int click = g_click_buttons;
+      if (mouse_button != 0 || click < 0) return false;
+      buttons = uint16_t(click);
+      return true;
+    });
+    return true;
+  }();
+  (void)wheel_hooked;
+  // Drop stale components: their memory may be freed.
+  auto now = Clock::now();
+  for (auto it = g_drawn.begin(); it != g_drawn.end();) {
+    it = now - it->second.when > std::chrono::milliseconds(200) ? g_drawn.erase(it) : std::next(it);
+  }
+  for (auto* drawn : {&g_help_bars, &g_scrollbars, &g_reviews}) {
+    for (auto it = drawn->begin(); it != drawn->end();) {
+      it = now - it->second.when > std::chrono::milliseconds(200) ? drawn->erase(it) : std::next(it);
+    }
+  }
+  if (!REXCVAR_GET(mnk_mode)) return;
+  float px, py;
+  if (!PointerPosition(px, py)) {
+    g_review_preview_comp = 0;
+    g_review_preview_score = -1;
+    g_pointer_on_list = false;
+    g_click_buttons = -1;
+    g_drag = {};
+    std::lock_guard lock(g_highlight_mutex);
+    g_highlights.clear();
+    return;
+  }
+  bool moved = std::fabs(px - g_last_x) > 0.002f || std::fabs(py - g_last_y) > 0.002f;
+  g_last_x = px;
+  g_last_y = py;
+  bool debug = moved && REXCVAR_GET(mouse_menu_debug);
+  g_log_hover = debug;
+  if (debug) REXLOG_INFO("Pointer: moved to {:.3f},{:.3f}, {} drawn", px, py, g_drawn.size());
+  // Every frame: the screen changes under a still pointer too.
+  Vec3 local{};
+  uint32_t comp = Hover(base, px, py, local);
+  bool on_list = comp && IsList(Load32(base, comp));
+  int item = on_list ? ListItemAt(base, comp, local) : -1;
+  g_pointer_on_list = on_list;
+  int click = -1;
+  std::vector<Highlight> highlights;
+  uint32_t label = 0;
+  LocalBox line{};
+  Scrollbar bar;
+  float bar_z = 0;
+  bool left = LeftButtonDown(), pressed = left && !g_left_was_down;
+  g_review_preview_comp = 0;
+  g_review_preview_score = -1;
+  if (debug) {
+    uint32_t review = 0;
+    int score = 0;
+    Vec3 local{};
+    bool on = ReviewPickAt(base, px, py, review, score, &local);
+    if (review || !g_reviews.empty()) {
+      REXLOG_INFO("Pointer: review display local {:.1f},{:.1f} pick {}", local.x, local.z, on ? score : 0);
+    }
+  }
+  g_left_was_down = left;
+  if (g_drag.bar && (!left || !g_scrollbars.count(g_drag.bar))) g_drag = {};
+  if (g_drag.bar) {
+    // Dragging: the thumb follows the pointer, wherever it is.
+    Vec3 hit;
+    Scrollbar sb;
+    if (ReadScrollbar(base, g_drag.bar, g_scrollbars[g_drag.bar].cam, sb)) {
+      if (PointerOnPlane(base, sb.bar, sb.cam, px, py, hit)) DragScrollbar(ctx, base, sb, hit.z + g_drag.grab);
+      Highlight h;
+      if (ScreenRect(base, sb.bar, sb.cam,
+                     {sb.x + kBarCentre - kBarHalfWidth, sb.thumb_top, sb.x + kBarCentre + kBarHalfWidth,
+                      sb.thumb_top - sb.thumb_height - kBarBottomExtra},
+                     HighlightStyle::kThumbHeld, h)) {
+        highlights.push_back(h);
+      }
+    }
+    click = 0;
+    comp = 0;
+  } else if (ScrollbarAt(base, px, py, bar, bar_z)) {
+    // A press on the track centres the thumb there first.
+    bool on_thumb = bar_z <= bar.thumb_top && bar_z >= bar.thumb_top - bar.thumb_height;
+    if (pressed) {
+      g_drag = {bar.bar, on_thumb ? bar.thumb_top - bar_z : bar.thumb_height / 2};
+      if (!on_thumb) DragScrollbar(ctx, base, bar, bar_z + g_drag.grab);
+      if (REXCVAR_GET(mouse_menu_debug)) REXLOG_INFO("Pointer: scrollbar {:08X} grabbed at {:.1f}", bar.bar, bar_z);
+    }
+    Highlight h;
+    if (ScreenRect(base, bar.bar, bar.cam,
+                   {bar.x + kBarCentre - kBarHalfWidth, bar.thumb_top, bar.x + kBarCentre + kBarHalfWidth,
+                    bar.thumb_top - bar.thumb_height - kBarBottomExtra},
+                   on_thumb || pressed ? HighlightStyle::kThumbHeld : HighlightStyle::kThumb, h)) {
+      highlights.push_back(h);
+    }
+    click = 0;
+    g_pointer_on_list = true;
+    comp = 0;
+  } else if (uint32_t review = 0; [&] {
+               int score = 0;
+               if (!ReviewPickAt(base, px, py, review, score)) return false;
+               int current = int(Load32(base, review + kReviewScore));
+               g_review_preview_comp = review;
+               g_review_preview_score = score;
+               if (pressed && score != current) {
+                 for (int n = (score - current + 6) % 6; n > 0; --n) Press(rex::input::X_INPUT_GAMEPAD_X);
+                 if (REXCVAR_GET(mouse_menu_debug)) REXLOG_INFO("Pointer: review {} -> {}", current, score);
+               }
+               return true;
+             }()) {
+    click = 0;
+    comp = 0;
+  } else if (Highlight tab; OvershellTabAt(base, px, py, tab)) {
+    click = rex::input::X_INPUT_GAMEPAD_START;
+    if (debug) {
+      REXLOG_INFO("Pointer: over the overshell tab, highlight {:.3f},{:.3f}-{:.3f},{:.3f}", tab.x0, tab.y0, tab.x1, tab.y1);
+      for (const auto& run : tab.runs) REXLOG_INFO("Pointer:   glyphs of {}: {}", run.font, run.quads.size());
+    }
+    if (tab.x1 > tab.x0) highlights.push_back(std::move(tab));
+    comp = 0;
+  } else if (uint32_t action = OvershellOpen(base) ? 0 : HelpActionAt(base, px, py, label, line);
+             action && !(comp && g_drawn.count(comp) && g_drawn[comp].order > g_drawn[label].order)) {
+    // An open overshell covers the help bar and takes the input.
+    click = ActionButton(action, PadIsGamepad(ctx, base));
+    comp = 0;
+    Highlight h;
+    LocalBox glyphs;
+    bool icons_only = false;
+    bool have_glyphs = GlyphBox(base, Load32(base, label + 324), glyphs, &icons_only);
+    if (debug) {
+      REXLOG_INFO("Pointer: label {:08X} line {:.1f},{:.1f}-{:.1f},{:.1f} glyphs {} {:.1f},{:.1f}-{:.1f},{:.1f}", label,
+                  line.left, line.top, line.right, line.bottom, have_glyphs, glyphs.left, glyphs.top, glyphs.right,
+                  glyphs.bottom);
+    }
+    if (!have_glyphs) glyphs = line;
+    uint32_t cam = g_drawn[label].cam;
+    if (ScreenRect(base, label, cam, glyphs,
+                   have_glyphs && icons_only ? HighlightStyle::kIcon : HighlightStyle::kButton, h)) {
+      CollectGlyphRuns(base, label, Load32(base, label + 324), cam, h.runs);
+      if (debug) {
+        for (const auto& run : h.runs) REXLOG_INFO("Pointer:   glyphs of {} ({}): {}", run.font, run.icon, run.quads.size());
+      }
+      highlights.push_back(std::move(h));
+    }
+    if (debug) REXLOG_INFO("Pointer: over help action {}: button {:04X}", action, click);
+  } else if (on_list && IsSongList(base, comp)) {
+    bool selected = base[comp + kCompState] == kFocused &&
+                    item == int(Load32(base, comp + kListState + kStateSelectedDisplay));
+    click = selected ? -1 : 0;
+    item = -1;
+  }
+  g_click_buttons = click;
+  {
+    std::lock_guard lock(g_highlight_mutex);
+    g_highlights = std::move(highlights);
+    g_highlights_time = Clock::now();
+  }
+  if (moved && comp && (comp != g_target.comp || item != g_target.item)) {
+    g_target = {comp, item, 0};
+    if (debug) {
+      REXLOG_INFO("Pointer: over {:08X} (vtable {:08X}) item {} at local {:.2f} {:.2f} {:.2f}",
+                  comp, Load32(base, comp), item, local.x, local.y, local.z);
+    }
+  }
+  if (int notches = g_wheel_notches.exchange(0)) {
+    uint32_t focused = FocusedComponent(base);
+    if (focused && IsList(Load32(base, focused))) {
+      if (IsSongList(base, focused)) {
+        ScrollSongList(ctx, base, focused, notches);
+      } else {
+        ScrollList(ctx, base, focused, notches);
+      }
+    }
+  }
+  if (!g_target.comp) return;
+  if (rex::input::mnk::PressesPending()) {
+    // The device only sends presses while the window has focus.
+    if (g_target.presses && Clock::now() - g_target.pressed > std::chrono::seconds(1)) g_target = {};
+    return;
+  }
+  if (g_target.presses) {
+    uint32_t focused_now = FocusedComponent(base);
+    int selected_now = focused_now && IsList(Load32(base, focused_now))
+                           ? int(Load32(base, focused_now + kListState + kStateSelectedDisplay))
+                           : -1;
+    bool changed = focused_now != g_target.waiting_focus || selected_now != g_target.waiting_selected;
+    if (!changed && Clock::now() - g_target.pressed < std::chrono::milliseconds(400)) return;
+  }
+  if (g_target.presses >= kMaxPresses || !g_drawn.count(g_target.comp)) {
+    g_target = {};
+    return;
+  }
+  using namespace rex::input;
+  uint32_t target = g_target.comp;
+  if (base[target + kCompState] != kFocused) {
+    uint32_t focused = FocusedComponent(base);
+    // Nested screens (song list's VIEW MORE INFO) are their own PanelDir, but
+    // input goes to the outer panel's focus, so set it in both.
+    uint32_t dir = PanelDirOf(base, target);
+    if (dir && focused && PanelDirOf(base, focused) == dir && SetFocusEverywhere(ctx, base, focused, target, dir)) {
+      if (REXCVAR_GET(mouse_menu_debug)) REXLOG_INFO("Pointer: focus set on {:08X}", target);
+      if (g_target.item < 0) g_target = {};
+      return;
+    }
+    float fx, fy, tx, ty;
+    if (!focused || !ScreenPos(base, focused, fx, fy) || !ScreenPos(base, target, tx, ty)) {
+      g_target = {};
+      return;
+    }
+    float dx = tx - fx, dy = ty - fy;
+    if (std::fabs(dy) >= std::fabs(dx)) {
+      Press(dy > 0 ? X_INPUT_GAMEPAD_DPAD_DOWN : X_INPUT_GAMEPAD_DPAD_UP);
+    } else {
+      Press(dx > 0 ? X_INPUT_GAMEPAD_DPAD_RIGHT : X_INPUT_GAMEPAD_DPAD_LEFT);
+    }
+    NotePress(base);
+    return;
+  }
+  if (g_target.item < 0) {
+    g_target = {};
+    return;
+  }
+  // Within the focused list: select the item under the pointer, with the
+  // view where it is (scrolling is the wheel's job).
+  int first = int(Load32(base, target + kListState + kStateFirstShowing));
+  int selected = int(Load32(base, target + kListState + kStateSelectedDisplay));
+  // Rows past the end of a short list are empty: nothing to select there.
+  int last = NumShowing(ctx, base, target) - 1;
+  if (selected != g_target.item && first + g_target.item <= last) {
+    SelectListItem(ctx, base, target, first + g_target.item, first);
+  }
+  g_target = {};
+}
+
 }  // namespace
+
+// Every component polls through here; the pointer is updated once per frame
+// or so, on the game thread, where the game's functions can be called.
+REX_HOOK_RAW(MM_COMPONENT_POLL) {
+  MM_COMPONENT_POLL_ORIG(ctx, base);
+  static Clock::time_point last;
+  auto now = Clock::now();
+  if (now - last < std::chrono::milliseconds(15)) return;
+  last = now;
+  UpdatePointer(ctx, base);
+}
+
+// Captures gNullStr.
+REX_HOOK_RAW(MM_SET_FOCUS_COMPONENT) {
+  uint32_t nav_type = ctx.r5.u32;
+  if (!g_null_symbol && nav_type >= 0x40000000 && nav_type < 0x90000000 && base[nav_type] == 0) {
+    g_null_symbol = nav_type;
+  }
+  MM_SET_FOCUS_COMPONENT_ORIG(ctx, base);
+}
+
+REX_HOOK_RAW(MM_BANDBUTTON_DRAW) {
+  NoteDrawn(ctx.r3.u32, base);
+  MM_BANDBUTTON_DRAW_ORIG(ctx, base);
+}
+REX_HOOK_RAW(MM_BANDLIST_DRAW) {
+  NoteDrawn(ctx.r3.u32, base);
+  MM_BANDLIST_DRAW_ORIG(ctx, base);
+}
+REX_HOOK_RAW(MM_LABEL_DRAW) {
+  NoteDrawn(ctx.r3.u32, base);
+  MM_LABEL_DRAW_ORIG(ctx, base);
+}
+REX_HOOK_RAW(MM_UILIST_DRAW) {
+  NoteDrawn(ctx.r3.u32, base);
+  MM_UILIST_DRAW_ORIG(ctx, base);
+}
+// Preview picks to dim: scores in (from, to].
+uint32_t g_review_drawing = 0;
+int g_review_dim_from = 0, g_review_dim_to = 0;
+
+// While a review preview draws, its picks are DxMeshes (one per pick, at
+// x = -90 + 45 * i in the display's space, each with its own material):
+// those to dim are drawn with their material's colour (RndMat +0x2C, RGB
+// floats, multiplying the texture) darkened, then it's put back.
+constexpr uint32_t kMeshMat = 0xF8, kMatColor = 0x2C;
+constexpr float kReviewDimmed = 0.65f;
+REX_HOOK_RAW(MM_DXMESH_DRAW) {
+  uint32_t mesh = ctx.r3.u32;
+  uint32_t mat = g_review_drawing ? Load32(base, mesh + kMeshMat) : 0;
+  if (mat < 0x40000000 || mat >= 0x50000000) return MM_DXMESH_DRAW_ORIG(ctx, base);
+  Vec3 local = ToLocal(base, g_review_drawing, LoadVec(base, mesh + kCompXfm + 48));
+  int pick = int(std::lround((local.x - kReviewFirstX) / kReviewSpacing)) + 1;
+  if (pick <= g_review_dim_from || pick > g_review_dim_to) return MM_DXMESH_DRAW_ORIG(ctx, base);
+  uint8_t saved[12];
+  std::memcpy(saved, base + mat + kMatColor, 12);
+  for (int c = 0; c < 3; ++c) StoreF(base, mat + kMatColor + 4 * c, LoadF(base, mat + kMatColor + 4 * c) * kReviewDimmed);
+  MM_DXMESH_DRAW_ORIG(ctx, base);
+  std::memcpy(base + mat + kMatColor, saved, 12);
+}
+REX_HOOK_RAW(MM_REVIEW_DRAW) {
+  uint32_t review = ctx.r3.u32;
+  if (!review) return MM_REVIEW_DRAW_ORIG(ctx, base);
+  g_reviews[review] = {Load32(base, kCurrentCam), Clock::now(), ++g_draw_count};
+  int preview = g_review_preview_comp == review ? g_review_preview_score.load() : -1;
+  uint32_t score = Load32(base, review + kReviewScore);
+  if (preview < 0 || uint32_t(preview) == score) return MM_REVIEW_DRAW_ORIG(ctx, base);
+  uint32_t shown = __builtin_bswap32(uint32_t(preview));
+  std::memcpy(base + review + kReviewScore, &shown, 4);
+  g_review_drawing = review;
+  g_review_dim_from = int(score);
+  g_review_dim_to = preview;
+  MM_REVIEW_DRAW_ORIG(ctx, base);
+  g_review_drawing = 0;
+  uint32_t real = __builtin_bswap32(score);
+  std::memcpy(base + review + kReviewScore, &real, 4);
+}
+REX_HOOK_RAW(MM_SCROLLBAR_DRAW) {
+  if (ctx.r3.u32) g_scrollbars[ctx.r3.u32] = {Load32(base, kCurrentCam), Clock::now(), ++g_draw_count};
+  MM_SCROLLBAR_DRAW_ORIG(ctx, base);
+}
+REX_HOOK_RAW(MM_HELP_DRAW) {
+  if (ctx.r3.u32) g_help_bars[ctx.r3.u32] = {Load32(base, kCurrentCam), Clock::now(), ++g_draw_count};
+  MM_HELP_DRAW_ORIG(ctx, base);
+}
+
+namespace rb3pc {
+namespace {
+
+// Font milos searched for "x.tex" atlases, loaded on first use.
+constexpr const char* kFontMilos[] = {
+    "pentatonic", "pentatonic_bold", "pentatonic_boldsmall", "pentatonic_display",
+    "pentatonic_regularcond", "pentatonic_regularsmall", "pentatonic_mononumerals",
+    "pentatonic_outline", "buttons", "button",
+};
+
+class PointerOverlay final : public rex::ui::ImGuiDialog {
+ public:
+  PointerOverlay(rex::ui::ImGuiDrawer* drawer, std::function<rex::ui::ImmediateDrawer*()> immediate_drawer,
+                 std::filesystem::path game_root)
+      : ImGuiDialog(drawer),
+        immediate_drawer_(immediate_drawer),
+        game_root_(std::move(game_root)),
+        ui_(immediate_drawer, game_root_) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    ui_.Update();
+    std::vector<Highlight> highlights;
+    {
+      std::lock_guard lock(g_highlight_mutex);
+      // Stale during loading screens.
+      if (Clock::now() - g_highlights_time > std::chrono::milliseconds(150)) return;
+      highlights = g_highlights;
+    }
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    GameArea area = GameAreaIn(io.DisplaySize.x, io.DisplaySize.y);
+    float w = area.width, h = area.height;
+    auto to_screen = [&](float x, float y) { return ImVec2(area.x + x * w, area.y + y * h); };
+    for (const auto& hl : highlights) {
+      ImVec2 a = to_screen(hl.x0, hl.y0), b = to_screen(hl.x1, hl.y1);
+      switch (hl.style) {
+        case HighlightStyle::kButton:
+        case HighlightStyle::kIcon:
+          DrawLabelHighlight(draw, hl, a, b, h, to_screen);
+          break;
+        case HighlightStyle::kThumb:
+          draw->AddRectFilled(a, b, IM_COL32(240, 205, 40, 150));
+          break;
+        case HighlightStyle::kThumbHeld:
+          draw->AddRectFilled(a, b, IM_COL32(240, 205, 40, 230));
+          break;
+      }
+    }
+  }
+
+ private:
+  struct FontAtlas {
+    std::future<std::optional<Rgba8Image>> loading;
+    std::unique_ptr<rex::ui::ImmediateTexture> texture;
+    bool failed = false;
+  };
+
+  rex::ui::ImmediateTexture* Atlas(const std::string& name) {
+    FontAtlas& atlas = atlases_[name];
+    if (atlas.texture) return atlas.texture.get();
+    if (atlas.failed) return nullptr;
+    if (!atlas.loading.valid()) {
+      atlas.loading = std::async(std::launch::async, [root = game_root_, name] {
+        std::string stem = name.size() > 5 && name.ends_with(".font") ? name.substr(0, name.size() - 5) : name;
+        // Longest milo-name prefix first ("Pentatonic_Bold_(3_00)4x" -> pentatonic_bold).
+        std::string lower = stem;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::vector<const char*> milos(std::begin(kFontMilos), std::end(kFontMilos));
+        std::stable_sort(milos.begin(), milos.end(), [&](const char* a, const char* b) {
+          auto score = [&](const char* m) { return lower.starts_with(m) ? std::strlen(m) : 0; };
+          return score(a) > score(b);
+        });
+        for (const char* milo : milos) {
+          std::string path = std::string("ui/resource/fonts/gen/") + milo + ".milo_xbox";
+          Rb3UiAssets assets = LoadRb3UiAssets(root, {{"atlas", path, stem + ".tex"}}, {});
+          auto it = assets.images.find("atlas");
+          if (it != assets.images.end()) return std::optional<Rgba8Image>(std::move(it->second));
+        }
+        return std::optional<Rgba8Image>();
+      });
+      return nullptr;
+    }
+    if (atlas.loading.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return nullptr;
+    std::optional<Rgba8Image> image = atlas.loading.get();
+    rex::ui::ImmediateDrawer* drawer = immediate_drawer_ ? immediate_drawer_() : nullptr;
+    if (image && drawer) {
+      atlas.texture = drawer->CreateTexture(image->width, image->height, rex::ui::ImmediateTextureFilter::kLinear,
+                                            false, image->pixels.data());
+    }
+    if (!atlas.texture) {
+      atlas.failed = true;
+      REXLOG_WARN("Pointer: no atlas for font {}", name);
+    }
+    return atlas.texture.get();
+  }
+
+  // Main-menu-style yellow bar with the glyphs redrawn in black on top. Plain
+  // outline until the atlases load (the bar would hide the text).
+  template <typename ToScreen>
+  void DrawLabelHighlight(ImDrawList* draw, const Highlight& hl, ImVec2 a, ImVec2 b, float h,
+                          ToScreen to_screen) {
+    std::vector<rex::ui::ImmediateTexture*> textures;
+    bool ready = !hl.runs.empty();
+    for (const auto& run : hl.runs) {
+      textures.push_back(Atlas(run.font));
+      ready = ready && textures.back();
+    }
+    float pad_x = h * (hl.style == HighlightStyle::kIcon ? 0.004f : 0.007f);
+    float pad_y = hl.style == HighlightStyle::kIcon ? h * 0.004f : 0.0f;
+    a = ImVec2(a.x - pad_x, a.y - pad_y);
+    b = ImVec2(b.x + pad_x, b.y + pad_y);
+    if (!ready) {
+      draw->AddRect(a, b, kUiAccent, 0, 0, std::max(1.5f, h * 0.0025f));
+      return;
+    }
+    float scale = h / 720.0f;
+    ui_.DrawAccentBar(draw, a, b, scale);
+    // The main menu's bar has a thin dark edge.
+    draw->AddRect(ImVec2(a.x - 0.5f, a.y - 0.5f), ImVec2(b.x + 0.5f, b.y + 0.5f), IM_COL32(16, 16, 6, 190),
+                  std::min(5.0f * scale, (b.y - a.y) * 0.5f), 0, std::max(1.0f, scale));
+    for (size_t r = 0; r < hl.runs.size(); ++r) {
+      const GlyphRun& run = hl.runs[r];
+      auto id = reinterpret_cast<ImTextureID>(textures[r]);
+      ImU32 color = run.icon ? run.color : IM_COL32(0, 0, 0, 255);
+      for (const GlyphQuad& q : run.quads) {
+        draw->AddImageQuad(id, to_screen(q.x[0], q.y[0]), to_screen(q.x[1], q.y[1]), to_screen(q.x[2], q.y[2]),
+                           to_screen(q.x[3], q.y[3]), ImVec2(q.u[0], q.v[0]), ImVec2(q.u[1], q.v[1]),
+                           ImVec2(q.u[2], q.v[2]), ImVec2(q.u[3], q.v[3]), color);
+      }
+    }
+  }
+
+  std::function<rex::ui::ImmediateDrawer*()> immediate_drawer_;
+  std::filesystem::path game_root_;
+  Rb3UiRenderer ui_;
+  std::unordered_map<std::string, FontAtlas> atlases_;
+};
+
+}  // namespace
+
+std::unique_ptr<rex::ui::ImGuiDialog> CreatePointerOverlay(
+    rex::ui::ImGuiDrawer* drawer, std::function<rex::ui::ImmediateDrawer*()> immediate_drawer,
+    const std::filesystem::path& game_root) {
+  LoadIconInk(game_root);
+  return std::make_unique<PointerOverlay>(drawer, std::move(immediate_drawer), game_root);
+}
+
+}  // namespace rb3pc
