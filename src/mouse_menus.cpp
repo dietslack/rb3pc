@@ -589,4 +589,477 @@ bool SetFocusEverywhere(PPCContext& ctx, uint8_t* base, uint32_t focused, uint32
   return any;
 }
 
+void NotePress(const uint8_t* base) {
+  ++g_target.presses;
+  g_target.waiting_focus = FocusedComponent(base);
+  g_target.waiting_selected = g_target.waiting_focus && IsList(Load32(base, g_target.waiting_focus))
+                                  ? int(Load32(base, g_target.waiting_focus + kListState + kStateSelectedDisplay))
+                                  : -1;
+  g_target.pressed = Clock::now();
+  if (REXCVAR_GET(mouse_menu_debug)) {
+    REXLOG_INFO("Pointer: press {} toward {:08X}, focused {:08X}", g_target.presses, g_target.comp,
+                g_target.waiting_focus);
+  }
+}
+
+int MaxFirstShowing(PPCContext& ctx, uint8_t* base, uint32_t list) {
+  PPCContext saved = ctx;
+  ctx.r1.u64 = (ctx.r1.u32 - 0x200) & ~0xFu;
+  ctx.r3.u64 = list + kListState;
+  MM_MAX_FIRST_SHOWING(ctx, base);
+  int max = int(ctx.r3.s32);
+  ctx = saved;
+  return std::max(max, 0);
+}
+
+// UIList::mUser (LocalUser*, +480), carried by UIComponentScrollMsg. The
+// overshell forwards it only to that user's slot and its lists never set one,
+// so fill in player 1 (pad 0, mnk).
+constexpr uint32_t kListUser = 480;
+
+bool IsUser(uint32_t user) { return user >= 0x40000000 && user < 0x50000000; }
+
+uint32_t PlayerOneUser(PPCContext& ctx, uint8_t* base) {
+  PPCContext saved = ctx;
+  ctx.r1.u64 = (ctx.r1.u32 - 0x200) & ~0xFu;
+  ctx.r3.u64 = 0;
+  MM_USER_FROM_PAD(ctx, base);
+  uint32_t user = ctx.r3.u32;
+  ctx = saved;
+  return IsUser(user) ? user : 0;
+}
+
+void SelectListItem(PPCContext& ctx, uint8_t* base, uint32_t list, int pos, int first) {
+  if (!IsUser(Load32(base, list + kListUser))) {
+    if (uint32_t user = PlayerOneUser(ctx, base)) {
+      user = __builtin_bswap32(user);
+      std::memcpy(base + list + kListUser, &user, 4);
+    }
+  }
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x200) & ~0xFu;
+  ctx.r1.u64 = sp;
+  ctx.r3.u64 = list;
+  ctx.r4.s64 = pos;
+  ctx.r5.s64 = first;
+  MM_LIST_SET_SELECTED(ctx, base);
+  ctx.r1.u64 = sp;
+  ctx.r3.u64 = list + 336;  // its UIListStateCallback
+  ctx.r4.u64 = list + kListState;
+  MM_LIST_COMPLETE_SCROLL(ctx, base);
+  ctx = saved;
+}
+
+
+void ScrollList(PPCContext& ctx, uint8_t* base, uint32_t list, int notches) {
+  int first = int(Load32(base, list + kListState + kStateFirstShowing));
+  int display = int(Load32(base, list + kListState + kStateSelectedDisplay));
+  int new_first = std::clamp(first - notches, 0, MaxFirstShowing(ctx, base, list));
+  if (new_first == first) return;
+  // Keep the selection on the same screen row.
+  SelectListItem(ctx, base, list, new_first + display, new_first);
+}
+
+// UIListState: provider +0x20, hidden items +0x24 (vector<int>).
+constexpr uint32_t kStateProvider = 0x20, kStateHidden = 0x24;
+constexpr uint32_t kProviderNumDataSlot = 10, kProviderIsActiveSlot = 11;
+constexpr uint32_t kMusicLibraryVtable = rb3pc::exe::kDeluxe ? 0x82090E54 : 0x8209002C;  // the song list's provider
+
+bool IsSongList(const uint8_t* base, uint32_t list) {
+  uint32_t provider = Load32(base, list + kListState + kStateProvider);
+  return provider && Load32(base, provider) == kMusicLibraryVtable;
+}
+
+int NumShowing(PPCContext& ctx, uint8_t* base, uint32_t list) {
+  PPCContext saved = ctx;
+  ctx.r1.u64 = (ctx.r1.u32 - 0x200) & ~0xFu;
+  ctx.r3.u64 = list + kListState;
+  MM_NUM_SHOWING(ctx, base);
+  int num = int(ctx.r3.s32);
+  ctx = saved;
+  return num;
+}
+
+// UIListProvider::IsActive (song list headers aren't). Positions are data
+// indices only when nothing is hidden; otherwise assume active.
+bool IsActive(PPCContext& ctx, uint8_t* base, uint32_t list, int pos) {
+  uint32_t state = list + kListState;
+  if (Load32(base, state + kStateHidden) != Load32(base, state + kStateHidden + 4)) return true;
+  uint32_t provider = Load32(base, state + kStateProvider);
+  PPCFunc* func = provider ? rex::runtime::ResolveIndirectFunction(
+                                 Load32(base, Load32(base, provider) + 4 * kProviderIsActiveSlot))
+                           : nullptr;
+  if (!func) return true;
+  PPCContext saved = ctx;
+  ctx.r1.u64 = (ctx.r1.u32 - 0x200) & ~0xFu;
+  ctx.r3.u64 = provider;
+  ctx.r4.s64 = pos;
+  func(ctx, base);
+  bool active = (ctx.r3.u32 & 0xFF) != 0;
+  ctx = saved;
+  return active;
+}
+
+// One active item per notch, like the d-pad; the view follows past the middle row.
+void ScrollSongList(PPCContext& ctx, uint8_t* base, uint32_t list, int notches) {
+  uint32_t state = list + kListState;
+  int num_display = int(Load32(base, state + kStateNumDisplay));
+  int first = int(Load32(base, state + kStateFirstShowing));
+  int pos = first + int(Load32(base, state + kStateSelectedDisplay));
+  int count = NumShowing(ctx, base, list);
+  if (num_display <= 0 || count <= 0) return;
+  int max_first = std::min(MaxFirstShowing(ctx, base, list), std::max(count - num_display, 0));
+  int middle = (num_display - 1) / 2;
+  int step = notches > 0 ? -1 : 1;
+  int new_pos = pos;
+  for (int n = std::abs(notches); n > 0; --n) {
+    int next = new_pos + step;
+    while (next >= 0 && next < count && !IsActive(ctx, base, list, next)) next += step;
+    if (next < 0 || next >= count) break;
+    new_pos = next;
+  }
+  if (new_pos == pos) return;
+  int new_first = first;
+  if (step > 0 && new_pos - first > middle) new_first = new_pos - middle;
+  if (step < 0 && new_pos - first < middle) new_first = new_pos - middle;
+  new_first = std::clamp(new_first, std::max(new_pos - num_display + 1, 0), std::min(new_pos, max_first));
+  if (REXCVAR_GET(mouse_menu_debug)) {
+    REXLOG_INFO("Pointer: song list {} of {} (first {}) -> {} (first {}), max first {}", pos, count,
+                first, new_pos, new_first, max_first);
+  }
+  SelectListItem(ctx, base, list, new_pos, new_first);
+}
+
+// AppInlineHelp: vector of 36-byte ActionElements (JoypadAction first) at
+// +0x14C; matching vector<UILabel*> at +0x158.
+constexpr uint32_t kHelpConfig = 0x14C, kHelpLabels = 0x158, kActionElementSize = 36;
+enum JoypadAction : uint32_t {
+  kActionNone = 0, kActionConfirm, kActionCancel, kActionOption, kActionStart,
+  kActionViewModify, kActionUp, kActionRight, kActionDown, kActionLeft,
+  kActionPageUp, kActionPageDown, kActionExtended1, kActionExtended2, kActionShellOption,
+};
+
+bool PointerOnPlane(const uint8_t* base, uint32_t comp, uint32_t cam, float px, float py, Vec3& hit) {
+  float sx, sy, depth;
+  if (!cam || !Project(base, cam, LoadVec(base, comp + kCompXfm + 48), sx, sy, depth)) return false;
+  return PlaneHit(base, comp, Unproject(base, cam, px, py, depth * 0.25f),
+                  Unproject(base, cam, px, py, depth * 4.0f), hit);
+}
+
+// Hmx::Object name (const char* at +0x18). Only heap and image addresses are
+// read; others may be unmapped.
+constexpr uint32_t kObjectName = 0x18;
+std::string ObjectName(const uint8_t* base, uint32_t object) {
+  uint32_t name = Load32(base, object + kObjectName);
+  if (!((name >= 0x40000000 && name < 0x50000000) || (name >= 0x82000000 && name < 0x83000000))) return {};
+  const char* c = reinterpret_cast<const char*>(base + name);
+  size_t n = 0;
+  while (n < 96 && c[n] >= 0x20 && c[n] < 0x7F) ++n;
+  return c[n] == 0 ? std::string(c, n) : std::string();
+}
+
+// Icon font: glyphs fitted to their ink, drawn in their own colours.
+constexpr const char* kIconFont = "buttons.font";
+
+// Glyph extent, tighter than line metrics (a lone icon like NO REVIEW's X).
+// RndText::mMeshMap, one mesh per font: std::map head inline at +0x160
+// (leftmost +4, root +8, rightmost +0xC, size +0x10); node MeshInfo at +0x14
+// (mesh, sync flags, glyph count). 4 verts per glyph (RndMesh verts at +0xD8,
+// 96 bytes: pos +0, uv +0x40).
+constexpr uint32_t kRndMeshVtable = rb3pc::exe::kDeluxe ? 0x82101B14 : 0x820FC3C4;  // DxMesh
+constexpr uint32_t kTextMeshMap = 0x160, kMeshVerts = 0xD8, kVertSize = 96, kVertUv = 0x40;
+constexpr float kIconCellShare = 0.55f;
+
+// Ink bounds per icon cell, measured from buttons.font in the ARK: cells are
+// much bigger than the icons, by varying amounts.
+struct IconInk {
+  float u0, v0;              // cell top left
+  float ink_u0, ink_v0, ink_u1, ink_v1;
+};
+std::atomic<const std::vector<IconInk>*> g_icon_ink{nullptr};
+
+void LoadIconInk(std::filesystem::path game_root) {
+  std::thread([game_root] {
+    rb3pc::Rb3UiAssets assets = rb3pc::LoadRb3UiAssets(
+        game_root, {}, {{"buttons", "ui/resource/fonts/gen/buttons.milo_xbox", "buttons.font", "buttons.tex"}});
+    auto it = assets.fonts.find("buttons");
+    if (it == assets.fonts.end() || !it->second.atlas.width) return;
+    const rb3pc::BitmapFont& font = it->second;
+    const rb3pc::Rgba8Image& atlas = font.atlas;
+    auto* inks = new std::vector<IconInk>();
+    for (const auto& [ch, glyph] : font.glyphs) {
+      int x0 = int(glyph.u * atlas.width), y0 = int(glyph.v * atlas.height);
+      int x1 = std::min(int((glyph.u + glyph.width * font.cell_u) * atlas.width + 0.5f), int(atlas.width));
+      int y1 = std::min(int((glyph.v + font.cell_v) * atlas.height + 0.5f), int(atlas.height));
+      int ix0 = x1, iy0 = y1, ix1 = x0 - 1, iy1 = y0 - 1;
+      for (int y = std::max(y0, 0); y < y1; ++y) {
+        for (int x = std::max(x0, 0); x < x1; ++x) {
+          if (atlas.pixels[(size_t(y) * atlas.width + x) * 4 + 3] < 96) continue;
+          ix0 = std::min(ix0, x);
+          iy0 = std::min(iy0, y);
+          ix1 = std::max(ix1, x);
+          iy1 = std::max(iy1, y);
+        }
+      }
+      if (ix1 < ix0) continue;
+      inks->push_back({glyph.u, glyph.v, float(ix0) / atlas.width, float(iy0) / atlas.height,
+                       float(ix1 + 1) / atlas.width, float(iy1 + 1) / atlas.height});
+    }
+    g_icon_ink = inks;  // kept for the process's life
+  }).detach();
+}
+
+const IconInk* FindIconInk(float u0, float v0) {
+  const std::vector<IconInk>* inks = g_icon_ink;
+  if (!inks) return nullptr;
+  for (const auto& ink : *inks) {
+    if (std::fabs(ink.u0 - u0) < 0.002f && std::fabs(ink.v0 - v0) < 0.002f) return &ink;
+  }
+  return nullptr;
+}
+
+bool GlyphBox(const uint8_t* base, uint32_t text, LocalBox& out, bool* icons_only = nullptr) {
+  if (icons_only) *icons_only = true;
+  uint32_t head = text + kTextMeshMap;
+  uint32_t count = Load32(base, head + 0x10);
+  if (!count || count > 3) return false;
+  uint32_t nodes[3] = {Load32(base, head + 4), Load32(base, head + 8), Load32(base, head + 0xC)};
+  uint32_t text_font = Load32(base, text + 0x110);  // RndText::mStyle.font
+  bool any = false;
+  for (int n = 0; n < 3; ++n) {
+    uint32_t node = nodes[n];
+    if (node == head || node < 0x40000000 || node >= 0x90000000 ||
+        std::find(nodes, nodes + n, node) != nodes + n) {
+      continue;
+    }
+    uint32_t mesh = Load32(base, node + 0x14), glyphs = Load32(base, node + 0x1C);
+    if (mesh < 0x40000000 || mesh >= 0x90000000 || Load32(base, mesh) != kRndMeshVtable || glyphs > 256) continue;
+    uint32_t verts = Load32(base, mesh + kMeshVerts);
+    if (verts < 0x40000000 || verts >= 0x90000000) continue;
+    uint32_t font = Load32(base, node + 0x10);
+    bool icon = font != text_font || ObjectName(base, font) == kIconFont;
+    for (uint32_t g = 0; g < glyphs; ++g) {
+      uint32_t q = verts + g * 4 * kVertSize;
+      // Verts 0 and 2 are opposite corners.
+      float x0 = LoadF(base, q), z0 = LoadF(base, q + 8);
+      float x1 = LoadF(base, q + 2 * kVertSize), z1 = LoadF(base, q + 2 * kVertSize + 8);
+      float u0 = LoadF(base, q + kVertUv), v0 = LoadF(base, q + kVertUv + 4);
+      float u1 = LoadF(base, q + 2 * kVertSize + kVertUv), v1 = LoadF(base, q + 2 * kVertSize + kVertUv + 4);
+      if (u0 == u1 || v0 == v1 || x0 == x1) continue;
+      if (!icon && icons_only) *icons_only = false;
+      float left = std::min(x0, x1), right = std::max(x0, x1);
+      float top = std::max(z0, z1), bottom = std::min(z0, z1);
+      if (icon) {
+        if (const IconInk* ink = FindIconInk(std::min(u0, u1), std::min(v0, v1))) {
+          auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+          float l = lerp(x0, x1, (ink->ink_u0 - u0) / (u1 - u0)), r = lerp(x0, x1, (ink->ink_u1 - u0) / (u1 - u0));
+          float t = lerp(z0, z1, (ink->ink_v0 - v0) / (v1 - v0)), b = lerp(z0, z1, (ink->ink_v1 - v0) / (v1 - v0));
+          left = std::min(l, r);
+          right = std::max(l, r);
+          top = std::max(t, b);
+          bottom = std::min(t, b);
+        } else {
+          float trim = (top - bottom) * (1 - kIconCellShare) / 2;
+          top -= trim;
+          bottom += trim;
+        }
+      }
+      if (!any) {
+        out = {left, top, right, bottom};
+        any = true;
+      } else {
+        out = {std::min(out.left, left), std::max(out.top, top), std::max(out.right, right),
+               std::min(out.bottom, bottom)};
+      }
+    }
+  }
+  return any;
+}
+
+// Glyph quads redrawn over a highlight: screen corners and atlas uv.
+struct GlyphQuad {
+  float x[4], y[4], u[4], v[4];
+};
+struct GlyphRun {
+  std::string font;  // RndFont object name
+  bool icon;         // own colours; text is drawn black
+  uint32_t color;    // ImU32
+  std::vector<GlyphQuad> quads;
+};
+void CollectGlyphRuns(const uint8_t* base, uint32_t comp, uint32_t text, uint32_t cam,
+                      std::vector<GlyphRun>& runs) {
+  uint32_t head = text + kTextMeshMap;
+  uint32_t count = Load32(base, head + 0x10);
+  if (!count || count > 3) return;
+  uint32_t nodes[3] = {Load32(base, head + 4), Load32(base, head + 8), Load32(base, head + 0xC)};
+  uint32_t text_font = Load32(base, text + 0x110);
+  for (int n = 0; n < 3; ++n) {
+    uint32_t node = nodes[n];
+    if (node == head || node < 0x40000000 || node >= 0x90000000 ||
+        std::find(nodes, nodes + n, node) != nodes + n) {
+      continue;
+    }
+    uint32_t font = Load32(base, node + 0x10);
+    uint32_t mesh = Load32(base, node + 0x14), glyphs = Load32(base, node + 0x1C);
+    if (font < 0x40000000 || font >= 0x90000000 || mesh < 0x40000000 || mesh >= 0x90000000 ||
+        Load32(base, mesh) != kRndMeshVtable || glyphs > 256) {
+      continue;
+    }
+    uint32_t verts = Load32(base, mesh + kMeshVerts);
+    if (verts < 0x40000000 || verts >= 0x90000000) continue;
+    GlyphRun run{ObjectName(base, font), font != text_font, IM_COL32_WHITE, {}};
+    if (run.font.empty()) continue;
+    if (run.font == kIconFont) run.icon = true;
+    for (uint32_t g = 0; g < glyphs; ++g) {
+      uint32_t q = verts + g * 4 * kVertSize;
+      GlyphQuad quad;
+      bool ok = true;
+      for (int k = 0; k < 4 && ok; ++k) {
+        uint32_t v = q + k * kVertSize;
+        float depth;
+        ok = Project(base, cam, Transform(base, comp + kCompXfm, LoadVec(base, v)), quad.x[k], quad.y[k], depth);
+        quad.u[k] = LoadF(base, v + kVertUv);
+        quad.v[k] = LoadF(base, v + kVertUv + 4);
+      }
+      if (!ok || (quad.u[0] == quad.u[2] && quad.v[0] == quad.v[2])) continue;  // spaces
+      if (run.quads.empty()) {
+        // Vertex colour: RGBA floats at +0x30.
+        auto channel = [&](uint32_t o) { return int(std::clamp(LoadF(base, q + 0x30 + o), 0.0f, 1.0f) * 255); };
+        run.color = IM_COL32(channel(0), channel(4), channel(8), channel(12));
+      }
+      run.quads.push_back(quad);
+    }
+    if (!run.quads.empty()) runs.push_back(std::move(run));
+  }
+}
+
+// The help bar label under the pointer: its action (or kActionNone), the
+// label and the text line hit.
+uint32_t HelpActionAt(const uint8_t* base, float px, float py, uint32_t& label_hit, LocalBox& line) {
+  uint64_t best_order = 0;
+  uint32_t action = kActionNone;
+  for (const auto& [help, drawn] : g_help_bars) {
+    uint32_t config = Load32(base, help + kHelpConfig), config_end = Load32(base, help + kHelpConfig + 4);
+    uint32_t labels = Load32(base, help + kHelpLabels), labels_end = Load32(base, help + kHelpLabels + 4);
+    if (config_end - config > kActionElementSize * 16 || labels_end - labels > 4 * 16) continue;
+    for (uint32_t i = 0; config + i * kActionElementSize < config_end && labels + i * 4 < labels_end; ++i) {
+      uint32_t label = Load32(base, labels + i * 4);
+      auto it = g_drawn.find(label);
+      if (it == g_drawn.end() || it->second.order < best_order) continue;
+      Vec3 hit;
+      if (!PointerOnPlane(base, label, it->second.cam, px, py, hit) || !InButton(base, label, hit, &line)) continue;
+      // Glyphs, not the line: a lone icon is much smaller.
+      LocalBox glyphs;
+      if (GlyphBox(base, Load32(base, label + 324), glyphs)) {
+        float slack = (glyphs.top - glyphs.bottom) * 0.3f;
+        if (hit.x < glyphs.left - slack || hit.x > glyphs.right + slack || hit.z > glyphs.top + slack ||
+            hit.z < glyphs.bottom - slack) {
+          continue;
+        }
+      }
+      {
+        action = Load32(base, config + i * kActionElementSize);
+        label_hit = label;
+        best_order = it->second.order;
+      }
+    }
+  }
+  return action;
+}
+
+// ScrollbarDisplay (vtable 0x82031F1C): BandList +328, track height +332, min
+// thumb +348, top bone (RndMesh, local pos +112) +352, thumb position 0-1
+// +388, thumb share of track +392. Track runs -z from the top bone.
+constexpr uint32_t kBarList = 328, kBarHeight = 332, kBarMinThumb = 348, kBarTopBone = 352;
+constexpr uint32_t kBarPosition = 388, kBarScale = 392, kBoneLocalPos = 112;
+// Drawn thumb, measured on screen.
+constexpr float kBarCentre = 0.35f, kBarHalfWidth = 3.05f, kBarBottomExtra = 1, kBarGrabHalfWidth = 14;
+
+std::unordered_map<uint32_t, Drawn> g_scrollbars;
+
+struct Scrollbar {
+  uint32_t bar = 0, list = 0, cam = 0;
+  float x = 0, top = 0, height = 0;  // track
+  float thumb_top = 0, thumb_height = 0;
+};
+
+bool ReadScrollbar(const uint8_t* base, uint32_t bar, uint32_t cam, Scrollbar& out) {
+  uint32_t bone = Load32(base, bar + kBarTopBone), list = Load32(base, bar + kBarList);
+  float scale = LoadF(base, bar + kBarScale);
+  if (!bone || !list || !g_drawn.count(list) || !(scale < 1.0f)) return false;  // no thumb shown
+  out.bar = bar;
+  out.list = list;
+  out.cam = cam;
+  out.x = LoadF(base, bone + kBoneLocalPos);
+  out.top = LoadF(base, bone + kBoneLocalPos + 8);
+  out.height = LoadF(base, bar + kBarHeight);
+  out.thumb_height = std::max(scale * out.height, LoadF(base, bar + kBarMinThumb));
+  out.thumb_top = out.top - LoadF(base, bar + kBarPosition) * (out.height - out.thumb_height);
+  return out.height > 0;
+}
+
+bool ScrollbarAt(const uint8_t* base, float px, float py, Scrollbar& bar, float& z) {
+  for (const auto& [b, drawn] : g_scrollbars) {
+    Scrollbar sb;
+    Vec3 hit;
+    if (!ReadScrollbar(base, b, drawn.cam, sb) || !PointerOnPlane(base, b, sb.cam, px, py, hit)) continue;
+    if (std::fabs(hit.x - sb.x) <= kBarGrabHalfWidth && hit.z <= sb.top + 4 &&
+        hit.z >= sb.top - sb.height - 4) {
+      bar = sb;
+      z = hit.z;
+      return true;
+    }
+  }
+  return false;
+}
+
+// grab: thumb top relative to the pointer.
+struct Drag {
+  uint32_t bar = 0;
+  float grab = 0;
+};
+Drag g_drag;
+bool g_left_was_down = false;
+
+void DragScrollbar(PPCContext& ctx, uint8_t* base, const Scrollbar& sb, float thumb_top) {
+  uint32_t list = sb.list, state = list + kListState;
+  int num_display = int(Load32(base, state + kStateNumDisplay));
+  int count = NumShowing(ctx, base, list);
+  int max_first = std::min(MaxFirstShowing(ctx, base, list), std::max(count - num_display, 0));
+  float range = sb.height - sb.thumb_height;
+  if (range <= 0 || max_first <= 0) return;
+  float fraction = std::clamp((sb.top - thumb_top) / range, 0.0f, 1.0f);
+  int first = int(Load32(base, state + kStateFirstShowing));
+  int new_first = int(std::lround(fraction * max_first));
+  if (new_first == first) return;
+  int display = int(Load32(base, state + kStateSelectedDisplay));
+  SelectListItem(ctx, base, list, std::min(new_first + display, count - 1), new_first);
+}
+
+// ReviewDisplay (vtable 0x820313C4): score at +328 (0-5; anim frame score *
+// 10). The game steps the score with X (ShellOption), wrapping 5 to none, so
+// a click queues that many presses. Pick centres measured on screen.
+constexpr uint32_t kReviewScore = 328;
+constexpr float kReviewFirstX = -90, kReviewSpacing = 45, kReviewZ = 2.6f, kReviewHalfHeight = 17;
+
+std::unordered_map<uint32_t, Drawn> g_reviews;
+std::atomic<uint32_t> g_review_preview_comp{0};
+std::atomic<int> g_review_preview_score{-1};
+
+bool ReviewPickAt(const uint8_t* base, float px, float py, uint32_t& review, int& score, Vec3* local = nullptr) {
+  for (const auto& [comp, drawn] : g_reviews) {
+    Vec3 hit;
+    if (!PointerOnPlane(base, comp, drawn.cam, px, py, hit)) continue;
+    if (local) *local = hit;
+    if (std::fabs(hit.z - kReviewZ) > kReviewHalfHeight) continue;
+    float slot = (hit.x - kReviewFirstX) / kReviewSpacing;
+    int pick = int(std::lround(slot));
+    if (pick < 0 || pick > 4 || std::fabs(hit.x - (kReviewFirstX + pick * kReviewSpacing)) > kReviewSpacing / 2) continue;
+    review = comp;
+    score = pick + 1;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
