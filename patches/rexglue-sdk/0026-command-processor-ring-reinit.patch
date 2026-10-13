@@ -1,0 +1,71 @@
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -255,6 +255,9 @@
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
++  // Set by InitializeRingBuffer (a guest thread): the worker restarts reading
++  // at the start of the ring before it next looks at the write pointer.
++  std::atomic<bool> ring_reset_pending_{false};
+ 
+   // Some titles submit writes beyond the emulated register file range in PM4
+   // packets. Preserve these values so dependent packet logic can still observe
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -215,6 +215,9 @@
+       fn();
+     }
+ 
++    if (ring_reset_pending_.exchange(false)) {
++      read_ptr_index_ = 0;
++    }
+     uint32_t write_ptr_index = write_ptr_index_.load();
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+@@ -234,10 +237,10 @@
+         rex::thread::MaybeYield();
+         loop_count++;
+         write_ptr_index = write_ptr_index_.load();
+-      } while (worker_running_ && pending_fns_.empty() &&
++      } while (worker_running_ && pending_fns_.empty() && !ring_reset_pending_.load() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
+-      if (!worker_running_ || !pending_fns_.empty()) {
++      if (!worker_running_ || !pending_fns_.empty() || ring_reset_pending_.load()) {
+         continue;
+       }
+     }
+@@ -245,6 +248,11 @@
+ 
+     // Execute. Note that we handle wraparound transparently.
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    if (ring_reset_pending_.load()) {
++      // The ring was set up again meanwhile: that position belongs to the old
++      // one, and the reset at the top of the loop applies.
++      continue;
++    }
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -317,9 +325,20 @@
+ void CommandProcessor::ShutdownContext() {}
+ 
+ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+-  read_ptr_index_ = 0;
++  // A title may set the ring up again (Rock Band 3 Deluxe does, while
++  // booting). Both pointers go back to the start: with only the read pointer
++  // reset, the worker saw the old write pointer and replayed the whole old
++  // ring, re-running stale command buffers that overwrote newer fence values,
++  // and the title waited forever on a fence. The read pointer is reset by the
++  // worker (it may be mid-execution here); the write pointer here, before the
++  // title writes its next one. The ring is cleared, as Xenia does, so nothing
++  // stale can run.
+   primary_buffer_ptr_ = ptr;
+   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
++  std::memset(memory_->TranslatePhysical(primary_buffer_ptr_), 0, primary_buffer_size_);
++  write_ptr_index_ = 0;
++  ring_reset_pending_ = true;
++  write_ptr_index_event_->Set();
+ }
+ 
+ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {

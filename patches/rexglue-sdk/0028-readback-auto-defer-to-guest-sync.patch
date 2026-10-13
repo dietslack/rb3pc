@@ -1,0 +1,237 @@
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -221,6 +221,12 @@
+   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
+   virtual bool IssueCopy() = 0;
++  // Resolves whose readback into guest memory was deferred (Vulkan auto
++  // readback) are completed here, before anything that lets the guest see
++  // the GPU reached a point (fences and other GPU memory writes, the ring
++  // read pointer, interrupts): the guest can't look at resolved memory
++  // earlier than that on the real console either.
++  virtual void FlushPendingReadbacks() {}
+ 
+   // "Actual" is for the command processor thread, to be read by the
+   // implementations.
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -257,6 +257,7 @@
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+     if (read_ptr_writeback_ptr_) {
++      FlushPendingReadbacks();  // before the guest can see the GPU got here
+       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                        read_ptr_index_);
+     }
+@@ -390,6 +391,7 @@
+       // Enabled - write to address.
+       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
+       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
++      FlushPendingReadbacks();  // before the guest can see the GPU got here
+       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+     }
+   } else {
+@@ -943,6 +945,7 @@
+   for (int n = 0; n < 6; n++) {
+     if (cpu_mask & (1 << n)) {
+       if (graphics_system_) {
++        FlushPendingReadbacks();  // before the guest can see the GPU got here
+         graphics_system_->DispatchInterruptCallback(1, n);
+       }
+     }
+@@ -1118,6 +1121,7 @@
+   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
+   mem_addr &= ~0x3;
+   reg_val = GpuSwap(reg_val, endianness);
++  FlushPendingReadbacks();  // before the guest can see the GPU got here
+   memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+ 
+   return true;
+@@ -1132,6 +1136,7 @@
+     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
+     auto addr = write_addr & ~0x3;
+     write_data = GpuSwap(write_data, endianness);
++    FlushPendingReadbacks();  // before the guest can see the GPU got here
+     memory::store(memory_->TranslatePhysical(addr), write_data);
+     write_addr += 4;
+   }
+@@ -1193,6 +1198,7 @@
+       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
+       write_reg_addr &= ~0x3;
+       write_data = GpuSwap(write_data, endianness);
++      FlushPendingReadbacks();  // before the guest can see the GPU got here
+       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+     } else {
+       // Register.
+@@ -1238,6 +1244,7 @@
+   auto endianness = static_cast<xenos::Endian>(address & 0x3);
+   address &= ~0x3;
+   data_value = GpuSwap(data_value, endianness);
++  FlushPendingReadbacks();  // before the guest can see the GPU got here
+   memory::store(memory_->TranslatePhysical(address), data_value);
+   return true;
+ }
+@@ -1265,6 +1272,7 @@
+       1,                                         // max z
+   };
+   assert_true(endianness == xenos::Endian::k8in16);
++  FlushPendingReadbacks();  // before the guest can see the GPU got here
+   memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
+                                      rex::countof(extents));
+   return true;
+@@ -1284,6 +1292,7 @@
+   // As a workaround report some fixed amount of passed samples.
+   auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+   if (fake_sample_count >= 0) {
++    FlushPendingReadbacks();  // before the guest can see the GPU got here
+     auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
+         register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+     if (!pSampleCounts) {
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -482,6 +482,18 @@
+     uint32_t frame_streak = 0;
+   };
+   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
++  void FlushPendingReadbacks() override;
++  // auto mode: occasional resolves copied into readback buffers whose copy
++  // into guest memory waits for FlushPendingReadbacks, so a frame with many
++  // of them costs one GPU wait, not one each. One per destination: a later
++  // resolve of the same one replaces it (only the last content is visible).
++  struct PendingReadback {
++    uint64_t key;
++    uint32_t index;
++    uint32_t address;
++    uint32_t length;
++  };
++  std::vector<PendingReadback> pending_readbacks_;
+   // auto mode: a destination resolved in at least this many frames, never
+   // more than kReadbackAutoMaxFrameGap apart, is a per-frame render target and
+   // isn't read back. Once one, it stays one (readback_auto_frequent_) until
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1943,6 +1943,7 @@
+       readback.written_size[i] = 0;
+     }
+   }
++  pending_readbacks_.clear();
+   readback_buffers_.clear();
+   readback_auto_frequent_.clear();
+   for (auto& readback_pair : memexport_readback_buffers_) {
+@@ -4574,6 +4575,7 @@
+     }
+ 
+     if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
++      FlushPendingReadbacks();  // may refer to the buffer being replaced
+       if (!AwaitAllQueueOperationsCompletion()) {
+         dfn.vkUnmapMemory(device, new_memory);
+         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+@@ -4615,6 +4617,7 @@
+   // read by the GPU, which already has them, so they aren't read back at all:
+   // copying them into guest memory every frame was a third of the GPU
+   // thread's time on RB3's title screen.
++  bool defer_readback = false;
+   if (readback_mode == ReadbackResolveMode::kAuto) {
+     auto frequent = readback_auto_frequent_.find(resolve_key);
+     if (frequent != readback_auto_frequent_.end() &&
+@@ -4635,6 +4638,7 @@
+       return true;
+     }
+     readback_mode = ReadbackResolveMode::kFull;
++    defer_readback = true;
+   }
+   uint32_t write_index = readback.current_index;
+   uint32_t readback_size = AlignReadbackBufferSize(written_length);
+@@ -4809,6 +4813,18 @@
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+ 
++  if (defer_readback) {
++    auto pending = std::find_if(pending_readbacks_.begin(), pending_readbacks_.end(),
++                                [&](const PendingReadback& p) { return p.key == resolve_key; });
++    if (pending != pending_readbacks_.end()) {
++      pending->index = write_index;
++    } else {
++      pending_readbacks_.push_back({resolve_key, write_index, written_address, written_length});
++    }
++    readback.current_index = 1 - readback.current_index;
++    return true;
++  }
++
+   bool use_delayed_sync =
+       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+   uint32_t read_index = write_index;
+@@ -4849,11 +4865,52 @@
+   return true;
+ }
+ 
++void VulkanCommandProcessor::FlushPendingReadbacks() {
++  if (pending_readbacks_.empty()) {
++    return;
++  }
++  // Moved out first: the wait ends the submission, which may come back here.
++  std::vector<PendingReadback> pending;
++  pending.swap(pending_readbacks_);
++  if (!AwaitAllQueueOperationsCompletion()) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  for (const PendingReadback& p : pending) {
++    auto it = readback_buffers_.find(p.key);
++    if (it == readback_buffers_.end()) {
++      continue;
++    }
++    ReadbackBuffer& readback = it->second;
++    if (readback.memories[p.index] == VK_NULL_HANDLE || readback.mapped_data[p.index] == nullptr ||
++        p.length > readback.sizes[p.index]) {
++      continue;
++    }
++    VkMappedMemoryRange range = {};
++    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++    range.memory = readback.memories[p.index];
++    range.offset = 0;
++    range.size = VK_WHOLE_SIZE;
++    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
++    if (uint8_t* destination = memory_->TranslatePhysical(p.address)) {
++      std::memcpy(destination, readback.mapped_data[p.index], p.length);
++    }
++  }
++}
++
+ void VulkanCommandProcessor::EvictOldReadbackBuffers(
+     std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map) {
+   if (buffer_map.empty()) {
+     return;
+   }
++  // Pending readbacks (normally completed when the frame opened) keep theirs.
++  auto is_pending = [&](uint64_t key) {
++    return &buffer_map == &readback_buffers_ &&
++           std::any_of(pending_readbacks_.begin(), pending_readbacks_.end(),
++                       [&](const PendingReadback& p) { return p.key == key; });
++  };
+ 
+   const uint64_t eviction_frame_floor = (frame_current_ > kReadbackBufferEvictionAgeFrames)
+                                             ? (frame_current_ - kReadbackBufferEvictionAgeFrames)
+@@ -4864,7 +4921,8 @@
+   for (auto it = buffer_map.begin(); it != buffer_map.end();) {
+     ReadbackBuffer& readback = it->second;
+     bool evict =
+-        buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor;
++        (buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor) &&
++        !is_pending(it->first);
+     if (!evict) {
+       ++it;
+       continue;
+@@ -5264,6 +5322,10 @@
+   if (submission_open_ && !is_opening_frame) {
+     return true;
+   }
++  if (is_opening_frame && !submission_open_) {
++    // Deferred readbacks refer to readback buffers the new frame may evict.
++    FlushPendingReadbacks();
++  }
+ 
+   // Check the fence - needed for all kinds of submissions (to reclaim transient
+   // resources early) and specifically for frames (not to queue too many), and

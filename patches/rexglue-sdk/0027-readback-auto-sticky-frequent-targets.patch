@@ -1,0 +1,64 @@
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -484,8 +484,14 @@
+   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+   // auto mode: a destination resolved in at least this many frames, never
+   // more than kReadbackAutoMaxFrameGap apart, is a per-frame render target and
+-  // gets the delayed readback.
+-  static constexpr uint32_t kReadbackAutoFrequentFrames = 30;
++  // isn't read back. Once one, it stays one (readback_auto_frequent_) until
++  // unused for kReadbackAutoFrequentForgetFrames: RB3 uses many per-frame
++  // targets in bursts of one camera shot (often under a second, two or three
++  // resolves a frame), and with the streak starting over each burst they were
++  // read back, each a full GPU stall, the whole song. Render-to-texture read
++  // by the CPU (character composites) is resolved once and never qualifies.
++  static constexpr uint32_t kReadbackAutoFrequentFrames = 8;
++  static constexpr uint64_t kReadbackAutoFrequentForgetFrames = 4096;
+   static constexpr uint64_t kReadbackAutoMaxFrameGap = 4;
+   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
+   static constexpr size_t kMaxReadbackBuffers = 256;
+@@ -789,6 +795,10 @@
+   uint64_t vertex_buffers_in_sync_[2] = {};
+   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
++  // auto mode: resolve destinations known to be per-frame targets, and the
++  // frame each was last resolved in. Kept apart from readback_buffers_, whose
++  // entries are evicted after kReadbackBufferEvictionAgeFrames.
++  std::unordered_map<uint64_t, uint64_t> readback_auto_frequent_;
+ 
+   // The current dynamic state of the graphics pipeline bind point. Note that
+   // binding any pipeline to the bind point with static state (even if it's
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1944,6 +1944,7 @@
+     }
+   }
+   readback_buffers_.clear();
++  readback_auto_frequent_.clear();
+   for (auto& readback_pair : memexport_readback_buffers_) {
+     ReadbackBuffer& readback = readback_pair.second;
+     for (uint32_t i = 0; i < 2; ++i) {
+@@ -4615,7 +4616,22 @@
+   // copying them into guest memory every frame was a third of the GPU
+   // thread's time on RB3's title screen.
+   if (readback_mode == ReadbackResolveMode::kAuto) {
+-    if (readback.frame_streak >= kReadbackAutoFrequentFrames) {
++    auto frequent = readback_auto_frequent_.find(resolve_key);
++    if (frequent != readback_auto_frequent_.end() &&
++        frame_current_ - frequent->second > kReadbackAutoFrequentForgetFrames) {
++      readback_auto_frequent_.erase(frequent);
++      frequent = readback_auto_frequent_.end();
++    }
++    if (frequent != readback_auto_frequent_.end() ||
++        readback.frame_streak >= kReadbackAutoFrequentFrames) {
++      readback_auto_frequent_[resolve_key] = frame_current_;
++      if (readback_auto_frequent_.size() > 4096) {
++        // Bounded: drop the ones not seen for longest.
++        for (auto it = readback_auto_frequent_.begin(); it != readback_auto_frequent_.end();) {
++          it = frame_current_ - it->second > kReadbackAutoMaxFrameGap ? readback_auto_frequent_.erase(it)
++                                                                      : std::next(it);
++        }
++      }
+       return true;
+     }
+     readback_mode = ReadbackResolveMode::kFull;
