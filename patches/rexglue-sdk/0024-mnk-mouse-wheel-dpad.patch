@@ -1,0 +1,265 @@
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index c8751b7..b77c76a 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -15,6 +15,8 @@
+ #include <rex/ui/window_listener.h>
+ 
+ #include <atomic>
++#include <functional>
++#include <chrono>
+ #include <cstdint>
+ #include <mutex>
+ #include <queue>
+@@ -22,6 +24,22 @@
+ 
+ namespace rex::input::mnk {
+ 
++// Queues one press of `buttons` on the keyboard-and-mouse device (held, then
++// released, like a mouse wheel notch with mnk_wheel_dpad). For host code that
++// drives the game's menus. At most 8 queue up; any thread.
++void QueuePress(uint16_t buttons);
++// Whether queued presses are still being sent.
++bool PressesPending();
++// Lets host code take mouse wheel notches (positive = away from the user)
++// before mnk_wheel_dpad turns them into d-pad presses: return true to
++// consume them. Called on the UI thread; empty to remove.
++void SetWheelHandler(std::function<bool(int32_t notches)> handler);
++// Lets host code take a mouse button press (0 left, 1 right, 2 middle)
++// before its key binding: return true to have the press hold `buttons`
++// instead (0 for nothing) until the mouse button is released. Called on the
++// UI thread; empty to remove.
++void SetClickHandler(std::function<bool(int mouse_button, uint16_t& buttons)> handler);
++
+ void SetMouseLookActive(bool active);
+ bool IsMouseLookActive();
+ 
+@@ -50,6 +68,7 @@ class MnkInputDriver final : public InputDriver,
+   void OnMouseDown(rex::ui::MouseEvent& e) override;
+   void OnMouseUp(rex::ui::MouseEvent& e) override;
+   void OnMouseMove(rex::ui::MouseEvent& e) override;
++  void OnMouseWheel(rex::ui::MouseEvent& e) override;
+ 
+   // WindowListener
+   void OnClosing(rex::ui::UIEvent& e) override;
+@@ -104,6 +123,8 @@ class MnkInputDriver final : public InputDriver,
+ 
+   // Packet number incremented on state change
+   uint32_t packet_number_ = 0;
++
++  int32_t wheel_accum_ = 0;  // mnk_wheel_dpad: scroll short of a whole notch
+ };
+ 
+ }  // namespace rex::input::mnk
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..02f6265 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -21,6 +21,8 @@
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
++#include <mutex>
+ #include <string_view>
+ 
+ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+@@ -29,6 +31,10 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
+                     "from the keybind_rstick_* keys only");
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
++REXCVAR_DEFINE_BOOL(mnk_wheel_dpad, false, "Input",
++                    "Mouse wheel presses d-pad up/down, once per notch (for menus)");
++REXCVAR_DEFINE_BOOL(mnk_ignore_focus, false, "Input",
++                    "Testing aid: report the device's state (queued presses) without window focus");
+ 
+ REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
+ REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
+@@ -137,8 +143,116 @@ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t l
+ 
+ std::atomic<bool> mouse_look_active{true};
+ 
++// QueuePress: presses still to send, and the one being sent. Each is held,
++// then released, for a set time so a game polling at its own rate sees every
++// press.
++std::mutex press_mutex;
++std::deque<uint16_t> press_queue;
++uint16_t press_current = 0;
++std::chrono::steady_clock::time_point press_start{};
++
++// The buttons queued presses hold right now.
++uint16_t QueuedButtons() {
++  constexpr auto kHold = std::chrono::milliseconds(50), kGap = std::chrono::milliseconds(40);
++  std::lock_guard lock(press_mutex);
++  auto now = std::chrono::steady_clock::now();
++  if (press_current && now - press_start >= kHold + kGap) press_current = 0;
++  if (!press_current && !press_queue.empty()) {
++    press_current = press_queue.front();
++    press_queue.pop_front();
++    press_start = now;
++  }
++  return press_current && now - press_start < kHold ? press_current : 0;
++}
++
++}  // namespace
++
++void QueuePress(uint16_t buttons) {
++  std::lock_guard lock(press_mutex);
++  if (buttons && press_queue.size() < 8) press_queue.push_back(buttons);
++}
++
++bool PressesPending() {
++  std::lock_guard lock(press_mutex);
++  return press_current || !press_queue.empty();
++}
++
++namespace {
++std::mutex wheel_handler_mutex;
++std::function<bool(int32_t)> wheel_handler;
++}  // namespace
++
++void SetWheelHandler(std::function<bool(int32_t notches)> handler) {
++  std::lock_guard lock(wheel_handler_mutex);
++  wheel_handler = std::move(handler);
++}
++
++namespace {
++std::mutex click_mutex;
++std::function<bool(int, uint16_t&)> click_handler;
++// Presses the click handler took, per mouse button: what they hold, and
++// until when once released (a short click still lasts a few game polls).
++struct ClickOverride {
++  bool active = false, released = false;
++  uint16_t buttons = 0;
++  std::chrono::steady_clock::time_point until{};
++};
++ClickOverride click_overrides[3];
++constexpr auto kMinClickHold = std::chrono::milliseconds(60);
++
++int MouseButtonIndex(rex::ui::MouseEvent::Button button) {
++  switch (button) {
++    case rex::ui::MouseEvent::Button::kLeft:
++      return 0;
++    case rex::ui::MouseEvent::Button::kRight:
++      return 1;
++    case rex::ui::MouseEvent::Button::kMiddle:
++      return 2;
++    default:
++      return -1;
++  }
++}
++
++// On a mouse button press: whether the click handler takes it.
++bool TakeClick(int index) {
++  std::lock_guard lock(click_mutex);
++  uint16_t buttons = 0;
++  if (index < 0 || !click_handler || !click_handler(index, buttons))
++    return false;
++  click_overrides[index] = {true, false, buttons,
++                            std::chrono::steady_clock::now() + kMinClickHold};
++  return true;
++}
++
++// On its release: whether the press was taken.
++bool ReleaseClick(int index) {
++  std::lock_guard lock(click_mutex);
++  if (index < 0 || !click_overrides[index].active)
++    return false;
++  click_overrides[index].released = true;
++  return true;
++}
++
++// The buttons taken presses hold right now.
++uint16_t ClickButtons() {
++  std::lock_guard lock(click_mutex);
++  auto now = std::chrono::steady_clock::now();
++  uint16_t buttons = 0;
++  for (auto& o : click_overrides) {
++    if (o.active && o.released && now >= o.until)
++      o = {};
++    if (o.active)
++      buttons |= o.buttons;
++  }
++  return buttons;
++}
+ }  // namespace
+ 
++void SetClickHandler(std::function<bool(int mouse_button, uint16_t& buttons)> handler) {
++  std::lock_guard lock(click_mutex);
++  click_handler = std::move(handler);
++}
++
+ void SetMouseLookActive(bool active) {
+   mouse_look_active.store(active, std::memory_order_relaxed);
+ }
+@@ -264,7 +378,7 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
+                           has_focus_ && is_active());
+ 
+-  if (!is_active() || !has_focus_) {
++  if (!is_active() || (!has_focus_ && !REXCVAR_GET(mnk_ignore_focus))) {
+     if (out_state) {
+       std::memset(out_state, 0, sizeof(*out_state));
+       out_state->packet_number = packet_number_;
+@@ -306,6 +420,10 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+ 
++  // Queued presses (wheel notches with mnk_wheel_dpad, host code's) and
++  // clicks the click handler took.
++  buttons |= QueuedButtons() | ClickButtons();
++
+   uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+   uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+ 
+@@ -499,6 +617,8 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+   if (!IsEnabled() || !has_focus_)
+     return;
++  if (TakeClick(MouseButtonIndex(e.button())))
++    return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+     case rex::ui::MouseEvent::Button::kLeft:
+@@ -518,6 +638,8 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+   if (!IsEnabled())
+     return;
++  if (ReleaseClick(MouseButtonIndex(e.button())))
++    return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+     case rex::ui::MouseEvent::Button::kLeft:
+@@ -558,6 +680,32 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+   }
+ }
+ 
++void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
++  if (!IsEnabled() || !has_focus_ || !REXCVAR_GET(mnk_wheel_dpad))
++    return;
++  // scroll_y is kScrollPerDetent per notch, positive away from the user.
++  // Smooth scrolling (touchpads) arrives in fractions, so it's summed. A few
++  // notches queue up; a long spin doesn't scroll on forever.
++  constexpr int32_t kNotch = int32_t(rex::ui::MouseEvent::kScrollPerDetent);
++  int32_t notches;
++  {
++    std::lock_guard lock(state_mutex_);
++    wheel_accum_ += e.scroll_y();
++    notches = wheel_accum_ / kNotch;
++    wheel_accum_ -= notches * kNotch;
++  }
++  if (!notches)
++    return;
++  {
++    std::lock_guard lock(wheel_handler_mutex);
++    if (wheel_handler && wheel_handler(notches))
++      return;
++  }
++  for (int32_t i = 0; i < std::min(std::abs(notches), 4); ++i) {
++    QueuePress(notches > 0 ? X_INPUT_GAMEPAD_DPAD_UP : X_INPUT_GAMEPAD_DPAD_DOWN);
++  }
++}
++
+ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+   has_focus_ = false;
+   // Withdraw the request too, or an update queued before the focus loss grabs

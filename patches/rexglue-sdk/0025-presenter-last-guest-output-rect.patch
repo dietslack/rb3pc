@@ -1,0 +1,69 @@
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..c5638b6 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -51,6 +51,12 @@ namespace rex {
+ namespace ui {
+ 
+ class Presenter;
++
++// Where the guest output was last painted: its rectangle in [0,1] of the host
++// window, letterboxing and any stretching or cropping included. For host code
++// that maps the mouse or draws over the game. False before the first paint
++// with guest output. Any thread.
++bool GetLastGuestOutputRect(float& x, float& y, float& width, float& height);
+ class Window;
+ 
+ class UIDrawContext {
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..84a8895 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <mutex>
+ #include <cctype>
+ #include <utility>
+ 
+@@ -277,6 +278,24 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+ namespace rex {
+ namespace ui {
+ 
++namespace {
++std::mutex last_guest_output_rect_mutex;
++bool last_guest_output_rect_valid = false;
++float last_guest_output_rect[4];
++}  // namespace
++
++bool GetLastGuestOutputRect(float& x, float& y, float& width, float& height) {
++  std::lock_guard lock(last_guest_output_rect_mutex);
++  if (!last_guest_output_rect_valid) {
++    return false;
++  }
++  x = last_guest_output_rect[0];
++  y = last_guest_output_rect[1];
++  width = last_guest_output_rect[2];
++  height = last_guest_output_rect[3];
++  return true;
++}
++
+ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
+                                               [[maybe_unused]] bool statically_from_ui_thread) {
+   rex::FatalError("Graphics device lost (probably due to an internal error)");
+@@ -1018,6 +1037,14 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+       flow.output_x >= int32_t(host_rt_width) || flow.output_y >= int32_t(host_rt_height)) {
+     return flow;
+   }
++  {
++    std::lock_guard lock(last_guest_output_rect_mutex);
++    last_guest_output_rect_valid = true;
++    last_guest_output_rect[0] = float(flow.output_x) / float(host_rt_width);
++    last_guest_output_rect[1] = float(flow.output_y) / float(host_rt_height);
++    last_guest_output_rect[2] = float(output_width) / float(host_rt_width);
++    last_guest_output_rect[3] = float(output_height) / float(host_rt_height);
++  }
+ 
+   // The output image may have a part of it outside the final render target (if
+   // using the overscan area to stretch the image to the entire surface while
