@@ -39,6 +39,7 @@ set(RB3PC_SOURCES
     src/rb3_ui.cpp
     src/save_tweaks.cpp
     src/gpu_wait.cpp
+    src/launcher.cpp
     src/profile.cpp
     src/script_patches.cpp
     src/deluxe.cpp
