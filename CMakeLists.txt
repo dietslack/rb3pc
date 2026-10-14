@@ -45,6 +45,7 @@ set(RB3PC_SOURCES
     src/deluxe.cpp
     src/mouse_menus.cpp
     src/audio_options.cpp
+    src/calibration_fps.cpp
     src/shader_warmup.cpp
     src/ark.cpp
     src/dtb.cpp
