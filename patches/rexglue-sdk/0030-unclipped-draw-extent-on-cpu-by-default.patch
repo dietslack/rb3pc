@@ -1,0 +1,19 @@
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -24,8 +24,14 @@
+ #include <rex/memory.h>
+ #include <rex/ui/graphics_util.h>
+ 
+-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+-                    "Execute unclipped draw vertex shader on CPU");
++// On by default as in upstream Xenia: RB3 draws screen-space rectangles with
++// clipping off and no scissor or viewport, and without the vertices, each of
++// them was assumed to cover the whole EDRAM - with host render targets, ~75
++// ownership transfers per frame, some of the whole EDRAM, halving the frame
++// rate in songs.
++REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
++                    "Execute the vertex shader of draws with clipping disabled (usually "
++                    "screen-space rectangles) on the CPU to estimate the EDRAM area they use");
+ 
+ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
+                     "Execute unclipped draw VS on CPU with scissor");

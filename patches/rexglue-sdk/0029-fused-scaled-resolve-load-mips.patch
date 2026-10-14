@@ -1,0 +1,268 @@
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -218,7 +218,8 @@
+     // stores the loaded texels through; VK_NULL_HANDLE otherwise.
+     VkFormat storage_load_format() const { return storage_load_format_; }
+     void set_storage_load_format(VkFormat format) { storage_load_format_ = format; }
+-    VkImageView GetStorageLoadView();
++    // A storage view of one mip level, for loading it with compute.
++    VkImageView GetStorageLoadView(uint32_t level = 0);
+     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+ 
+    private:
+@@ -276,7 +277,7 @@
+ 
+     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
+     VkFormat storage_load_format_ = VK_FORMAT_UNDEFINED;
+-    VkImageView storage_load_view_ = VK_NULL_HANDLE;
++    std::array<VkImageView, xenos::kTextureMaxMips> storage_load_views_{};
+     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
+     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
+     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
+@@ -373,7 +374,8 @@
+   VkPipelineLayout fused_load_pipeline_layout_ = VK_NULL_HANDLE;
+   std::array<VkPipeline, size_t(FusedLoadTransform::kCount)> fused_load_pipelines_{};
+   bool TryLoadScaledResolveFused(VulkanTexture& texture, LoadShaderIndex load_shader,
+-                                 const HostFormat& host_format);
++                                 const HostFormat& host_format, uint32_t level_first,
++                                 uint32_t level_last);
+   // The integer format with the same texel size as an uncompressed host
+   // format, for its storage view; VK_FORMAT_UNDEFINED if the direct store
+   // can't be used for it.
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1182,10 +1182,12 @@
+     image_create_info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   }
+   // Single-level 2D textures (render-to-texture targets, mostly) get an
+-  // integer storage view so loads can store into them directly.
++  // integer storage view so loads can store into them directly. So do
++  // mipmapped resolution-scaled resolve results, loaded level by level by the
++  // fused path (RB3's bloom chain).
+   VkFormat storage_load_format = VK_FORMAT_UNDEFINED;
+   if (key.dimension != xenos::DataDimension::k3D && key.dimension != xenos::DataDimension::kCube &&
+-      key.GetDepthOrArraySize() == 1 && key.mip_max_level == 0) {
++      key.GetDepthOrArraySize() == 1 && (key.mip_max_level == 0 || key.scaled_resolve)) {
+     storage_load_format = GetStorageLoadFormat(formats[0]);
+     if (formats[1] != VK_FORMAT_UNDEFINED &&
+         GetStorageLoadFormat(formats[1]) != storage_load_format) {
+@@ -1327,8 +1329,8 @@
+   if (pipeline == VK_NULL_HANDLE) {
+     return false;
+   }
+-  if (load_base && (!load_mips || texture_key.mip_max_level == 0) &&
+-      TryLoadScaledResolveFused(vulkan_texture, load_shader, host_format)) {
++  if (TryLoadScaledResolveFused(vulkan_texture, load_shader, host_format, load_base ? 0 : 1,
++                                load_mips ? texture_key.mip_max_level : 0)) {
+     return true;
+   }
+   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
+@@ -1813,8 +1815,8 @@
+ 
+   // Single-level textures with a storage view: store the loaded texels into
+   // the image with a compute shader rather than copying the buffer to it.
+-  if (level_first == 0 && level_last == 0 && level_packed > 0 && !host_format.block_compressed &&
+-      vulkan_texture.storage_load_format() != VK_FORMAT_UNDEFINED) {
++  if (level_first == 0 && level_last == 0 && texture_key.mip_max_level == 0 && level_packed > 0 &&
++      !host_format.block_compressed && vulkan_texture.storage_load_format() != VK_FORMAT_UNDEFINED) {
+     uint32_t bytes_per_texel = load_shader_info.bytes_per_host_block;
+     uint32_t store_index = bytes_per_texel == 4 ? 0 : bytes_per_texel == 8 ? 1 : 2;
+     VkImageView storage_view = vulkan_texture.GetStorageLoadView();
+@@ -1964,7 +1966,8 @@
+ 
+ bool VulkanTextureCache::TryLoadScaledResolveFused(VulkanTexture& texture,
+                                                    LoadShaderIndex load_shader,
+-                                                   const HostFormat& host_format) {
++                                                   const HostFormat& host_format,
++                                                   uint32_t level_first, uint32_t level_last) {
+   TextureKey texture_key = texture.key();
+   FusedLoadTransform transform;
+   switch (load_shader) {
+@@ -1985,47 +1988,71 @@
+   }
+   VkPipeline pipeline = fused_load_pipelines_[size_t(transform)];
+   const texture_util::TextureGuestLayout& guest_layout = texture.guest_layout();
+-  // A single 2D level, not in a packed mip tail, of a resolve result.
++  // 2D levels of a resolve result, none in the packed mip tail (each level
++  // is then tiled on its own, from its own base). Resolution-scaled
++  // render-to-texture with mips (RB3's bloom renders each blur step into a
++  // mip of one texture, resolving each) reloads levels every frame too.
+   if (pipeline == VK_NULL_HANDLE || !texture_key.scaled_resolve || !texture_key.tiled ||
+       texture_key.dimension != xenos::DataDimension::k2DOrStacked ||
+-      texture_key.GetDepthOrArraySize() != 1 || texture_key.mip_max_level != 0 ||
+-      guest_layout.packed_level == 0 || texture.force_load_3d_tiling() ||
++      texture_key.GetDepthOrArraySize() != 1 || level_first > level_last ||
++      level_last > texture_key.mip_max_level || level_last >= guest_layout.packed_level ||
++      (level_last > 0 && !texture_key.mip_page) || texture.force_load_3d_tiling() ||
+       host_format.block_compressed || FormatInfo::Get(texture_key.format)->bytes_per_block() != 4 ||
+       texture.storage_load_format() != VK_FORMAT_R32_UINT) {
+     return false;
+   }
+-  VkImageView storage_view = texture.GetStorageLoadView();
+-  if (storage_view == VK_NULL_HANDLE) {
+-    return false;
+-  }
+-  uint64_t source_start, source_range;
+-  if (!GetScaledResolveRange(texture_key.base_page << 12, texture.GetGuestBaseSize(), 4,
+-                             source_start, source_range)) {
+-    return false;
+-  }
+-  VkDescriptorSet descriptor_set_source = command_processor_.AllocateSingleTransientDescriptor(
+-      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+-  VkDescriptorSet descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
+-      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
+-  if (descriptor_set_source == VK_NULL_HANDLE || descriptor_set_dest == VK_NULL_HANDLE) {
+-    return false;
+-  }
++  struct LevelLoad {
++    VkDescriptorSet source, dest;
++    uint32_t constants[5];
++  };
++  std::array<LevelLoad, xenos::kTextureMaxMips> loads;
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+-  VkDescriptorBufferInfo source_info = {scaled_resolve_buffer_, source_start, source_range};
+-  VkDescriptorImageInfo dest_info = {VK_NULL_HANDLE, storage_view, VK_IMAGE_LAYOUT_GENERAL};
+-  VkWriteDescriptorSet writes[2] = {};
+-  writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-  writes[0].dstSet = descriptor_set_source;
+-  writes[0].descriptorCount = 1;
+-  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-  writes[0].pBufferInfo = &source_info;
+-  writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-  writes[1].dstSet = descriptor_set_dest;
+-  writes[1].descriptorCount = 1;
+-  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+-  writes[1].pImageInfo = &dest_info;
+-  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 2, writes, 0,
+-                                                    nullptr);
++  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
++  for (uint32_t level = level_first; level <= level_last; ++level) {
++    VkImageView storage_view = texture.GetStorageLoadView(level);
++    if (storage_view == VK_NULL_HANDLE) {
++      return false;
++    }
++    const texture_util::TextureGuestLayout::Level& level_layout =
++        level ? guest_layout.mips[level] : guest_layout.base;
++    uint32_t level_address = level ? (texture_key.mip_page << 12) + guest_layout.mip_offsets_bytes[level]
++                                   : texture_key.base_page << 12;
++    uint32_t level_size = level ? level_layout.level_data_extent_bytes : texture.GetGuestBaseSize();
++    uint64_t source_start, source_range;
++    if (!GetScaledResolveRange(level_address, level_size, 4, source_start, source_range)) {
++      return false;
++    }
++    LevelLoad& load = loads[level];
++    load.source = command_processor_.AllocateSingleTransientDescriptor(
++        VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
++    load.dest = command_processor_.AllocateSingleTransientDescriptor(
++        VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
++    if (load.source == VK_NULL_HANDLE || load.dest == VK_NULL_HANDLE) {
++      return false;
++    }
++    VkDescriptorBufferInfo source_info = {scaled_resolve_buffer_, source_start, source_range};
++    VkDescriptorImageInfo dest_info = {VK_NULL_HANDLE, storage_view, VK_IMAGE_LAYOUT_GENERAL};
++    VkWriteDescriptorSet writes[2] = {};
++    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[0].dstSet = load.source;
++    writes[0].descriptorCount = 1;
++    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    writes[0].pBufferInfo = &source_info;
++    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[1].dstSet = load.dest;
++    writes[1].descriptorCount = 1;
++    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++    writes[1].pImageInfo = &dest_info;
++    vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 2, writes, 0,
++                                                      nullptr);
++    uint32_t level_width = std::max(texture_key.GetWidth() >> level, uint32_t(1));
++    uint32_t level_height = std::max(texture_key.GetHeight() >> level, uint32_t(1));
++    load.constants[0] = (uint32_t(texture_key.endianness) << 2) | (scale_x << 4) | (scale_y << 7);
++    load.constants[1] = level_layout.row_pitch_bytes / 4;
++    load.constants[2] = level_width * scale_x;
++    load.constants[3] = level_height * scale_y;
++    load.constants[4] = 0;
++  }
+ 
+   UseScaledResolveBufferForRead();
+   texture.MarkAsUsed();
+@@ -2036,29 +2063,30 @@
+   GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+   GetTextureUsageMasks(VulkanTexture::Usage::kStorageDestination, dst_stage_mask,
+                        dst_access_mask, new_layout);
+-  // The whole image is overwritten, so its old contents can be dropped.
++  // With every level overwritten, the old contents can be dropped; otherwise
++  // the levels not loaded keep theirs.
++  bool overwrites_all = level_first == 0 && level_last == texture_key.mip_max_level;
+   command_processor_.PushImageMemoryBarrier(
+       texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+-      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask, 0,
+-      dst_access_mask, VK_IMAGE_LAYOUT_UNDEFINED, new_layout);
++      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
++      overwrites_all ? 0 : src_access_mask, dst_access_mask,
++      overwrites_all ? VK_IMAGE_LAYOUT_UNDEFINED : old_layout, new_layout);
+   command_processor_.SubmitBarriers(true);
+ 
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+   command_processor_.BindExternalComputePipeline(pipeline);
+-  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+-                                         fused_load_pipeline_layout_, 0, 1,
+-                                         &descriptor_set_source, 0, nullptr);
+-  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+-                                         fused_load_pipeline_layout_, 1, 1, &descriptor_set_dest,
+-                                         0, nullptr);
+-  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
+-  uint32_t constants[5] = {
+-      (uint32_t(texture_key.endianness) << 2) | (scale_x << 4) | (scale_y << 7),
+-      guest_layout.base.row_pitch_bytes / 4, texture_key.GetWidth() * scale_x,
+-      texture_key.GetHeight() * scale_y, 0};
+-  command_buffer.CmdVkPushConstants(fused_load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+-                                    sizeof(constants), constants);
+-  command_buffer.CmdVkDispatch((constants[2] + 31) / 32, (constants[3] + 15) / 16, 1);
++  for (uint32_t level = level_first; level <= level_last; ++level) {
++    const LevelLoad& load = loads[level];
++    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                           fused_load_pipeline_layout_, 0, 1, &load.source, 0,
++                                           nullptr);
++    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                           fused_load_pipeline_layout_, 1, 1, &load.dest, 0,
++                                           nullptr);
++    command_buffer.CmdVkPushConstants(fused_load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                      sizeof(load.constants), load.constants);
++    command_buffer.CmdVkDispatch((load.constants[2] + 31) / 32, (load.constants[3] + 15) / 16, 1);
++  }
+   return true;
+ }
+ 
+@@ -2133,13 +2161,20 @@
+   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
+   }
+-  if (storage_load_view_ != VK_NULL_HANDLE) {
+-    dfn.vkDestroyImageView(device, storage_load_view_, nullptr);
++  for (VkImageView storage_load_view : storage_load_views_) {
++    if (storage_load_view == VK_NULL_HANDLE) {
++      continue;
++    }
++    dfn.vkDestroyImageView(device, storage_load_view, nullptr);
+   }
+   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
+ }
+ 
+-VkImageView VulkanTextureCache::VulkanTexture::GetStorageLoadView() {
++VkImageView VulkanTextureCache::VulkanTexture::GetStorageLoadView(uint32_t level) {
++  if (level >= storage_load_views_.size() || level > key().mip_max_level) {
++    return VK_NULL_HANDLE;
++  }
++  VkImageView& storage_load_view_ = storage_load_views_[level];
+   if (storage_load_view_ != VK_NULL_HANDLE || storage_load_format_ == VK_FORMAT_UNDEFINED) {
+     return storage_load_view_;
+   }
+@@ -2152,7 +2187,8 @@
+   view_create_info.image = image_;
+   view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+   view_create_info.format = storage_load_format_;
+-  view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
++  view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(
++      VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
+   if (vulkan_device->functions().vkCreateImageView(vulkan_device->device(), &view_create_info,
+                                                    nullptr, &storage_load_view_) != VK_SUCCESS) {
+     storage_load_view_ = VK_NULL_HANDLE;
