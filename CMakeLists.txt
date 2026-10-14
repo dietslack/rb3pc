@@ -41,6 +41,7 @@ set(RB3PC_SOURCES
     src/gpu_wait.cpp
     src/profile.cpp
     src/script_patches.cpp
+    src/deluxe.cpp
     src/mouse_menus.cpp
     src/audio_options.cpp
     src/shader_warmup.cpp
