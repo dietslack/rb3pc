@@ -574,6 +574,212 @@ class Launcher final : public rex::ui::ImGuiDialog {
     }
   }
 
+  static std::string Upper(std::string text) {
+    for (char& c : text) c = char(std::toupper(static_cast<unsigned char>(c)));
+    return text;
+  }
+
+  void HandleInput(ImGuiIO& io) {
+    PollDeluxeInstall();
+    uint32_t held = pads_.Poll();
+    uint32_t pad_pressed = repeater_.Update(held);
+    uint32_t pressed = pad_pressed;
+
+    auto key = [](ImGuiKey k) { return ImGui::IsKeyPressed(k, true); };
+    if (key(ImGuiKey_UpArrow)) pressed |= kUp;
+    if (key(ImGuiKey_DownArrow)) pressed |= kDown;
+    if (key(ImGuiKey_LeftArrow)) pressed |= kLeft;
+    if (key(ImGuiKey_RightArrow)) pressed |= kRight;
+    if (key(ImGuiKey_Enter) || key(ImGuiKey_KeypadEnter)) pressed |= editing_ ? kStart : kConfirm;
+    if (!editing_ && key(ImGuiKey_Space)) pressed |= kConfirm;
+    if (key(ImGuiKey_Backspace)) pressed |= kBack;
+    if (editing_ && key(ImGuiKey_Escape)) {
+      editing_ = false;  // cancel, keeping the old name
+      return;
+    }
+    if (key(ImGuiKey_Escape)) pressed |= kBack;
+
+    if (editing_) {
+      HandleEditing(pressed & ~pad_pressed);
+      return;
+    }
+    if (adjusting_) {
+      HandleAdjusting(pressed);
+      return;
+    }
+
+    if (SelectedRow() == Row::kProfile) {
+      std::string typed = TypedText();
+      // Space selects, as on every other row.
+      if (typed.find_first_not_of(' ') != std::string::npos) {
+        editing_ = true;
+        edit_name_.clear();
+        AppendTyped(typed);
+        return;
+      }
+    }
+
+    bool mouse_moved = io.MouseDelta.x != 0 || io.MouseDelta.y != 0;
+    int hovered = HoveredRow(io.MousePos);
+    if (hovered >= 0 && mouse_moved) selected_ = hovered;
+    if (hovered >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      selected_ = hovered;
+      pressed |= kConfirm;
+    }
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) pressed |= kBack;
+
+    int count = int(Items().size());
+    if (pressed & kUp) selected_ = (selected_ + count - 1) % count;
+    if (pressed & kDown) selected_ = (selected_ + 1) % count;
+    Item item = Selected();
+    if (item.kind == Item::kSetting) {
+      if (pressed & kLeft) Cycle(item.row, -1);
+      if (pressed & kRight) Cycle(item.row, +1);
+    }
+    if (pressed & kBack) {
+      LeaveSection();
+      return;
+    }
+    if (pressed & kConfirm) {
+      switch (item.kind) {
+        case Item::kPlay: Play(); return;
+        case Item::kQuit: Finish(hooks_.quit); return;
+        case Item::kSection: EnterSection(item.section); return;
+        case Item::kBack: LeaveSection(); return;
+        case Item::kSetting:
+          if (item.row == Row::kProfile) {
+            // Typed only: a controller's green doesn't start editing (Enter,
+            // Space or a click does).
+            if (!(pad_pressed & kConfirm)) StartEditing();
+          } else if (item.row == Row::kDeluxeInstall) {
+            PickDeluxeZip();
+          } else if (IsListChoice(item.row)) {
+            StartAdjusting(item.row);
+          } else {
+            Cycle(item.row, +1);
+          }
+          break;
+      }
+    }
+    if (pressed & kStart) Play();
+  }
+
+  void PickDeluxeZip() {
+    {
+      std::lock_guard lock(install_->mutex);
+      if (install_->running) return;
+    }
+    static const SDL_DialogFileFilter kFilters[] = {{"Rock Band 3 Deluxe (Xbox 360 zip)", "zip"}};
+    auto* job = new std::shared_ptr<DeluxeInstallJob>(install_);
+    SDL_ShowOpenFileDialog(
+        [](void* userdata, const char* const* files, int) {
+          std::unique_ptr<std::shared_ptr<DeluxeInstallJob>> job(
+              static_cast<std::shared_ptr<DeluxeInstallJob>*>(userdata));
+          if (!files || !files[0]) return;  // cancelled, or an error
+          std::lock_guard lock((*job)->mutex);
+          (*job)->picked = std::filesystem::path(files[0]);
+        },
+        job, nullptr, kFilters, 1, nullptr, false);
+  }
+
+  void PollDeluxeInstall() {
+    std::lock_guard lock(install_->mutex);
+    if (install_->picked && !install_->running) {
+      std::filesystem::path source = *install_->picked;
+      install_->picked.reset();
+      install_->running = true;
+      install_->progress = 0;
+      install_status_ = "";
+      std::thread([job = install_, source] {
+        auto error = InstallDeluxe(source, &job->progress);
+        std::lock_guard lock(job->mutex);
+        job->running = false;
+        job->result = error.value_or("");
+      }).detach();
+    }
+    if (install_->result) {
+      install_status_ = *install_->result;
+      if (install_status_.empty()) {
+        SetDeluxeEnabled(true);
+        Save();
+      }
+      install_->result.reset();
+    }
+  }
+
+  // The note on the right of the install row: the last install's error, or
+  // what to pick until something is installed.
+  std::string DeluxeNote() const {
+    if (!install_status_.empty()) return install_status_;
+    return DeluxeInstalled() ? "" : "THE XBOX 360 RELEASE ZIP";
+  }
+
+  // Profile name: typed on the keyboard only (typing on the row starts a new
+  // one; Enter, Space or a click edits the current one; Enter saves, Escape
+  // cancels).
+  void StartEditing() {
+    editing_ = true;
+    edit_name_ = SanitizeProfileName(rex::cvar::GetFlagByName("profile_name"));
+    if (edit_name_.empty()) edit_name_ = ProfileName();
+  }
+
+  // From key presses: SDL sends no text events until text input is enabled.
+  static std::string TypedText() {
+    std::string out;
+    // The SDK forwards Shift as a key but not as ImGui's modifier state.
+    bool shift = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
+    for (int i = 0; i < 26; ++i) {
+      if (ImGui::IsKeyPressed(ImGuiKey(ImGuiKey_A + i), true)) out += char((shift ? 'A' : 'a') + i);
+    }
+    for (int i = 0; i < 10; ++i) {
+      if (ImGui::IsKeyPressed(ImGuiKey(ImGuiKey_0 + i), true) ||
+          ImGui::IsKeyPressed(ImGuiKey(ImGuiKey_Keypad0 + i), true)) {
+        out += char('0' + i);
+      }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, true)) out += ' ';
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus, true)) out += shift ? '_' : '-';
+    if (ImGui::IsKeyPressed(ImGuiKey_Period, true)) out += '.';
+    return out;
+  }
+
+  void AppendTyped(const std::string& typed) {
+    for (char c : typed) {
+      if (edit_name_.size() < kMaxProfileNameLength) edit_name_ += c;
+    }
+  }
+
+  void HandleEditing(uint32_t pressed) {
+    std::string typed = TypedText();
+    AppendTyped(typed);
+    if ((pressed & kBack) && !edit_name_.empty()) edit_name_.pop_back();
+    if (pressed & kStart) {
+      editing_ = false;
+      std::string name = SanitizeProfileName(edit_name_);
+      // The login name is the default, so don't pin it in the config.
+      rex::cvar::SetFlagByName("profile_name", "");
+      if (!name.empty() && name != ProfileName()) {
+        rex::cvar::SetFlagByName("profile_name", name);
+      }
+      Save();
+    }
+  }
+
+  // Blocked during a Deluxe install; the boot would miss it.
+  void Play() {
+    {
+      std::lock_guard lock(install_->mutex);
+      if (install_->running) return;
+    }
+    Finish(hooks_.play);
+  }
+
+  void Finish(const std::function<void()>& action) {
+    finished_ = true;
+    Save();
+    if (action) action();
+  }
+
   Rb3UiRenderer ui_;
   LauncherHooks hooks_;
   MenuPads pads_;
