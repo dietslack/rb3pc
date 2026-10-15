@@ -1,0 +1,158 @@
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -462,6 +462,9 @@
+     // Signed version of the texture if the data in the signed version is
+     // different on the host.
+     Texture* texture_signed;
++    // texture is a texture with mips of the same memory, whose base level is
++    // what the key without mips refers to (see FindMipChainTextureForBase).
++    bool base_level_only;
+ 
+     TextureBinding() { Reset(); }
+ 
+@@ -604,6 +607,19 @@
+   uint64_t current_submission_time_ = 0;
+ 
+   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
++  // Keys of textures with mips that have been bound, by the key with the mip
++  // fields stripped.
++  std::unordered_map<TextureKey, TextureKey, TextureKey::Hasher> mip_chain_keys_;
++  static TextureKey StripMipFields(TextureKey key) {
++    key.mip_page = 0;
++    key.mip_max_level = 0;
++    key.packed_mips = 0;
++    return key;
++  }
++  // For a key of a texture without mips, an existing texture of the same memory
++  // with mips, whose base level is the same data (RB3 binds its bloom chain both
++  // ways, and both used to be loaded after every resolve into it).
++  Texture* FindMipChainTextureForBase(const TextureKey& key) const;
+ 
+   uint64_t textures_total_host_memory_usage_ = 0;
+ 
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -211,7 +211,9 @@
+       return old_usage;
+     }
+ 
+-    VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
++    // base_level_only: only mip level 0 (see TextureBinding::base_level_only).
++    VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true,
++                        bool base_level_only = false);
+ 
+     // For textures created with a storage view format (see
+     // VulkanTextureCache::GetStorageLoadFormat), the view a compute shader
+@@ -229,6 +231,7 @@
+         uint32_t is_signed_separate_view : 1;
+         uint32_t host_swizzle : 12;
+         uint32_t is_array : 1;
++        uint32_t base_level_only : 1;
+       };
+ 
+       ViewKey() : key(0) { static_assert_size(*this, sizeof(key)); }
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -26,6 +26,10 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DEFINE_BOOL(texture_share_base_with_mip_chain, true, "GPU",
++                    "Bind a texture without mips as the base level of an existing texture with "
++                    "mips of the same memory, rather than loading it separately");
++
+ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
+                      "Texture cache memory limit for render-to-texture (MB)")
+     .range(1, 256)
+@@ -450,6 +454,25 @@
+   return true;
+ }
+ 
++TextureCache::Texture* TextureCache::FindMipChainTextureForBase(const TextureKey& key) const {
++  // A plain 2D texture large enough for its base level not to be in a packed
++  // mip tail, so the base level is laid out the same with or without mips.
++  if (key.mip_page || key.mip_max_level ||
++      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
++      key.GetWidth() < 32 || key.GetHeight() < 32 || IsSignedVersionSeparateForFormat(key)) {
++    return nullptr;
++  }
++  auto chain_key_it = mip_chain_keys_.find(StripMipFields(key));
++  if (chain_key_it == mip_chain_keys_.end()) {
++    return nullptr;
++  }
++  auto texture_it = textures_.find(chain_key_it->second);
++  if (texture_it == textures_.end()) {
++    return nullptr;
++  }
++  return texture_it->second.get();
++}
++
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+   const auto& regs = register_file();
+ 
+@@ -548,8 +571,20 @@
+       // Same resource for both unsigned and signed, but descriptor formats may
+       // be different.
+       if (key_changed) {
+-        binding.texture = FindOrCreateTexture(binding.key);
++        binding.base_level_only = false;
++        Texture* mip_chain_texture = REXCVAR_GET(texture_share_base_with_mip_chain)
++                                         ? FindMipChainTextureForBase(binding.key)
++                                         : nullptr;
++        if (mip_chain_texture) {
++          binding.texture = mip_chain_texture;
++          binding.base_level_only = true;
++        } else {
++          binding.texture = FindOrCreateTexture(binding.key);
++        }
+         load_unsigned_data = true;
++        if (binding.key.mip_page && binding.key.mip_max_level) {
++          mip_chain_keys_[StripMipFields(binding.key)] = binding.key;
++        }
+       }
+       binding.texture_signed = nullptr;
+     }
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -2126,10 +2126,12 @@
+       VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
+       if (texture) {
+         if (uses_unsigned && host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED) {
+-          vulkan_binding.image_view_unsigned = texture->GetView(false, binding->host_swizzle);
++          vulkan_binding.image_view_unsigned =
++              texture->GetView(false, binding->host_swizzle, true, binding->base_level_only);
+         }
+         if (uses_signed && host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
+-          vulkan_binding.image_view_signed = texture->GetView(true, binding->host_swizzle);
++          vulkan_binding.image_view_signed =
++              texture->GetView(true, binding->host_swizzle, true, binding->base_level_only);
+         }
+       }
+     }
+@@ -2197,7 +2199,7 @@
+ }
+ 
+ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
+-                                                       bool is_array) {
++                                                       bool is_array, bool base_level_only) {
+   xenos::DataDimension dimension = key().dimension;
+   if (dimension == xenos::DataDimension::k3D || dimension == xenos::DataDimension::kCube) {
+     is_array = false;
+@@ -2231,6 +2233,7 @@
+   view_key.host_swizzle = host_swizzle;
+ 
+   view_key.is_array = uint32_t(is_array);
++  view_key.base_level_only = uint32_t(base_level_only);
+ 
+   // Try to find an existing view.
+   auto it = views_.find(view_key);
+@@ -2252,6 +2255,9 @@
+   view_create_info.components.b = GetComponentSwizzle(host_swizzle, 2);
+   view_create_info.components.a = GetComponentSwizzle(host_swizzle, 3);
+   view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
++  if (base_level_only) {
++    view_create_info.subresourceRange.levelCount = 1;
++  }
+   switch (dimension) {
+     case xenos::DataDimension::k3D:
+       view_create_info.viewType = VK_IMAGE_VIEW_TYPE_3D;

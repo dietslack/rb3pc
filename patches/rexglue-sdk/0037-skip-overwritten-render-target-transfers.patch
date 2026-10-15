@@ -1,0 +1,317 @@
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -181,6 +181,8 @@
+   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
+ 
+  protected:
++  DrawExtentEstimator& draw_extent_estimator() { return draw_extent_estimator_; }
++
+   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
+                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
+       : register_file_(register_file),
+--- a/include/rex/graphics/util/draw_extent_estimator.h
++++ b/include/rex/graphics/util/draw_extent_estimator.h
+@@ -29,6 +29,12 @@
+ 
+   // The shader must have its ucode analyzed.
+   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
++  // For a draw of a single screen-space rectangle (a 3-vertex rectangle list
++  // with clipping and the viewport transform disabled), its bounds in pixels
++  // (with the half-pixel offset applied), from the vertex shader run on the
++  // CPU. False if the draw isn't one or can't be evaluated.
++  bool EstimateScreenSpaceRectangle(const Shader& vertex_shader, float& left_out, float& top_out,
++                                    float& right_out, float& bottom_out);
+   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
+ 
+  private:
+@@ -38,18 +44,21 @@
+                 uint32_t value_mask) override;
+ 
+     void Reset() {
++      position_x_.reset();
+       position_y_.reset();
+       position_w_.reset();
+       point_size_.reset();
+       vertex_kill_.reset();
+     }
+ 
++    const std::optional<float>& position_x() const { return position_x_; }
+     const std::optional<float>& position_y() const { return position_y_; }
+     const std::optional<float>& position_w() const { return position_w_; }
+     const std::optional<float>& point_size() const { return point_size_; }
+     const std::optional<uint32_t>& vertex_kill() const { return vertex_kill_; }
+ 
+    private:
++    std::optional<float> position_x_;
+     std::optional<float> position_y_;
+     std::optional<float> position_w_;
+     std::optional<float> point_size_;
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -111,6 +111,8 @@
+ 
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
++  // For the next Update: whether the pixel shader may discard pixels.
++  void SetNextDrawPixelShaderKills(bool kills) { next_draw_pixel_shader_kills_ = kills; }
+   // Binding information for the last successful update.
+   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
+   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
+@@ -258,6 +260,15 @@
+   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
+   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
+   EdramBufferUsage edram_buffer_usage_;
++  // Whether the draw being set up writes every sample of the transfer
++  // destination areas of the render target, so its ownership transfers can be
++  // skipped. rectangle is the draw's screen-space rectangle (left, top, right,
++  // bottom), if it's one.
++  bool DoesDrawOverwriteTransfers(uint32_t rt_index, const RenderTarget& render_target,
++                                  const std::vector<Transfer>& transfers,
++                                  reg::RB_DEPTHCONTROL normalized_depth_control,
++                                  uint32_t normalized_color_mask, const float* rectangle) const;
++  bool next_draw_pixel_shader_kills_ = false;
+   EdramBufferModificationStatus edram_buffer_modification_status_ =
+       EdramBufferModificationStatus::kUnmodified;
+   VkDescriptorPool edram_storage_buffer_descriptor_pool_ = VK_NULL_HANDLE;
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -68,6 +68,9 @@
+ void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister export_register,
+                                                       const float* value, uint32_t value_mask) {
+   if (export_register == ucode::ExportRegister::kVSPosition) {
++    if (value_mask & 0b0001) {
++      position_x_ = value[0];
++    }
+     if (value_mask & 0b0010) {
+       position_y_ = value[1];
+     }
+@@ -256,6 +259,79 @@
+          8;
+ }
+ 
++bool DrawExtentEstimator::EstimateScreenSpaceRectangle(const Shader& vertex_shader,
++                                                       float& left_out, float& top_out,
++                                                       float& right_out, float& bottom_out) {
++  const RegisterFile& regs = register_file_;
++  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
++      vgt_draw_initiator.num_indices != 3 ||
++      vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
++    return false;
++  }
++  if (!regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
++    return false;
++  }
++  // Screen-space positions: no viewport scale or offset, X and Y not divided
++  // by W, and no window offset.
++  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
++  if (!pa_cl_vte_cntl.vtx_xy_fmt || pa_cl_vte_cntl.vport_x_scale_ena ||
++      pa_cl_vte_cntl.vport_x_offset_ena || pa_cl_vte_cntl.vport_y_scale_ena ||
++      pa_cl_vte_cntl.vport_y_offset_ena) {
++    return false;
++  }
++  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable &&
++      regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET]) {
++    return false;
++  }
++  assert_true(vertex_shader.is_ucode_analyzed());
++  if (!ShaderInterpreter::CanInterpretShader(vertex_shader)) {
++    return false;
++  }
++  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
++  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
++  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
++  float half_pixel =
++      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
++  float left = FLT_MAX, top = FLT_MAX, right = -FLT_MAX, bottom = -FLT_MAX;
++  shader_interpreter_.SetShader(vertex_shader);
++  PositionYExportSink export_sink;
++  shader_interpreter_.SetExportSink(&export_sink);
++  bool valid = true;
++  for (uint32_t i = 0; i < 3 && valid; ++i) {
++    uint32_t vertex_index =
++        std::min(max_index, std::max(min_index, (i + index_offset) & 0xFFFFFF));
++    export_sink.Reset();
++    shader_interpreter_.temp_registers()[0] = float(vertex_index);
++    shader_interpreter_.Execute();
++    if ((export_sink.vertex_kill().has_value() &&
++         (export_sink.vertex_kill().value() & ~(UINT32_C(1) << 31))) ||
++        !export_sink.position_x().has_value() || !export_sink.position_y().has_value()) {
++      valid = false;
++      break;
++    }
++    float x = export_sink.position_x().value() + half_pixel;
++    float y = export_sink.position_y().value() + half_pixel;
++    if (!(x == x) || !(y == y)) {
++      valid = false;
++      break;
++    }
++    left = std::min(left, x);
++    top = std::min(top, y);
++    right = std::max(right, x);
++    bottom = std::max(bottom, y);
++  }
++  shader_interpreter_.SetExportSink(nullptr);
++  if (!valid) {
++    return false;
++  }
++  left_out = left;
++  top_out = top;
++  right_out = right;
++  bottom_out = bottom;
++  return true;
++}
++
+ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
+                                            const Shader& vertex_shader) {
+   SCOPE_profile_cpu_f("gpu");
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3945,6 +3945,7 @@
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
++  render_target_cache_->SetNextDrawPixelShaderKills(pixel_shader && pixel_shader->kills_pixels());
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -37,6 +37,11 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_skip_overwritten_transfers, true, "GPU/Vulkan",
++                    "With host render targets, skip copying the EDRAM contents into a render "
++                    "target for a draw that overwrites all of them (a screen-space rectangle "
++                    "writing every sample, such as RB3's clears through 4x MSAA aliases)");
++
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -1377,6 +1382,82 @@
+   return copied && cleared;
+ }
+ 
++bool VulkanRenderTargetCache::DoesDrawOverwriteTransfers(
++    uint32_t rt_index, const RenderTarget& render_target, const std::vector<Transfer>& transfers,
++    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
++    const float* rectangle) const {
++  const RegisterFile& regs = register_file();
++  // Every covered sample written: no discarding, no alpha test or alpha to
++  // coverage, all samples in the mask (depth / stencil also by depth-only
++  // draws).
++  xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
++  if (next_draw_pixel_shader_kills_ ||
++      (edram_mode != xenos::EdramMode::kColorDepth &&
++       !(rt_index == 0 && edram_mode == xenos::EdramMode::kDepthOnly)) ||
++      (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) != 0xFFFF) {
++    return false;
++  }
++  auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
++  if (rb_colorcontrol.alpha_test_enable || rb_colorcontrol.alpha_to_mask_enable) {
++    return false;
++  }
++  RenderTargetKey key = render_target.key();
++  if (rt_index == 0) {
++    // Depth replaced unconditionally, and the stencil (both formats have it)
++    // too.
++    uint32_t stencil_write_mask = (regs[XE_GPU_REG_RB_STENCILREFMASK] >> 16) & 0xFF;
++    if (!normalized_depth_control.z_enable || !normalized_depth_control.z_write_enable ||
++        normalized_depth_control.zfunc != xenos::CompareFunction::kAlways ||
++        !normalized_depth_control.stencil_enable || normalized_depth_control.backface_enable ||
++        normalized_depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
++        normalized_depth_control.stencilzpass != xenos::StencilOp::kReplace ||
++        stencil_write_mask != 0xFF) {
++      return false;
++    }
++  } else {
++    uint32_t color_index = rt_index - 1;
++    float clamp[4];
++    uint32_t keep_mask[2];
++    GetPSIColorFormatInfo(key.GetColorFormat(), (normalized_color_mask >> (color_index * 4)) & 0b1111,
++                          clamp[0], clamp[1], clamp[2], clamp[3], keep_mask[0], keep_mask[1]);
++    if (keep_mask[0] || keep_mask[1] ||
++        (regs[reg::RB_BLENDCONTROL::rt_register_indices[color_index]] & 0x1FFF1FFF) !=
++            0x00010001) {
++      return false;
++    }
++  }
++  // The rectangle and the scissor containing every area transferred.
++  auto window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
++  auto window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
++  auto screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
++  auto screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
++  if (window_scissor_tl.tl_x || window_scissor_tl.tl_y || screen_scissor_tl.tl_x ||
++      screen_scissor_tl.tl_y ||
++      (!window_scissor_tl.window_offset_disable && regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET])) {
++    return false;
++  }
++  uint32_t scissor_right = std::min(uint32_t(window_scissor_br.br_x), uint32_t(screen_scissor_br.br_x));
++  uint32_t scissor_bottom =
++      std::min(uint32_t(window_scissor_br.br_y), uint32_t(screen_scissor_br.br_y));
++  bool is_64bpp = !key.is_depth && xenos::IsColorRenderTargetFormat64bpp(key.GetColorFormat());
++  for (const Transfer& transfer : transfers) {
++    Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithoutCutout];
++    uint32_t rectangle_count = transfer.GetRectangles(key.base_tiles, key.pitch_tiles_at_32bpp,
++                                                      key.msaa_samples, is_64bpp, rectangles);
++    for (uint32_t i = 0; i < rectangle_count; ++i) {
++      const Transfer::Rectangle& r = rectangles[i];
++      uint32_t r_right = r.x_pixels + r.width_pixels;
++      uint32_t r_bottom = r.y_pixels + r.height_pixels;
++      if (rectangle[0] > float(r.x_pixels) || rectangle[1] > float(r.y_pixels) ||
++          rectangle[2] < float(r_right) || rectangle[3] < float(r_bottom) ||
++          scissor_right < r_right || scissor_bottom < r_bottom) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
+ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+                                      reg::RB_DEPTHCONTROL normalized_depth_control,
+                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
+@@ -1397,8 +1478,41 @@
+       RenderTarget* const* depth_and_color_render_targets =
+           last_update_accumulated_render_targets();
+ 
++      const std::vector<Transfer>* render_target_transfers = last_update_transfers();
++      std::vector<Transfer> kept_transfers[1 + xenos::kMaxColorRenderTargets];
++      if (REXCVAR_GET(vulkan_skip_overwritten_transfers)) {
++        float rectangle[4];
++        bool rectangle_known = false, rectangle_checked = false;
++        bool any_skipped = false;
++        bool skip[1 + xenos::kMaxColorRenderTargets] = {};
++        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++          if (!depth_and_color_render_targets[i] || render_target_transfers[i].empty()) {
++            continue;
++          }
++          if (!rectangle_checked) {
++            rectangle_checked = true;
++            rectangle_known = draw_extent_estimator().EstimateScreenSpaceRectangle(
++                vertex_shader, rectangle[0], rectangle[1], rectangle[2], rectangle[3]);
++          }
++          if (rectangle_known &&
++              DoesDrawOverwriteTransfers(i, *depth_and_color_render_targets[i],
++                                         render_target_transfers[i], normalized_depth_control,
++                                         normalized_color_mask, rectangle)) {
++            skip[i] = true;
++            any_skipped = true;
++          }
++        }
++        if (any_skipped) {
++          for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++            if (!skip[i]) {
++              kept_transfers[i] = render_target_transfers[i];
++            }
++          }
++          render_target_transfers = kept_transfers;
++        }
++      }
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+-                                       depth_and_color_render_targets, last_update_transfers());
++                                       depth_and_color_render_targets, render_target_transfers);
+ 
+       if (depth_and_color_render_targets[0]) {
+         render_pass_key.depth_and_color_used |= 1 << 0;

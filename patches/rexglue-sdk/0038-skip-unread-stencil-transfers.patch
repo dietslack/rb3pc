@@ -1,0 +1,78 @@
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -111,6 +111,10 @@
+ 
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
++  // A draw tests or otherwise depends on the stencil buffer's contents - from
++  // then on, stencil is transferred between render targets (see
++  // vulkan_skip_unread_stencil_transfers).
++  void NotifyStencilRead() { stencil_read_seen_ = true; }
+   // For the next Update: whether the pixel shader may discard pixels.
+   void SetNextDrawPixelShaderKills(bool kills) { next_draw_pixel_shader_kills_ = kills; }
+   // Binding information for the last successful update.
+@@ -269,6 +273,7 @@
+                                   reg::RB_DEPTHCONTROL normalized_depth_control,
+                                   uint32_t normalized_color_mask, const float* rectangle) const;
+   bool next_draw_pixel_shader_kills_ = false;
++  bool stencil_read_seen_ = false;
+   EdramBufferModificationStatus edram_buffer_modification_status_ =
+       EdramBufferModificationStatus::kUnmodified;
+   VkDescriptorPool edram_storage_buffer_descriptor_pool_ = VK_NULL_HANDLE;
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3944,6 +3944,24 @@
+   texture_cache_->RequestTextures(used_texture_mask);
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
++  // Whether the draw depends on the stencil contents: tests them, or
++  // increments, decrements or inverts them.
++  if (normalized_depth_control.stencil_enable) {
++    auto stencil_op_reads = [](xenos::StencilOp op) {
++      return op == xenos::StencilOp::kIncrementClamp || op == xenos::StencilOp::kDecrementClamp ||
++             op == xenos::StencilOp::kInvert || op == xenos::StencilOp::kIncrementWrap ||
++             op == xenos::StencilOp::kDecrementWrap;
++    };
++    const auto& dc = normalized_depth_control;
++    if (dc.stencilfunc != xenos::CompareFunction::kAlways || stencil_op_reads(dc.stencilfail) ||
++        stencil_op_reads(dc.stencilzpass) || stencil_op_reads(dc.stencilzfail) ||
++        (dc.backface_enable &&
++         (dc.stencilfunc_bf != xenos::CompareFunction::kAlways ||
++          stencil_op_reads(dc.stencilfail_bf) || stencil_op_reads(dc.stencilzpass_bf) ||
++          stencil_op_reads(dc.stencilzfail_bf)))) {
++      render_target_cache_->NotifyStencilRead();
++    }
++  }
+   // Set up the render targets - this may perform dispatches and draws.
+   render_target_cache_->SetNextDrawPixelShaderKills(pixel_shader && pixel_shader->kills_pixels());
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -42,6 +42,12 @@
+                     "target for a draw that overwrites all of them (a screen-space rectangle "
+                     "writing every sample, such as RB3's clears through 4x MSAA aliases)");
+ 
++REXCVAR_DEFINE_BOOL(vulkan_skip_unread_stencil_transfers, true, "GPU/Vulkan",
++                    "With host render targets and no VK_EXT_shader_stencil_export (Nvidia), skip "
++                    "transferring the stencil between render targets (8 draws per transfer, one "
++                    "per bit) until a draw tests or otherwise depends on the stencil contents "
++                    "(RB3 only writes it)");
++
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -4956,8 +4962,13 @@
+ 
+       // Gather shader keys and sort to reduce pipeline state and binding
+       // switches. Also gather stencil rectangles to clear if needed.
++      // Without stencil export, the stencil is written one bit per draw. Not
++      // needed until something reads the stencil - which happens never in
++      // RB3, that only writes it (with REPLACE); a reading draw makes later
++      // transfers include it (the stencil it reads first may be stale).
+       bool need_stencil_bit_draws =
+-          dest_rt_key.is_depth && !vulkan_device->extensions().ext_EXT_shader_stencil_export;
++          dest_rt_key.is_depth && !vulkan_device->extensions().ext_EXT_shader_stencil_export &&
++          (stencil_read_seen_ || !REXCVAR_GET(vulkan_skip_unread_stencil_transfers));
+       current_transfer_invocations_.clear();
+       current_transfer_invocations_.reserve(current_transfers.size()
+                                             << uint32_t(need_stencil_bit_draws));
