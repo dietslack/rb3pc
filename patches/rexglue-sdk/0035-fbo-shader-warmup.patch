@@ -1,0 +1,499 @@
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -328,8 +328,9 @@
+     // With VK_EXT_graphics_pipeline_library (see EnsurePipelineCreated):
+     // kLink builds the pipeline by fast-linking a vertex-side and a
+     // pixel-side library (each reused across pipelines); kFragmentOnly just
+-    // compiles the pixel-side library into the VkPipelineCache (warm-up).
+-    enum class LibraryMode : uint8_t { kNone, kLink, kFragmentOnly };
++    // compiles the pixel-side library into the VkPipelineCache (warm-up), and
++    // kVertexOnly the vertex-side one (the pixel shader may be absent).
++    enum class LibraryMode : uint8_t { kNone, kLink, kFragmentOnly, kVertexOnly };
+     LibraryMode library_mode = LibraryMode::kNone;
+     // Cull mode and front face as dynamic state (Pipeline::dynamic_cull_front).
+     bool dynamic_cull_front = false;
+@@ -412,7 +413,12 @@
+   // (rex/system/shader_warmup.h) that the list at warmup_list_path doesn't
+   // have yet, so the driver's compiled pixel shaders are in the persistent
+   // VkPipelineCache before the game first draws with them.
+-  void WarmUpShaders(const std::filesystem::path& warmup_list_path);
++  // history_storage_path: a pipeline storage file of the other render target
++  // path, whose vertex sides are warmed up too (host render targets).
++  void WarmUpShaders(const std::filesystem::path& warmup_list_path,
++                     const std::filesystem::path& history_storage_path = {});
++  void WarmUpVertexLibrariesFromHistory(const std::filesystem::path& history_storage_path,
++                                        const std::filesystem::path& done_marker_path);
+ 
+   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
+                                             PipelineRenderTarget& render_target_out) const;
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -771,6 +771,10 @@
+   if (edram_fragment_shader_interlock) {
+     WarmUpShaders(shader_storage_root /
+                   fmt::format("{:08X}.fsi.warmup", title_id));
++  } else if (PipelineLibrariesUsable()) {
++    // The fragment shader libraries (see EnsurePipelineCreated).
++    WarmUpShaders(shader_storage_root / fmt::format("{:08X}.fbo.warmup", title_id),
++                  shader_storage_shareable_root / fmt::format("{:08X}.fsi.vk.xpso", title_id));
+   }
+ 
+   // If any pipeline descriptions were corrupted (or the whole file has excess
+@@ -3499,8 +3503,13 @@
+   // formula, though Z has no effect on anything if a depth attachment is not
+   // used (the guest shader can't access Z), enabling only when there's a
+   // depth / stencil attachment for correctness.
++  // With host render target pipelines linked from libraries though, always, so
++  // the vertex-side library doesn't depend on whether there's a depth / stencil
++  // attachment (without one, depth bias has no effect anyway).
+   rasterization_state.depthBiasEnable =
+-      (!edram_fragment_shader_interlock && (description.render_pass_key.depth_and_color_used & 0b1))
++      (!edram_fragment_shader_interlock &&
++       ((description.render_pass_key.depth_and_color_used & 0b1) ||
++        creation_arguments.dynamic_depth_stencil))
+           ? VK_TRUE
+           : VK_FALSE;
+   // TODO(Triang3l): Wide lines.
+@@ -3751,8 +3760,10 @@
+       (edram_fragment_shader_interlock ||
+        (use_dynamic_rendering && creation_arguments.dynamic_depth_stencil)) &&
+       !tessellated &&
+-      fragment_shader_override == VK_NULL_HANDLE && shader_stage_count >= 2 &&
+-      shader_stages[shader_stage_count - 1].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
++      fragment_shader_override == VK_NULL_HANDLE &&
++      (creation_arguments.library_mode == LibraryMode::kVertexOnly ||
++       (shader_stage_count >= 2 &&
++        shader_stages[shader_stage_count - 1].stage == VK_SHADER_STAGE_FRAGMENT_BIT));
+   bool linked = false;
+   if (use_libraries) {
+     // With independent descriptor sets, each side only has its own sets.
+@@ -3771,6 +3782,43 @@
+       library_info.pNext = use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
+       library_info.flags = parts;
+       VkGraphicsPipelineCreateInfo library_create_info = pipeline_create_info;
++      // With host render targets, only the state of the part (in particular,
++      // for the fragment shader, nothing depending on the attachments, the
++      // blending or the dynamic depth / stencil state), so a fragment shader
++      // library compiled by the shader warm-up is found in the VkPipelineCache.
++      VkPipelineRenderingCreateInfo part_rendering_create_info = {};
++      VkPipelineDepthStencilStateCreateInfo part_depth_stencil_state = {};
++      if (!edram_fragment_shader_interlock) {
++        if (!(parts & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT)) {
++          library_create_info.pVertexInputState = nullptr;
++          library_create_info.pInputAssemblyState = nullptr;
++        }
++        if (!(parts & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT)) {
++          library_create_info.pTessellationState = nullptr;
++          library_create_info.pViewportState = nullptr;
++          library_create_info.pRasterizationState = nullptr;
++        }
++        if (!(parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) {
++          library_create_info.pDepthStencilState = nullptr;
++        } else if (creation_arguments.dynamic_depth_stencil &&
++                   library_create_info.pDepthStencilState) {
++          part_depth_stencil_state.sType =
++              VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
++          library_create_info.pDepthStencilState = &part_depth_stencil_state;
++        }
++        if (!(parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT)) {
++          library_create_info.pColorBlendState = nullptr;
++          if (use_dynamic_rendering) {
++            part_rendering_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
++            part_rendering_create_info.viewMask = pipeline_rendering_create_info.viewMask;
++            library_info.pNext = &part_rendering_create_info;
++          }
++        }
++        if (!(parts & (VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
++                       VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT))) {
++          library_create_info.pMultisampleState = nullptr;
++        }
++      }
+       library_create_info.pNext = &library_info;
+       library_create_info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+       library_create_info.stageCount = stage_count;
+@@ -3801,8 +3849,17 @@
+     VkGraphicsPipelineLibraryFlagsEXT fragment_parts =
+         edram_fragment_shader_interlock ? kFragmentParts : kFragmentShaderPart;
+ 
+-    if (creation_arguments.library_mode == LibraryMode::kFragmentOnly) {
+-      VkPipeline library = create_library(fragment_parts, 1, &fragment_stage, library_layouts[1]);
++    if (creation_arguments.library_mode == LibraryMode::kFragmentOnly ||
++        creation_arguments.library_mode == LibraryMode::kVertexOnly) {
++      uint32_t vertex_stage_count = shader_stage_count;
++      if (shader_stages[shader_stage_count - 1].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
++        --vertex_stage_count;
++      }
++      VkPipeline library =
++          creation_arguments.library_mode == LibraryMode::kVertexOnly
++              ? create_library(kVertexParts, vertex_stage_count, shader_stages.data(),
++                               library_layouts[0])
++              : create_library(fragment_parts, 1, &fragment_stage, library_layouts[1]);
+       if (library == VK_NULL_HANDLE) {
+         return false;
+       }
+@@ -4202,7 +4259,198 @@
+               data.size(), rex::path_to_utf8(path));
+ }
+ 
+-void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list_path) {
++void VulkanPipelineCache::WarmUpVertexLibrariesFromHistory(
++    const std::filesystem::path& history_storage_path,
++    const std::filesystem::path& done_marker_path) {
++  // The fsi pipeline storage has the pipelines played before with the other
++  // render target path - with their vertex shader translations and state as
++  // gameplay draws them (the game's shader caches the warm-up reads pair pixel
++  // shaders with vertex shaders other than the ones drawn with them).
++  FILE* file = rex::filesystem::OpenFile(history_storage_path, "rb");
++  if (!file) {
++    return;
++  }
++  struct {
++    uint32_t magic;
++    uint32_t magic_api;
++    uint32_t version_swapped;
++  } header;
++  std::vector<PipelineStoredDescription> stored;
++  if (fread(&header, sizeof(header), 1, file) && header.magic == 0x53504558 &&
++      header.magic_api == 1 &&
++      header.version_swapped ==
++          rex::byte_swap(std::max(PipelineDescription::kVersion,
++                                  SpirvShaderTranslator::Modification::kVersion))) {
++    PipelineStoredDescription entry;
++    while (fread(&entry, sizeof(entry), 1, file)) {
++      if (XXH3_64bits(&entry.description, sizeof(entry.description)) != entry.description_hash) {
++        break;
++      }
++      stored.push_back(entry);
++    }
++  }
++  fclose(file);
++  if (stored.empty()) {
++    return;
++  }
++  auto start_time = std::chrono::steady_clock::now();
++  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++  const auto& device_properties = vulkan_device->properties();
++  // Done already for this history, driver and settings (the libraries are in
++  // the saved VkPipelineCache)?
++  uint64_t done_key;
++  {
++    std::vector<uint64_t> key_source;
++    key_source.reserve(stored.size() + 4);
++    key_source.push_back(device_properties.vendorID);
++    key_source.push_back(device_properties.deviceID);
++    key_source.push_back(device_properties.driverVersion);
++    key_source.push_back((uint64_t(render_target_cache_.draw_resolution_scale_x()) << 32) |
++                         render_target_cache_.draw_resolution_scale_y());
++    for (const PipelineStoredDescription& entry : stored) {
++      key_source.push_back(entry.description_hash);
++    }
++    done_key = XXH3_64bits(key_source.data(), key_source.size() * sizeof(uint64_t));
++  }
++  if (FILE* marker = rex::filesystem::OpenFile(done_marker_path, "rb")) {
++    uint64_t marker_key = 0;
++    bool done = fread(&marker_key, sizeof(marker_key), 1, marker) && marker_key == done_key;
++    fclose(marker);
++    if (done) {
++      return;
++    }
++  }
++
++  // The vertex sides, unique (the pixel shader dropped, but its modification
++  // kept, as geometry shaders depend on it).
++  std::vector<PipelineDescription> vertex_descriptions;
++  {
++    std::unordered_set<uint64_t> seen;
++    for (const PipelineStoredDescription& entry : stored) {
++      const PipelineDescription& d = entry.description;
++      if (SpirvShaderTranslator::Modification(d.vertex_shader_modification).vertex.host_vertex_shader_type !=
++          Shader::HostVertexShaderType::kVertex) {
++        continue;
++      }
++      PipelineDescription vd;
++      vd.vertex_shader_hash = d.vertex_shader_hash;
++      vd.vertex_shader_modification = d.vertex_shader_modification;
++      vd.pixel_shader_modification = d.pixel_shader_modification;
++      vd.geometry_shader = d.geometry_shader;
++      vd.primitive_topology = d.primitive_topology;
++      vd.primitive_restart = d.primitive_restart;
++      vd.depth_clamp_enable = d.depth_clamp_enable;
++      vd.polygon_mode = d.polygon_mode;
++      vd.cull_back = 1;
++      vd.render_pass_key.msaa_samples = xenos::MsaaSamples::k1X;
++      vd.render_pass_key.depth_and_color_used = 0b10;
++      if (!ArePipelineRequirementsMet(vd) || !seen.insert(vd.GetHash()).second) {
++        continue;
++      }
++      vertex_descriptions.push_back(vd);
++    }
++  }
++
++  // Translate the vertex shaders (one task per shader translation).
++  std::vector<VulkanShader::VulkanTranslation*> to_translate;
++  for (const PipelineDescription& vd : vertex_descriptions) {
++    auto shader_it = shaders_.find(vd.vertex_shader_hash);
++    if (shader_it == shaders_.end()) {
++      continue;
++    }
++    VulkanShader* shader = shader_it->second;
++    if (!shader->is_ucode_analyzed()) {
++      shader->AnalyzeUcode(ucode_disasm_buffer_);
++    }
++    bool is_new = false;
++    auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
++        shader->GetOrCreateTranslation(vd.vertex_shader_modification, &is_new));
++    if (!translation->is_translated() &&
++        std::find(to_translate.begin(), to_translate.end(), translation) == to_translate.end()) {
++      to_translate.push_back(translation);
++    }
++  }
++  uint32_t processors = std::max(rex::thread::logical_processor_count(), uint32_t(1));
++  size_t thread_count = std::max(processors * 3 / 4, uint32_t(1));
++  auto run_parallel = [thread_count](size_t count, const std::function<void(size_t)>& work) {
++    std::atomic<size_t> next(0);
++    auto worker = [&]() {
++      for (size_t i; (i = next.fetch_add(1)) < count;) {
++        work(i);
++      }
++    };
++    size_t threads = std::min(thread_count, count);
++    if (threads <= 1) {
++      worker();
++      return;
++    }
++    std::vector<std::unique_ptr<rex::thread::Thread>> handles;
++    for (size_t i = 0; i < threads; ++i) {
++      auto thread = rex::thread::Thread::Create({}, worker);
++      assert_not_null(thread);
++      thread->set_name("Shader Warm-up");
++      handles.push_back(std::move(thread));
++    }
++    for (const auto& thread : handles) {
++      rex::thread::Wait(thread.get(), false);
++    }
++  };
++  run_parallel(to_translate.size(), [&](size_t i) {
++    thread_local std::unique_ptr<SpirvShaderTranslator> translator;
++    if (!translator) translator = CreateShaderTranslator();
++    TranslateShaderToModule(*translator, *to_translate[i]);
++  });
++  {
++    std::unordered_set<VulkanShader*> set_up;
++    for (auto* translation : to_translate) {
++      auto& shader = static_cast<VulkanShader&>(translation->shader());
++      if (set_up.insert(&shader).second) SetUpBindingLayouts(shader);
++    }
++  }
++
++  // Creation arguments on this thread (geometry shaders and layouts are
++  // created on demand), then the libraries on all.
++  std::deque<std::pair<const PipelineDescription, Pipeline>> pipelines;
++  std::vector<PipelineCreationArguments> creations;
++  for (const PipelineDescription& vd : vertex_descriptions) {
++    pipelines.emplace_back(vd, Pipeline());
++    PipelineCreationArguments creation_arguments;
++    if (!TryGetPipelineCreationArgumentsForDescription(vd, &pipelines.back(),
++                                                       creation_arguments)) {
++      continue;
++    }
++    if (const PipelineLayoutProvider* independent_layout =
++            creation_arguments.pipeline_layout->GetIndependentSetsLayout()) {
++      creation_arguments.pipeline_layout = independent_layout;
++    }
++    creation_arguments.library_mode = PipelineCreationArguments::LibraryMode::kVertexOnly;
++    creation_arguments.dynamic_cull_front = device_properties.extendedDynamicStateCullFront;
++    creation_arguments.dynamic_depth_stencil = true;
++    creations.push_back(creation_arguments);
++  }
++  std::atomic<uint32_t> compiled(0);
++  run_parallel(creations.size(), [&](size_t i) {
++    if (EnsurePipelineCreated(creations[i])) {
++      compiled.fetch_add(1);
++    }
++  });
++  SaveVkPipelineCache(true);
++  if (FILE* marker = rex::filesystem::OpenFile(done_marker_path, "wb")) {
++    fwrite(&done_key, sizeof(done_key), 1, marker);
++    fclose(marker);
++  }
++  REXGPU_INFO("Shader warm-up: compiled {} vertex libraries from {} previously played pipelines in {:.1f} s",
++              compiled.load(), stored.size(),
++              std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
++}
++
++void VulkanPipelineCache::WarmUpShaders(const std::filesystem::path& warmup_list_path,
++                                        const std::filesystem::path& history_storage_path) {
++  if (!history_storage_path.empty() && PipelineLibrariesUsable()) {
++    std::filesystem::path done_marker_path = warmup_list_path;
++    done_marker_path += ".history";
++    WarmUpVertexLibrariesFromHistory(history_storage_path, done_marker_path);
++  }
+   const rex::system::ShaderWarmupSource& source = rex::system::GetShaderWarmupSource();
+   if (!source) {
+     return;
+@@ -4222,6 +4470,14 @@
+   bool warm_libraries = REXCVAR_GET(vulkan_pipeline_library) &&
+                         device_properties.graphicsPipelineLibrary &&
+                         device_properties.graphicsPipelineLibraryFastLinking;
++  // With host render targets, only the fragment shader libraries, compiled for
++  // single-sampled rendering (pipelines otherwise depend on the render target
++  // formats and the depth / stencil and blend state too).
++  bool host_render_targets =
++      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets;
++  if (host_render_targets && !PipelineLibrariesUsable()) {
++    return;
++  }
+ 
+   // The list is only valid for the VkPipelineCache it was built into: the same
+   // GPU, driver and shader translation settings.
+@@ -4405,16 +4661,31 @@
+     for (size_t i = 0; i < pending.size(); ++i) {
+       auto [vertex_modification, pixel_modification] =
+           modifications(*vertex_shaders[i], *pixel_shaders[i]);
+-      uint64_t translation_key[2] = {pending[i].pixel_hash, pixel_modification};
+-      auto [it, inserted] = unique_of_translation.emplace(
+-          XXH3_64bits(translation_key, sizeof(translation_key)), uniques.size());
+-      if (inserted) {
+-        uniques.push_back({i, {}, vertex_modification, pixel_modification});
++      // With host render targets, GetCurrentPixelShaderModification requests
++      // early fragment tests where the shader allows them unless the alpha
++      // test or alpha to coverage is on, which isn't known here - both.
++      uint64_t pixel_variants[2] = {pixel_modification, pixel_modification};
++      uint32_t pixel_variant_count = 1;
++      if (host_render_targets && pixel_shaders[i]->implicit_early_z_write_allowed()) {
++        SpirvShaderTranslator::Modification early(pixel_modification);
++        early.pixel.depth_stencil_mode =
++            SpirvShaderTranslator::Modification::DepthStencilMode::kEarlyHint;
++        pixel_variants[0] = early.value;
++        pixel_variant_count = 2;
++      }
++      for (uint32_t v = 0; v < pixel_variant_count; ++v) {
++        uint64_t translation_key[2] = {pending[i].pixel_hash, pixel_variants[v]};
++        auto [it, inserted] = unique_of_translation.emplace(
++            XXH3_64bits(translation_key, sizeof(translation_key)), uniques.size());
++        if (inserted) {
++          uniques.push_back({i, {}, vertex_modification, pixel_variants[v]});
++        }
++        uniques[it->second].covered.push_back(i);
+       }
+-      uniques[it->second].covered.push_back(i);
+     }
+   }
+-  progress.total -= uint32_t(pending.size() - uniques.size());
++  progress.total = uint32_t(int64_t(progress.total) + int64_t(uniques.size()) -
++                           int64_t(pending.size()));
+ 
+   // In batches, so only one batch's SPIR-V is held at a time.
+   constexpr size_t kBatchSize = 256;
+@@ -4484,6 +4755,12 @@
+           description.pixel_shader_modification = item.pixel->modification();
+           description.primitive_topology = PipelinePrimitiveTopology::kTriangleList;
+           description.cull_back = 1;
++          if (host_render_targets) {
++            // Single-sampled, with a color render target (the format doesn't
++            // matter for the fragment shader library).
++            description.render_pass_key.msaa_samples = xenos::MsaaSamples::k1X;
++            description.render_pass_key.depth_and_color_used = 0b10;
++          }
+           std::pair<const PipelineDescription, Pipeline> pipeline(description, Pipeline());
+           PipelineCreationArguments creation_arguments;
+           creation_arguments.pipeline = &pipeline;
+@@ -4500,6 +4777,7 @@
+               creation_arguments.pipeline_layout = independent_layout;
+             }
+             creation_arguments.dynamic_cull_front = device_properties.extendedDynamicStateCullFront;
++            creation_arguments.dynamic_depth_stencil = host_render_targets;
+           }
+           if (EnsurePipelineCreated(creation_arguments)) {
+             compiled.fetch_add(1);
+@@ -4536,6 +4814,90 @@
+     }
+   }
+ 
++  if (host_render_targets && warm_libraries) {
++    // The vertex-side libraries of every pair's vertex shader translation (its
++    // layout only depends on the vertex shader's bindings), the most common
++    // way: a triangle list, with and without depth clamping (clipping disabled).
++    std::vector<std::pair<size_t, uint64_t>> vertex_uniques;
++    {
++      std::unordered_set<uint64_t> vertex_seen;
++      for (size_t i = 0; i < pending.size(); ++i) {
++        uint64_t vertex_modification =
++            modifications(*vertex_shaders[i], *pixel_shaders[i]).first;
++        uint64_t vertex_key[2] = {pending[i].vertex_hash, vertex_modification};
++        if (vertex_seen.insert(XXH3_64bits(vertex_key, sizeof(vertex_key))).second) {
++          vertex_uniques.emplace_back(i, vertex_modification);
++        }
++      }
++    }
++    progress.total += uint32_t(vertex_uniques.size());
++    std::vector<VulkanShader::VulkanTranslation*> vertex_items(vertex_uniques.size());
++    std::vector<VulkanShader::VulkanTranslation*> to_translate;
++    for (size_t u = 0; u < vertex_uniques.size(); ++u) {
++      bool vertex_new = false;
++      vertex_items[u] = static_cast<VulkanShader::VulkanTranslation*>(
++          vertex_shaders[vertex_uniques[u].first]->GetOrCreateTranslation(
++              vertex_uniques[u].second, &vertex_new));
++      if (vertex_new) to_translate.push_back(vertex_items[u]);
++    }
++    run_parallel(to_translate.size(), [&](size_t i) {
++      thread_local std::unique_ptr<SpirvShaderTranslator> translator;
++      if (!translator) translator = CreateShaderTranslator();
++      TranslateShaderToModule(*translator, *to_translate[i]);
++    });
++    {
++      std::unordered_set<VulkanShader*> set_up;
++      for (auto* translation : to_translate) {
++        auto& shader = static_cast<VulkanShader&>(translation->shader());
++        if (set_up.insert(&shader).second) SetUpBindingLayouts(shader);
++      }
++    }
++    run_parallel(vertex_items.size(), [&](size_t u) {
++      VulkanShader::VulkanTranslation* vertex = vertex_items[u];
++      if (vertex->is_valid()) {
++        const PipelineLayoutProvider* pipeline_layout;
++        {
++          std::lock_guard<std::mutex> lock(layout_mutex);
++          auto& vertex_shader = static_cast<const VulkanShader&>(vertex->shader());
++          pipeline_layout = command_processor_.GetPipelineLayout(
++              0, 0, vertex_shader.GetTextureBindingsAfterTranslation().size(),
++              vertex_shader.GetSamplerBindingsAfterTranslation().size());
++        }
++        if (pipeline_layout) {
++          if (const PipelineLayoutProvider* independent_layout =
++                  pipeline_layout->GetIndependentSetsLayout()) {
++            pipeline_layout = independent_layout;
++          }
++          for (uint32_t depth_clamp = 0; depth_clamp <= uint32_t(device_properties.depthClamp);
++               ++depth_clamp) {
++            PipelineDescription description;
++            description.vertex_shader_hash = vertex->shader().ucode_data_hash();
++            description.vertex_shader_modification = vertex->modification();
++            description.primitive_topology = PipelinePrimitiveTopology::kTriangleList;
++            description.cull_back = 1;
++            description.depth_clamp_enable = depth_clamp;
++            description.render_pass_key.msaa_samples = xenos::MsaaSamples::k1X;
++            description.render_pass_key.depth_and_color_used = 0b10;
++            std::pair<const PipelineDescription, Pipeline> pipeline(description, Pipeline());
++            PipelineCreationArguments creation_arguments;
++            creation_arguments.pipeline = &pipeline;
++            creation_arguments.pipeline_layout = pipeline_layout;
++            creation_arguments.vertex_shader = vertex;
++            creation_arguments.render_pass = render_pass;
++            creation_arguments.library_mode = PipelineCreationArguments::LibraryMode::kVertexOnly;
++            creation_arguments.dynamic_cull_front = device_properties.extendedDynamicStateCullFront;
++            creation_arguments.dynamic_depth_stencil = true;
++            if (EnsurePipelineCreated(creation_arguments)) {
++              compiled.fetch_add(1);
++            }
++          }
++        }
++      }
++      progress.done.fetch_add(1);
++    });
++    SaveVkPipelineCache(true);
++  }
++
+   REXGPU_INFO("Shader warm-up: compiled {} pipelines in {:.1f} s", compiled.load(),
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count());
+ }
