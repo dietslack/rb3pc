@@ -1,0 +1,68 @@
+# Mid-asm hooks for Rock Band 3 Deluxe's executable (rb3pc-dx).
+
+# A patch in DX's executable moved code out of sub_8275D670 into a cave at
+# 0x82516324, reached by `b` from 0x8275D6E0 and branching back into the
+# function. ReXGlue can't express a jump into another function's middle, so
+# the hook does what the cave does (src/deluxe_exe.cpp):
+#   lwz r4,4(r3); cmpwi r4,2; beq -> mr r4,r30; b 0x8275D6E4
+#                             else -> b 0x8275D6F0
+[[midasm_hook]]
+address = 0x8275D6E0
+name = "Rb3pcDxCave8275D6E0"
+registers = ["r3", "r4", "r30"]
+jump_address_on_true = 0x8275D6E4
+jump_address_on_false = 0x8275D6F0
+
+# The retail hooks (config/retail/hooks.toml, which explains each one) at the
+# same code in this executable.
+
+# VdSwap call in D3D Present (retail 0x828374BC).
+[[midasm_hook]]
+address = 0x82865EFC
+name = "Rb3pcOnGuestFrame"
+
+# D3D GPU wait poll, sub_8285AFF8 (retail 0x8282C664).
+[[midasm_hook]]
+address = 0x8285B0A4
+name = "Rb3pcOnGpuWaitPoll"
+
+# Modifier::UseSaveValue, sub_82589030 (retail 0x82571A28).
+[[midasm_hook]]
+address = 0x825890A8
+name = "Rb3pcModifierUseSaveValue"
+registers = ["r29", "r30"]
+
+# DefaultDifficulty(), sub_8268F4F8 (retail 0x826710BC).
+[[midasm_hook]]
+address = 0x8268F554
+name = "Rb3pcDefaultDifficulty"
+registers = ["r3"]
+
+# BandUser::SetDifficulty, sub_8268BA18 (retail 0x8266DABC).
+[[midasm_hook]]
+address = 0x8268BA54
+name = "Rb3pcSetDifficulty"
+registers = ["r30"]
+
+# ManageBandPanel::SetStandIn epilogue, sub_82624908 (retail 0x826081B8).
+[[midasm_hook]]
+address = 0x82624A20
+name = "Rb3pcStandInChanged"
+registers = ["r30"]
+
+# Splash's constructor, sub_827421B8 (retail 0x8271D288).
+[[midasm_hook]]
+address = 0x827422A8
+name = "Rb3pcSplashCreated"
+registers = ["r30"]
+
+# Splash::Poll, sub_827429E0 (retail 0x8271D9EC, jump 0x8271DA48).
+[[midasm_hook]]
+address = 0x82742A0C
+name = "Rb3pcSplashPollThrottle"
+jump_address_on_true = 0x82742A68
+
+# CalibrationPanel::Poll after its prologue, sub_8260CE50 (retail 0x825F0724).
+[[midasm_hook]]
+address = 0x8260CE64
+name = "Rb3pcCalibrationPoll"

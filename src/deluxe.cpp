@@ -306,4 +306,194 @@ std::optional<std::string> InstallFromFolder(const fs::path& folder, const fs::p
 
 fs::path DeluxeInstallDir() { return rex::filesystem::GetUserFolder() / "rb3pc" / "deluxe"; }
 
+bool DeluxeInstalled() {
+  std::error_code ec;
+  return fs::exists(DeluxeInstallDir() / "gen" / kHeaderName, ec);
+}
+
+std::string DeluxeInstalledName() {
+  std::ifstream in(DeluxeInstallDir() / kNameFile);
+  std::string name;
+  std::getline(in, name);
+  return name;
+}
+
+std::string DeluxeProblem() {
+  std::error_code ec;
+  if (!DeluxeInstalled()) return "Deluxe isn't installed.";
+  if (!fs::exists(DeluxeInstallDir() / kXexName, ec)) return "Deluxe's default.xex is missing.";
+  return "";
+}
+
+bool DeluxeEnabled() { return REXCVAR_GET(deluxe) && DeluxeInstalled(); }
+
+void SetDeluxeEnabled(bool on) { rex::cvar::SetFlagByName("deluxe", on ? "true" : "false"); }
+
+std::optional<std::string> InstallDeluxe(const fs::path& source, std::atomic<float>* progress) {
+  std::error_code ec;
+  // Stage and swap so a failed install leaves the old one working.
+  fs::path dir = DeluxeInstallDir();
+  fs::path staging = dir.parent_path() / "deluxe.new";
+  fs::remove_all(staging, ec);
+  if (!fs::create_directories(staging / "gen", ec)) {
+    return "Couldn't create " + staging.string() + ": " + ec.message();
+  }
+  auto error = fs::is_directory(source, ec) ? InstallFromFolder(source, staging / "gen", progress)
+                                            : InstallFromZip(source, staging / "gen", progress);
+  if (!error && !fs::exists(staging / "gen" / kHeaderName, ec)) {
+    error = "gen/patch_xbox.hdr wasn't extracted.";
+  }
+  if (error) {
+    fs::remove_all(staging, ec);
+    REXLOG_WARN("Deluxe: install from {} failed: {}", source.string(), *error);
+    return error;
+  }
+  std::ofstream(staging / kNameFile) << source.filename().string() << "\n";
+  fs::remove_all(dir, ec);
+  fs::rename(staging, dir, ec);
+  if (ec) return "Couldn't move the install into place: " + ec.message();
+  REXLOG_INFO("Deluxe: installed from {}", source.string());
+  return std::nullopt;
+}
+
+std::map<std::string, fs::path> DeluxeOverlayFiles() {
+  if (auto problem = DeluxeProblem(); !problem.empty()) {
+    REXLOG_ERROR("Deluxe: {}", problem);
+    return {};
+  }
+  REXLOG_INFO("Deluxe: loading {} from {}", DeluxeInstalledName(), DeluxeInstallDir().string());
+  std::map<std::string, fs::path> files{{kXexName, DeluxeInstallDir() / kXexName}};
+  std::error_code ec;
+  for (const auto& entry : fs::directory_iterator(DeluxeInstallDir() / "gen", ec)) {
+    files["gen/" + entry.path().filename().string()] = entry.path();
+  }
+  return files;
+}
+
+bool DeluxeExecutableAvailable() {
+  std::error_code ec;
+  return exe::kDeluxe || fs::exists(OtherExecutable(), ec);
+}
+
+bool NeedsOtherExecutable() {
+  // rb3pc-dx without DX installed hands back too, so both agree.
+  bool usable = DeluxeEnabled() && DeluxeProblem().empty();
+  return exe::kDeluxe ? !usable : usable && DeluxeExecutableAvailable();
+}
+
+bool LaunchedByOtherExecutable() {
+  const char* value = std::getenv(kHandoffEnv);
+  return value && *value;
+}
+
+std::string RunOtherExecutable() {
+  fs::path target = OtherExecutable();
+  // Never bounce back and forth: a handed-off process doesn't hand off again.
+  if (LaunchedByOtherExecutable()) return "Already handed over once; not switching again.";
+  REXLOG_INFO("Deluxe: switching to {}", target.string());
+#ifdef _WIN32
+  _putenv_s(kHandoffEnv, "1");
+  int argc = 0;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  std::vector<const wchar_t*> args{target.c_str()};
+  for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
+  args.push_back(nullptr);
+  // _wspawnv doesn't quote arguments with spaces.
+  std::vector<std::wstring> quoted;
+  for (size_t i = 0; i + 1 < args.size(); ++i) quoted.push_back(L"\"" + std::wstring(args[i]) + L"\"");
+  for (size_t i = 0; i < quoted.size(); ++i) args[i] = quoted[i].c_str();
+  if (_wspawnv(_P_NOWAIT, target.c_str(), args.data()) != -1) std::exit(0);
+  return "Couldn't start " + target.string();
+#else
+  setenv(kHandoffEnv, "1", 1);
+  std::ifstream in("/proc/self/cmdline", std::ios::binary);
+  std::vector<std::string> args;
+  for (std::string arg; std::getline(in, arg, '\0');) args.push_back(arg);
+  std::string target_str = target.string();
+  std::vector<char*> argv{target_str.data()};
+  for (size_t i = 1; i < args.size(); ++i) argv.push_back(args[i].data());
+  argv.push_back(nullptr);
+  execv(target_str.c_str(), argv.data());
+  return "Couldn't start " + target_str + ": " + std::strerror(errno);
+#endif
+}
+
+#ifdef RB3PC_DX
+void CheckDeluxeCode() {
+  // Compare loaded .text against the reference with known variant words masked
+  // (tools/dx_variants.py); any other difference wasn't recompiled.
+  namespace ref = dx_reference;
+  const uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
+  std::vector<uint8_t> text(base + ref::kTextStart, base + ref::kTextStart + ref::kTextSize);
+  for (uint32_t addr : ref::kMaskedAddresses) std::memset(&text[addr - ref::kTextStart], 0, 4);
+  std::vector<uint32_t> changed;
+  for (size_t page = 0; page < std::size(ref::kPageHashes); ++page) {
+    size_t begin = page * ref::kPageSize, end = std::min<size_t>(begin + ref::kPageSize, text.size());
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (size_t i = begin; i < end; ++i) hash = (hash ^ text[i]) * 0x100000001B3ull;
+    if (hash != ref::kPageHashes[page]) changed.push_back(ref::kTextStart + uint32_t(begin));
+  }
+  if (changed.empty()) {
+    REXLOG_INFO("Deluxe: executable code matches a known DX version");
+    return;
+  }
+  std::string pages;
+  for (size_t i = 0; i < changed.size() && i < 16; ++i) pages += fmt::format(" {:08X}", changed[i]);
+  REXLOG_ERROR(
+      "Deluxe: this DX version's default.xex changes code rb3pc-dx wasn't built with (pages{}{}). "
+      "It may misbehave. To support it, put its default.xex in game/rb3dx/versions and rebuild.",
+      pages, changed.size() > 16 ? " ..." : "");
+}
+#endif
+
+namespace {
+
+// GAME:/dx_settings.dta: one (name (name value)) entry per option. Edited in
+// place to keep DX's formatting (CRLF).
+std::regex OptionPattern(const std::string& name) {
+  return std::regex("(\\(" + name + "\\s*\\(" + name + "\\s+)([^)\\s]*)");
+}
+
+std::optional<std::string> ReadOption(const std::string& text, const std::string& name) {
+  std::smatch match;
+  if (!std::regex_search(text, match, OptionPattern(name))) return std::nullopt;
+  return match[2].str();
+}
+
+void SetOption(std::string& text, const std::string& name, const std::string& value) {
+  std::regex pattern = OptionPattern(name);
+  if (std::regex_search(text, pattern)) {
+    // "$01": two digits, so a value starting with a digit isn't read as part of it.
+    text = std::regex_replace(text, pattern, "$01" + value, std::regex_constants::format_first_only);
+    return;
+  }
+  std::string eol = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+  if (!text.empty() && text.back() != '\n') text += eol;
+  text += "(" + name + eol + "   (" + name + " " + value + ")" + eol + ")" + eol;
+}
+
+}  // namespace
+
+void ApplyDeluxeOptions(const fs::path& game_root, bool fps_counter, bool quick_start) {
+  fs::path path = game_root / "dx_settings.dta";
+  std::string text;
+  {
+    std::ifstream in(path, std::ios::binary);
+    text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+  std::string before = text;
+  SetOption(text, "dx_fps_counter", fps_counter ? "1" : "0");
+  // Off restores DX's intro only if none was set; a chosen intro stays.
+  SetOption(text, "dx_splash_screen", quick_start ? "0" : "1");
+  auto intro = ReadOption(text, "dx_current_intro_movie");
+  if (quick_start) {
+    SetOption(text, "dx_current_intro_movie", "disabled");
+  } else if (intro == "disabled") {
+    SetOption(text, "dx_current_intro_movie", "deluxe");
+  }
+  if (text != before) std::ofstream(path, std::ios::binary | std::ios::trunc) << text;
+  REXLOG_INFO("Deluxe: FPS counter {}, quick start {}", fps_counter ? "on" : "off",
+              quick_start ? "on" : "off");
+}
+
 }  // namespace rb3pc

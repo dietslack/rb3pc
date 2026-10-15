@@ -1,0 +1,16 @@
+# ReXGlue manifest for Rock Band 3 Deluxe's executable, built as rb3pc-dx.
+# Paths are relative to this file. It lives here, not next to
+# rb3pc_manifest.toml, because codegen rewrites generated/rexglue.cmake next
+# to the manifest it's given (here: config/dx/generated/, unused). The project
+# name stays "rb3pc" so the generated files are named as in generated/default.
+
+[project]
+name = "rb3pc"
+sdk_version = "0.10.0"
+game_root = "../../game/rb3dx"
+
+[entrypoint]
+file_path = "../../game/rb3dx/default.xex"
+out_directory_path = "../../generated/dx"
+# dx_variants.toml is written by the build (tools/dx_variants.py).
+includes = ["functions.toml", "hooks.toml", "../../generated/dx_variants.toml", "../codegen.toml"]

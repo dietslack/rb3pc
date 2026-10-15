@@ -1,0 +1,78 @@
+# Codegen overrides for Rock Band 3 Deluxe's executable
+# (game/rb3dx/default.xex, title 45410914, version 0.0.5.1: TU5 with DX's
+# changes). Addresses were found by matching the retail functions' code
+# (config/retail/functions.toml).
+
+# CRT setjmp/longjmp (retail 0x82B88A00 / 0x82B885D0).
+setjmp_address = 0x82BBBA50
+longjmp_address = 0x82BBB620
+
+# Small leaf/tail-call functions with no .pdata entry that analysis misses,
+# only reached through a tail branch (`b`). Inspect them with tools/dis.sh.
+
+[functions]
+0x823AC230 = { size = 0x48 }  # loop writing f1 into each 8-byte element of a vector
+0x82790150 = { size = 0x24 }  # bool (mask >> bit) & 1
+0x82790750 = { size = 0x10 }  # tail-calls 0x8277F160 with fields 0x38/0x64
+0x8279D7F8 = { size = 0x08 }  # lwz r3,0(r3); b 0x82794B50
+0x82B84FB8 = { size = 0x0C }  # tail-calls 0x82B84EF8
+0x82B98D78 = { size = 0x08 }  # lwz r3,200(r3); b 0x82BAA740
+
+# Constructors reached only through `eh vector constructor iterator`, placed
+# right after a call to a no-return function, so analysis merged them into
+# the function before.
+0x8243F3C0 = { size = 0x20 }  # retail 0x824B6A48
+
+# Functions reachable only indirectly (vtables, callbacks, this-adjustor
+# thunks): found with tools/find_missing_funcs.py, plus the retail entries
+# (config/retail/functions.toml) located here by matching their code.
+0x828C1FF8 = { size = 0x10 }  # ref @0x82136E48; ref @0x8213C73C
+0x828C21A0 = { size = 0x28 }  # ref @0x8213700C; ref @0x8213C90C
+0x828C21C8 = { size = 0x28 }  # ref @0x82137010; ref @0x8213C910
+0x828C21F0 = { size = 0x28 }  # ref @0x82137014; ref @0x8213C914
+0x828C2218 = { size = 0x28 }  # ref @0x82137018; ref @0x8213C918
+0x828C2638 = { size = 0x20 }  # ref @0x8213C94C
+0x828C2658 = { size = 0x10 }  # ref @0x828CBE54
+0x828C2668 = { size = 0x10 }  # ref @0x8289CEEC; ref @0x828CB98C
+0x828C2678 = { size = 0x10 }  # ref @0x8289D19C; ref @0x828CBC3C
+0x828C2688 = { size = 0x10 }  # ref @0x8289D1EC; ref @0x828CBC8C
+0x828C2698 = { size = 0x10 }  # ref @0x8289D514; ref @0x828CBA6C
+0x828C26A8 = { size = 0x10 }  # ref @0x8289CD24; ref @0x828CB814
+0x828C26B8 = { size = 0x10 }  # ref @0x8289D72C; ref @0x828CBCDC
+0x828C26C8 = { size = 0x10 }  # ref @0x8289CFCC; ref @0x828CC054
+0x828C26D8 = { size = 0x10 }  # ref @0x8289CD74; ref @0x828CB864
+0x828C26E8 = { size = 0x10 }  # ref @0x8289D23C; ref @0x828CBD2C
+0x82936760 = { size = 0x10 }  # ref @0x82909134; ref @0x82937884
+0x82936770 = { size = 0x78 }  # ref @0x82909140; ref @0x82937890
+0x8295C050 = { size = 0x8 }  # ref @0x82916D10; ref @0x82945468
+0x82991B40 = { size = 0x74 }  # ref @0x8297C8B4; ref @0x829AAD5C
+0x82A1D5F8 = { size = 0x18 }  # ref @0x8216B4B8; ref @0x82170DE8
+0x82BC33D8 = { size = 0x8 }  # ref @0x8219F9DC; ref @0x821A68FC
+0x82BCE410 = { size = 0x8 }  # ref @0x821A6C24
+0x82BCE418 = { size = 0x8 }  # ref @0x821A6BF4
+0x82BCE420 = { size = 0x8 }  # ref @0x821A6CFC
+0x82BCE428 = { size = 0x8 }  # ref @0x821A6C04
+0x82BCE430 = { size = 0x8 }  # ref @0x821A6C2C
+0x82BCE440 = { size = 0x8 }  # ref @0x8219FD0C; ref @0x821A6BE8
+0x82BCE448 = { size = 0x8 }  # ref @0x821A6C00
+0x82BCE450 = { size = 0x8 }  # ref @0x8219FCC8; ref @0x821A6C20
+0x82BCE458 = { size = 0x8 }  # ref @0x8219FCC0; ref @0x821A6CF8
+0x82BD4C20 = { size = 0x8 }  # ref @0x821A6BF0
+0x82BD4C28 = { size = 0x8 }  # ref @0x821A6C08
+0x82BD4C30 = { size = 0x8 }  # ref @0x821A6F74
+0x82BD4C40 = { size = 0x8 }  # ref @0x821A6BFC
+0x82BD4EC8 = { size = 0x8 }  # ref @0x821A6FE4
+0x82BD4ED8 = { size = 0x8 }  # ref @0x821A6C28
+0x82BD4EE0 = { size = 0x8 }  # ref @0x821A6F58
+0x82BD4EE8 = { size = 0x8 }  # ref @0x821A6F28
+0x82BE2DF8 = { size = 0x18 }  # ref @0x821A0F2C; ref @0x821A7E4C
+0x82BE3DD8 = { size = 0x8 }  # ref @0x821A0EC4; ref @0x821A7DE4
+0x82BF5300 = { size = 0x8 }  # ref @0x8219FCE0; retail equivalent
+0x82BF5308 = { size = 0x8 }  # ref @0x821A0008; retail equivalent
+0x82BF5310 = { size = 0x8 }  # ref @0x8219FCD8; retail equivalent
+0x82BF5318 = { size = 0x8 }  # ref @0x8219FD00; retail equivalent
+0x82BF5320 = { size = 0x8 }  # ref @0x8219FCFC; retail equivalent
+0x82BF5328 = { size = 0x8 }  # ref @0x8219FD04; retail equivalent
+0x82BF5330 = { size = 0x8 }  # ref @0x8219FCD0; retail equivalent
+0x82BF6B50 = { size = 0x8 }  # ref @0x821AD00C
+0x82C3C1D0 = { size = 0x18 }  # ref @0x82C046D0; ref @0x82C3C278
