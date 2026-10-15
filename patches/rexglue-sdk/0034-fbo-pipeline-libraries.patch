@@ -1,0 +1,394 @@
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -903,6 +903,9 @@
+   // Cull mode and front face last set as dynamic state (cull mode | front face
+   // << 8), or -1 if not set since a pipeline with them static was bound.
+   int32_t current_dynamic_cull_front_ = -1;
++  // Depth / stencil state last set as dynamic state, if valid.
++  bool current_dynamic_depth_stencil_valid_ = false;
++  DynamicDepthStencilState current_dynamic_depth_stencil_;
+ 
+   // Pipeline layout of the current guest graphics pipeline.
+   const PipelineLayout* current_guest_graphics_pipeline_layout_;
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -25,6 +25,19 @@
+ 
+ class VulkanCommandProcessor;
+ 
++// Depth / stencil state set dynamically (VK_EXT_extended_dynamic_state).
++struct DynamicDepthStencilState {
++  VkBool32 depth_test_enable = VK_FALSE;
++  VkBool32 depth_write_enable = VK_FALSE;
++  VkCompareOp depth_compare_op = VK_COMPARE_OP_NEVER;
++  VkBool32 stencil_test_enable = VK_FALSE;
++  VkStencilOpState front = {};
++  VkStencilOpState back = {};
++  bool operator==(const DynamicDepthStencilState& other) const {
++    return std::memcmp(this, &other, sizeof(*this)) == 0;
++  }
++};
++
+ class DeferredCommandBuffer {
+  public:
+   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
+@@ -321,6 +334,11 @@
+     args.front_face = front_face;
+   }
+ 
++  void CmdVkSetDepthStencilState(const DynamicDepthStencilState& state) {
++    *reinterpret_cast<DynamicDepthStencilState*>(
++        WriteCommand(Command::kVkSetDepthStencilState, sizeof(DynamicDepthStencilState))) = state;
++  }
++
+   void CmdVkSetBlendConstants(const float* blend_constants) {
+     auto& args = *reinterpret_cast<ArgsVkSetBlendConstants*>(
+         WriteCommand(Command::kVkSetBlendConstants, sizeof(ArgsVkSetBlendConstants)));
+@@ -404,6 +422,7 @@
+     kVkResetQueryPool,
+     kVkSetBlendConstants,
+     kVkSetCullModeAndFrontFace,
++    kVkSetDepthStencilState,
+     kVkSetDepthBias,
+     kVkSetScissor,
+     kVkSetStencilCompareMask,
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -35,6 +35,7 @@
+ #include <rex/graphics/primitive_processor.h>
+ #include <rex/graphics/register_file.h>
+ #include <rex/graphics/registers.h>
++#include <rex/graphics/vulkan/deferred_command_buffer.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+ #include <rex/graphics/vulkan/shader.h>
+ #include <rex/graphics/xenos.h>
+@@ -113,6 +114,9 @@
+   static const std::atomic<VkPipeline>* GetPipelineHandleSlot(void* handle);
+   // Whether the pipeline takes its cull mode and front face as dynamic state,
+   // and their values for it.
++  // Whether the pipeline takes its depth / stencil state as dynamic state (with
++  // host render targets, pipelines linked from libraries), and the values.
++  static bool GetPipelineDynamicDepthStencil(void* handle, DynamicDepthStencilState& state_out);
+   static bool GetPipelineDynamicCullFront(void* handle, VkCullModeFlags& cull_mode_out,
+                                           VkFrontFace& front_face_out);
+   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
+@@ -269,6 +273,9 @@
+     bool dynamic_cull_front = false;
+     VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
+     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    // Same for the depth / stencil state (host render targets).
++    bool dynamic_depth_stencil = false;
++    DynamicDepthStencilState depth_stencil;
+     Pipeline() = default;
+     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
+         : pipeline_layout(pipeline_layout_provider) {}
+@@ -279,7 +286,9 @@
+           creation_pending(other.creation_pending.load(std::memory_order_acquire)),
+           dynamic_cull_front(other.dynamic_cull_front),
+           cull_mode(other.cull_mode),
+-          front_face(other.front_face) {}
++          front_face(other.front_face),
++          dynamic_depth_stencil(other.dynamic_depth_stencil),
++          depth_stencil(other.depth_stencil) {}
+     Pipeline& operator=(const Pipeline& other) {
+       if (this == &other) {
+         return *this;
+@@ -294,6 +303,8 @@
+       dynamic_cull_front = other.dynamic_cull_front;
+       cull_mode = other.cull_mode;
+       front_face = other.front_face;
++      dynamic_depth_stencil = other.dynamic_depth_stencil;
++      depth_stencil = other.depth_stencil;
+       return *this;
+     }
+   };
+@@ -322,7 +333,11 @@
+     LibraryMode library_mode = LibraryMode::kNone;
+     // Cull mode and front face as dynamic state (Pipeline::dynamic_cull_front).
+     bool dynamic_cull_front = false;
++    // Depth / stencil state as dynamic state (Pipeline::dynamic_depth_stencil).
++    bool dynamic_depth_stencil = false;
+   };
++  static DynamicDepthStencilState GetDescriptionDepthStencilState(
++      const PipelineDescription& description);
+   struct PipelineCreationArgumentsPriorityComparator {
+     bool operator()(const PipelineCreationArguments& a, const PipelineCreationArguments& b) const {
+       return a.priority < b.priority;
+--- a/include/rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc
++++ b/include/rex/ui/vulkan/functions/device_1_3_ext_extended_dynamic_state.inc
+@@ -2,3 +2,8 @@
+ // Vulkan 1.3, where they're core).
+ XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetCullModeEXT, vkCmdSetCullMode)
+ XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetFrontFaceEXT, vkCmdSetFrontFace)
++XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetDepthTestEnableEXT, vkCmdSetDepthTestEnable)
++XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetDepthWriteEnableEXT, vkCmdSetDepthWriteEnable)
++XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetDepthCompareOpEXT, vkCmdSetDepthCompareOp)
++XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetStencilTestEnableEXT, vkCmdSetStencilTestEnable)
++XE_UI_VULKAN_FUNCTION_PROMOTED(vkCmdSetStencilOpEXT, vkCmdSetStencilOp)
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3637,6 +3637,7 @@
+   deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   current_external_graphics_pipeline_ = pipeline;
+   current_dynamic_cull_front_ = -1;
++  current_dynamic_depth_stencil_valid_ = false;
+   current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+   current_guest_graphics_pipeline_deferred_ = nullptr;
+   current_guest_graphics_pipeline_layout_ = VK_NULL_HANDLE;
+@@ -4007,6 +4008,18 @@
+     } else {
+       current_dynamic_cull_front_ = -1;
+     }
++    DynamicDepthStencilState depth_stencil;
++    if (pipeline_handle &&
++        VulkanPipelineCache::GetPipelineDynamicDepthStencil(pipeline_handle, depth_stencil)) {
++      if (!current_dynamic_depth_stencil_valid_ ||
++          !(current_dynamic_depth_stencil_ == depth_stencil)) {
++        deferred_command_buffer_.CmdVkSetDepthStencilState(depth_stencil);
++        current_dynamic_depth_stencil_ = depth_stencil;
++        current_dynamic_depth_stencil_valid_ = true;
++      }
++    } else {
++      current_dynamic_depth_stencil_valid_ = false;
++    }
+   }
+ 
+   // Update the graphics pipeline, and if the new graphics pipeline has a
+@@ -5394,6 +5407,7 @@
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_compute_pipeline_ = VK_NULL_HANDLE;
+     current_dynamic_cull_front_ = -1;
++    current_dynamic_depth_stencil_valid_ = false;
+     current_guest_graphics_pipeline_layout_ = nullptr;
+     current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+ 
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -559,6 +559,18 @@
+         dfn.vkCmdSetFrontFace(command_buffer, args.front_face);
+       } break;
+ 
++      case Command::kVkSetDepthStencilState: {
++        auto& args = *reinterpret_cast<const DynamicDepthStencilState*>(stream);
++        dfn.vkCmdSetDepthTestEnable(command_buffer, args.depth_test_enable);
++        dfn.vkCmdSetDepthWriteEnable(command_buffer, args.depth_write_enable);
++        dfn.vkCmdSetDepthCompareOp(command_buffer, args.depth_compare_op);
++        dfn.vkCmdSetStencilTestEnable(command_buffer, args.stencil_test_enable);
++        dfn.vkCmdSetStencilOp(command_buffer, VK_STENCIL_FACE_FRONT_BIT, args.front.failOp,
++                              args.front.passOp, args.front.depthFailOp, args.front.compareOp);
++        dfn.vkCmdSetStencilOp(command_buffer, VK_STENCIL_FACE_BACK_BIT, args.back.failOp,
++                              args.back.passOp, args.back.depthFailOp, args.back.compareOp);
++      } break;
++
+       case Command::kVkSetDepthBias: {
+         auto& args = *reinterpret_cast<const ArgsVkSetDepthBias*>(stream);
+         dfn.vkCmdSetDepthBias(command_buffer, args.depth_bias_constant_factor,
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1242,6 +1242,7 @@
+     if (found_pipeline == VK_NULL_HANDLE) {
+       PipelineCreationArguments creation_arguments;
+       it->second.dynamic_cull_front = false;
++      it->second.dynamic_depth_stencil = false;
+       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
+           !EnsurePipelineCreated(creation_arguments)) {
+         return false;
+@@ -1305,6 +1306,11 @@
+       pipeline.second.front_face = description.front_face_clockwise
+                                        ? VK_FRONT_FACE_CLOCKWISE
+                                        : VK_FRONT_FACE_COUNTER_CLOCKWISE;
++      if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
++        creation_arguments_real.dynamic_depth_stencil = true;
++        pipeline.second.dynamic_depth_stencil = true;
++        pipeline.second.depth_stencil = GetDescriptionDepthStencilState(description);
++      }
+     }
+   }
+   bool queued_deferred_creation = false;
+@@ -1370,9 +1376,60 @@
+ bool VulkanPipelineCache::PipelineLibrariesUsable() const {
+   const ui::vulkan::VulkanDevice::Properties& device_properties =
+       command_processor_.GetVulkanDevice()->properties();
+-  return REXCVAR_GET(vulkan_pipeline_library) && device_properties.graphicsPipelineLibrary &&
+-         device_properties.graphicsPipelineLibraryFastLinking &&
+-         render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
++  if (!REXCVAR_GET(vulkan_pipeline_library) || !device_properties.graphicsPipelineLibrary ||
++      !device_properties.graphicsPipelineLibraryFastLinking) {
++    return false;
++  }
++  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
++    return true;
++  }
++  // With host render targets, the pixel side is split into the fragment shader
++  // (taking the depth / stencil state as dynamic state) and the fragment output
++  // (attachment formats and blending), so the fragment shader library, the
++  // expensive part, only varies by the pixel shader and the sample count.
++  // Dynamic rendering makes it independent of the render pass.
++  return REXCVAR_GET(vulkan_dynamic_rendering) && device_properties.dynamicRendering &&
++         device_properties.extendedDynamicStateCullFront;
++}
++
++DynamicDepthStencilState VulkanPipelineCache::GetDescriptionDepthStencilState(
++    const PipelineDescription& description) {
++  // The same as the static state in EnsurePipelineCreated.
++  DynamicDepthStencilState state;
++  if (description.depth_write_enable ||
++      description.depth_compare_op != xenos::CompareFunction::kAlways) {
++    state.depth_test_enable = VK_TRUE;
++    state.depth_write_enable = description.depth_write_enable ? VK_TRUE : VK_FALSE;
++    state.depth_compare_op =
++        VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) + uint32_t(description.depth_compare_op));
++  }
++  if (description.stencil_test_enable) {
++    state.stencil_test_enable = VK_TRUE;
++    state.front.failOp =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_fail_op));
++    state.front.passOp =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_pass_op));
++    state.front.depthFailOp = VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) +
++                                          uint32_t(description.stencil_front_depth_fail_op));
++    state.front.compareOp = VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) +
++                                        uint32_t(description.stencil_front_compare_op));
++    state.back.failOp =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_fail_op));
++    state.back.passOp =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_pass_op));
++    state.back.depthFailOp = VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) +
++                                         uint32_t(description.stencil_back_depth_fail_op));
++    state.back.compareOp = VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) +
++                                       uint32_t(description.stencil_back_compare_op));
++  }
++  return state;
++}
++
++bool VulkanPipelineCache::GetPipelineDynamicDepthStencil(void* handle,
++                                                         DynamicDepthStencilState& state_out) {
++  const Pipeline& pipeline = *static_cast<const Pipeline*>(handle);
++  state_out = pipeline.depth_stencil;
++  return pipeline.dynamic_depth_stencil;
+ }
+ 
+ bool VulkanPipelineCache::IsCreatingPipelines() const {
+@@ -3580,7 +3637,7 @@
+     color_blend_state.pAttachments = color_blend_attachments;
+   }
+ 
+-  std::array<VkDynamicState, 9> dynamic_states;
++  std::array<VkDynamicState, 16> dynamic_states;
+   VkPipelineDynamicStateCreateInfo dynamic_state;
+   dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+   dynamic_state.pNext = nullptr;
+@@ -3604,6 +3661,13 @@
+     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_CULL_MODE;
+     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_FRONT_FACE;
+   }
++  if (creation_arguments.dynamic_depth_stencil) {
++    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE;
++    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE;
++    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP;
++    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE;
++    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_OP;
++  }
+ 
+   VkPipelineTessellationStateCreateInfo tessellation_state = {};
+   if (tessellated) {
+@@ -3684,7 +3748,9 @@
+       creation_arguments.library_mode != LibraryMode::kNone && REXCVAR_GET(vulkan_pipeline_library) &&
+       vulkan_device->properties().graphicsPipelineLibrary &&
+       vulkan_device->properties().graphicsPipelineLibraryFastLinking &&
+-      edram_fragment_shader_interlock && !tessellated &&
++      (edram_fragment_shader_interlock ||
++       (use_dynamic_rendering && creation_arguments.dynamic_depth_stencil)) &&
++      !tessellated &&
+       fragment_shader_override == VK_NULL_HANDLE && shader_stage_count >= 2 &&
+       shader_stages[shader_stage_count - 1].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+   bool linked = false;
+@@ -3726,8 +3792,17 @@
+         VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+     const VkPipelineShaderStageCreateInfo& fragment_stage = shader_stages[shader_stage_count - 1];
+ 
++    // With host render targets, the fragment shader and the fragment output
++    // interface are separate libraries.
++    constexpr VkGraphicsPipelineLibraryFlagsEXT kFragmentShaderPart =
++        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
++    constexpr VkGraphicsPipelineLibraryFlagsEXT kFragmentOutputPart =
++        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
++    VkGraphicsPipelineLibraryFlagsEXT fragment_parts =
++        edram_fragment_shader_interlock ? kFragmentParts : kFragmentShaderPart;
++
+     if (creation_arguments.library_mode == LibraryMode::kFragmentOnly) {
+-      VkPipeline library = create_library(kFragmentParts, 1, &fragment_stage, library_layouts[1]);
++      VkPipeline library = create_library(fragment_parts, 1, &fragment_stage, library_layouts[1]);
+       if (library == VK_NULL_HANDLE) {
+         return false;
+       }
+@@ -3762,7 +3837,7 @@
+                           (rasterization_state.rasterizerDiscardEnable << 1) |
+                           (rasterization_state.depthBiasEnable << 2);
+     vertex_key.state[6] = uint32_t(use_dynamic_rendering);
+-    fragment_key.parts = kFragmentParts;
++    fragment_key.parts = fragment_parts;
+     fragment_key.module = uint64_t(fragment_stage.module);
+     fragment_key.layout = uint64_t(library_layouts[1]);
+     fragment_key.render_pass = vertex_key.render_pass;
+@@ -3770,6 +3845,34 @@
+     fragment_key.state[1] = multisample_state.sampleShadingEnable;
+     fragment_key.state[2] = multisample_state.pSampleMask ? *multisample_state.pSampleMask : ~0u;
+     fragment_key.state[3] = uint32_t(use_dynamic_rendering);
++    fragment_key.state[4] = multisample_state.alphaToCoverageEnable;
++    if (!edram_fragment_shader_interlock) {
++      // Independent of the formats with dynamic rendering, and of the depth /
++      // stencil state as it's dynamic.
++      fragment_key.render_pass = 0;
++    }
++    // Attachment formats, blending and multisampling.
++    struct {
++      uint64_t parts;
++      uint32_t samples, sample_shading, sample_mask, alpha_to_coverage;
++      uint32_t color_formats[xenos::kMaxColorRenderTargets];
++      uint32_t depth_format, stencil_format, attachment_count;
++      VkPipelineColorBlendAttachmentState attachments[xenos::kMaxColorRenderTargets];
++    } output_key = {};
++    output_key.parts = kFragmentOutputPart;
++    output_key.samples = uint32_t(multisample_state.rasterizationSamples);
++    output_key.sample_shading = multisample_state.sampleShadingEnable;
++    output_key.sample_mask = fragment_key.state[2];
++    output_key.alpha_to_coverage = multisample_state.alphaToCoverageEnable;
++    for (uint32_t i = 0; i < pipeline_rendering_create_info.colorAttachmentCount; ++i) {
++      output_key.color_formats[i] = uint32_t(color_attachment_formats[i]);
++    }
++    output_key.depth_format = uint32_t(pipeline_rendering_create_info.depthAttachmentFormat);
++    output_key.stencil_format = uint32_t(pipeline_rendering_create_info.stencilAttachmentFormat);
++    output_key.attachment_count = color_blend_state.attachmentCount;
++    for (uint32_t i = 0; i < color_blend_state.attachmentCount; ++i) {
++      output_key.attachments[i] = color_blend_state.pAttachments[i];
++    }
+     auto get_library = [&](const auto& key, VkGraphicsPipelineLibraryFlagsEXT parts,
+                            uint32_t stage_count, const VkPipelineShaderStageCreateInfo* stages,
+                            VkPipelineLayout layout) -> VkPipeline {
+@@ -3790,14 +3893,21 @@
+       library_promise.set_value(library);
+       return library;
+     };
+-    VkPipeline libraries[2] = {
++    VkPipeline libraries[3] = {
+         get_library(vertex_key, kVertexParts, shader_stage_count - 1, shader_stages.data(),
+                     library_layouts[0]),
+-        get_library(fragment_key, kFragmentParts, 1, &fragment_stage, library_layouts[1])};
+-    if (libraries[0] != VK_NULL_HANDLE && libraries[1] != VK_NULL_HANDLE) {
++        get_library(fragment_key, fragment_parts, 1, &fragment_stage, library_layouts[1]),
++        VK_NULL_HANDLE};
++    uint32_t library_count = 2;
++    if (!edram_fragment_shader_interlock) {
++      libraries[2] = get_library(output_key, kFragmentOutputPart, 0, nullptr, library_layouts[1]);
++      library_count = 3;
++    }
++    if (libraries[0] != VK_NULL_HANDLE && libraries[1] != VK_NULL_HANDLE &&
++        (library_count < 3 || libraries[2] != VK_NULL_HANDLE)) {
+       VkPipelineLibraryCreateInfoKHR link_info = {};
+       link_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+-      link_info.libraryCount = 2;
++      link_info.libraryCount = library_count;
+       link_info.pLibraries = libraries;
+       VkGraphicsPipelineCreateInfo link_create_info = {};
+       link_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
