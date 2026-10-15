@@ -780,6 +780,271 @@ class Launcher final : public rex::ui::ImGuiDialog {
     if (action) action();
   }
 
+  // Modelled on RB3's dialog backdrop, main menu bar and overshell checkboxes.
+
+  struct Layout {
+    float scale, cx, menu_x, value_x, menu_w, top, bottom, row_h, text;
+  };
+
+  Layout ComputeLayout(ImVec2 display) const {
+    Layout l;
+    l.scale = std::max(display.y / 720.0f, 0.5f);
+    l.cx = display.x * 0.5f;
+    l.menu_w = std::min(760.0f * l.scale, display.x * 0.92f);
+    l.menu_x = l.cx - l.menu_w * 0.5f;
+    l.value_x = l.menu_x + l.menu_w * 0.53f;
+    l.top = 148.0f * l.scale;
+    // Help bar starts 58 units from the bottom.
+    float rows_bottom = 720.0f - 58.0f - 6.0f;
+    l.bottom = rows_bottom * l.scale;
+    float fit = (rows_bottom - 148.0f - 32.0f) / float(kMaxVisibleRows);
+    l.row_h = std::min(34.0f, fit) * l.scale;
+    l.text = std::min(25.0f * l.scale, l.row_h * 0.8f);
+    return l;
+  }
+
+  float MenuTop(const Layout& l) const {
+    int count = int(Items().size()) + (InSection() ? 1 : 0);  // + the header
+    float height = count * l.row_h + 2 * 16.0f * l.scale;
+    return l.top + std::max(0.0f, (l.bottom - l.top - height) * 0.5f);
+  }
+
+  float RowY(const Layout& l, int index) const {
+    float gap = 16.0f * l.scale;
+    float top = MenuTop(l);
+    if (InSection()) {
+      // Below the category's header, BACK set apart.
+      float y = top + (index + 1) * l.row_h + gap;
+      if (index == int(Items().size()) - 1) y += gap;
+      return y;
+    }
+    // A gap after PLAY and before QUIT.
+    float y = top + index * l.row_h;
+    if (index >= 1) y += gap;
+    if (index == int(Items().size()) - 1) y += gap;
+    return y;
+  }
+
+  int HoveredRow(ImVec2 mouse) const {
+    Layout l = ComputeLayout(ImGui::GetIO().DisplaySize);
+    if (mouse.x < l.menu_x || mouse.x > l.menu_x + l.menu_w) return -1;
+    for (int i = 0; i < int(Items().size()); ++i) {
+      float y = RowY(l, i);
+      if (mouse.y >= y && mouse.y < y + l.row_h) return i;
+    }
+    return -1;
+  }
+
+  bool IsCheckbox(Row row) const {
+    return (row == Row::kFpsCounter || row == Row::kQuickStart || row == Row::kShowLauncher ||
+            row == Row::kDeluxe || row == Row::kMouseKeyboard) &&
+           ChoiceCount(row);
+  }
+
+  void DrawHighlight(ImDrawList* draw, const Layout& l, float x0, float x1, float y) {
+    ui_.DrawAccentBar(draw, ImVec2(x0, y + 1 * l.scale), ImVec2(x1, y + l.row_h - 1 * l.scale),
+                      l.scale);
+  }
+
+  void Draw(ImDrawList* draw, ImVec2 display) {
+    Layout l = ComputeLayout(display);
+    float logo_w = std::min(460.0f * l.scale, display.x * 0.7f);
+    float logo_h = logo_w / ui_.logo_aspect();
+    float logo_y = 26.0f * l.scale;
+    ui_.DrawBackdrop(draw, display, l.scale, ImVec2(l.cx, logo_y + logo_h * 0.5f));
+    ui_.DrawLogo(draw, ImVec2(l.cx - logo_w * 0.5f, logo_y),
+                 ImVec2(l.cx + logo_w * 0.5f, logo_y + logo_h));
+
+
+    std::vector<std::string> pad_names = pads_.Names();
+    float pad = 14.0f * l.scale;
+    if (InSection()) {
+      // The category's name, as a header.
+      std::string title = SectionLabel(section_);
+      float size = l.text * 1.3f;
+      float w = ui_.TextWidth(UiFont::kHub, title, size);
+      ui_.DrawTextShadowed(draw, UiFont::kHub, title, size, l.cx - w * 0.5f,
+                           MenuTop(l) + (l.row_h - size) * 0.5f, kUiAccent);
+    }
+    std::vector<Item> items = Items();
+    for (int i = 0; i < int(items.size()); ++i) {
+      const Item& item = items[i];
+      Row row = item.row;
+      float y = RowY(l, i);
+      bool selected = i == selected_;
+      float text = l.text;
+      float text_y = y + (l.row_h - text) * 0.5f;
+
+      if (item.kind == Item::kPlay || item.kind == Item::kQuit || item.kind == Item::kBack) {
+        // Centred like the game's own menus, the bar hugging the word.
+        float size = item.kind == Item::kPlay ? text * 1.3f : text;
+        std::string label = item.kind == Item::kPlay   ? "PLAY"
+                            : item.kind == Item::kQuit ? "QUIT"
+                                                       : "BACK";
+        float w = ui_.TextWidth(UiFont::kHub, label, size);
+        float ty = y + (l.row_h - size) * 0.5f;
+        if (selected) {
+          DrawHighlight(draw, l, l.cx - w * 0.5f - pad, l.cx + w * 0.5f + pad, y);
+          ui_.DrawText(draw, UiFont::kHub, label, size, l.cx - w * 0.5f, ty, kUiDark);
+        } else {
+          ui_.DrawTextShadowed(draw, UiFont::kHub, label, size, l.cx - w * 0.5f, ty, kUiText);
+        }
+        continue;
+      }
+
+      if (selected) DrawHighlight(draw, l, l.menu_x, l.menu_x + l.menu_w, y);
+      auto label = [&](const std::string& s, float size, float x, float ty, ImU32 color) {
+        if (selected) {
+          ui_.DrawText(draw, UiFont::kHub, s, size, x, ty, kUiDark);
+        } else {
+          ui_.DrawTextShadowed(draw, UiFont::kHub, s, size, x, ty, color);
+        }
+      };
+      if (item.kind == Item::kSection) {
+        label(SectionLabel(item.section), text, l.menu_x + pad, text_y, kUiText);
+        label(SectionSummary(item.section), text, l.value_x, text_y, kUiAccent);
+        // The texture has a lot of empty space around it, so draw it bigger.
+        float size = l.row_h * 0.95f;
+        float x1 = l.menu_x + l.menu_w - pad * 0.5f;
+        float cy = y + l.row_h * 0.5f;
+        if (ui_.HasImage("chevron")) {
+          ui_.DrawImage(draw, "chevron", ImVec2(x1 - size, cy - size * 0.5f),
+                        ImVec2(x1, cy + size * 0.5f), selected ? kUiDark : kUiText);
+        } else {
+          float cell = text * 2.6f;
+          ui_.DrawText(draw, UiFont::kButtons, "S", cell, x1 - cell * 0.65f,
+                       y + (l.row_h - cell) * 0.5f, IM_COL32_WHITE);
+        }
+        continue;
+      }
+      label(Label(row), text, l.menu_x + pad, text_y, kUiText);
+
+      if (IsCheckbox(row)) {
+        float box = 26.0f * l.scale;
+        ImVec2 min(l.value_x, y + (l.row_h - box) * 0.5f), max(min.x + box, min.y + box);
+        ImU32 tint = selected ? IM_COL32(60, 60, 50, 255) : IM_COL32_WHITE;
+        if (ui_.HasImage("checkbox")) {
+          ui_.DrawImage(draw, "checkbox", min, max, tint);
+          if (ChoiceIndex(row)) {
+            float o = box * 0.08f;
+            ui_.DrawImage(draw, "check", ImVec2(min.x + o, min.y - o * 2),
+                          ImVec2(max.x + o * 3, max.y - o), IM_COL32_WHITE);
+          }
+        } else {
+          label(ChoiceIndex(row) ? "ON" : "OFF", text, l.value_x, text_y, kUiAccent);
+        }
+      } else if (row == Row::kProfile && editing_) {
+        bool blink = std::fmod(ImGui::GetTime(), 1.0) < 0.6;
+        float w = ui_.TextWidth(UiFont::kHub, edit_name_, text);
+        label(edit_name_, text, l.value_x, text_y, kUiAccent);
+        if (blink) {
+          draw->AddRectFilled(ImVec2(l.value_x + w + 3 * l.scale, text_y + text * 0.1f),
+                              ImVec2(l.value_x + w + 13 * l.scale, text_y + text * 0.9f),
+                              selected ? kUiDark : kUiAccent);
+        }
+      } else {
+        float x = l.value_x;
+        bool arrows = selected && adjusting_;
+        // Left chevron is the right one mirrored.
+        float size = l.row_h * 0.95f, arrow = size * 0.3f;
+        auto draw_arrow = [&](bool left, float center_x) {
+          ImVec2 min(center_x - size * 0.5f, y + (l.row_h - size) * 0.5f);
+          ImVec2 max(min.x + size, min.y + size);
+          ui_.DrawImage(draw, "chevron", min, max, kUiDark,
+                        left ? ImVec2(1, 0) : ImVec2(0, 0), left ? ImVec2(0, 1) : ImVec2(1, 1));
+        };
+        // Values stay put; the left arrow sits in the gap before them.
+        std::string value = Value(row);
+        label(value, text, x, text_y, kUiAccent);
+        if (arrows) {
+          draw_arrow(true, x - arrow - 6 * l.scale);
+          draw_arrow(false, x + ui_.TextWidth(UiFont::kHub, value, text) + arrow + 6 * l.scale);
+        }
+      }
+
+      if (row == Row::kDeluxeInstall) {
+        std::string note = DeluxeNote();
+        if (note.size() > 34) note = note.substr(0, 33) + "...";
+        float small = 15.0f * l.scale;
+        float w = ui_.TextWidth(UiFont::kDisplay, note, small);
+        ui_.DrawText(draw, UiFont::kDisplay, note, small, l.menu_x + l.menu_w - pad - w,
+                     y + (l.row_h - small) * 0.5f,
+                     selected ? IM_COL32(40, 40, 30, 255) : kUiMuted);
+      }
+
+      if (row >= Row::kController1 && row <= Row::kController4) {
+        size_t slot = size_t(int(row) - int(Row::kController1));
+        std::string name = slot < pad_names.size() ? pad_names[slot] : "NOT CONNECTED";
+        // PS3 instruments all start with this.
+        constexpr std::string_view kLicensed = "Licensed by Sony Computer Entertainment ";
+        if (name.starts_with(kLicensed)) name.erase(0, kLicensed.size());
+        if (name.starts_with("America ")) name.erase(0, 8);
+        if (name.size() > 30) name = name.substr(0, 29) + "...";
+        float small = 15.0f * l.scale;
+        float w = ui_.TextWidth(UiFont::kDisplay, name, small);
+        ui_.DrawText(draw, UiFont::kDisplay, name, small, l.menu_x + l.menu_w - pad - w,
+                     y + (l.row_h - small) * 0.5f,
+                     selected ? IM_COL32(40, 40, 30, 255) : kUiMuted);
+      }
+    }
+
+    DrawHints(draw, display, l);
+  }
+
+  // The help bar, with the game's fret icons ("g" / "r" in its buttons font).
+  void DrawHints(ImDrawList* draw, ImVec2 display, const Layout& l) {
+    struct Hint {
+      const char* icon;  // buttons-font glyph, or nullptr for a text-only hint
+      std::string text;
+    };
+    std::vector<Hint> hints;
+    if (editing_) {
+      hints = {{nullptr, "TYPE A NAME"},
+               {nullptr, "BACKSPACE: DELETE"},
+               {nullptr, "ENTER: DONE"},
+               {nullptr, "ESC: CANCEL"}};
+    } else if (adjusting_) {
+      hints = {{nullptr, "STRUM: CHANGE"}, {"g", "SAVE"}, {"r", "SAVE"}, {nullptr, "START: PLAY"}};
+    } else if (SelectedRow() == Row::kProfile) {
+      hints = {{nullptr, "STRUM: MOVE"},
+               {nullptr, "TYPE ON THE KEYBOARD TO RENAME"},
+               {"r", "BACK"},
+               {nullptr, "START: PLAY"}};
+    } else if (InSection()) {
+      hints = {{nullptr, "STRUM: MOVE"},
+               {"g", IsListChoice(SelectedRow()) ? "SELECT" : "CHANGE"},
+               {"r", "BACK"},
+               {nullptr, "START: PLAY"}};
+    } else {
+      hints = {{nullptr, "STRUM: MOVE"}, {"g", "SELECT"}, {nullptr, "START: PLAY"}};
+    }
+    float size = 19.0f * l.scale;
+    float icon = size * 1.5f;
+    float gap = 30.0f * l.scale;
+    float total = 0;
+    for (const auto& hint : hints) {
+      total += ui_.TextWidth(UiFont::kHub, hint.text, size) + (hint.icon ? icon : 0);
+    }
+    total += gap * float(hints.size() - 1);
+
+    float bar_h = 44.0f * l.scale;
+    float bar_y = display.y - bar_h - 14.0f * l.scale;
+    draw->AddRectFilledMultiColor(ImVec2(0, bar_y), ImVec2(display.x, bar_y + bar_h),
+                                  IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+                                  IM_COL32(0, 0, 0, 140), IM_COL32(0, 0, 0, 140));
+    float x = l.cx - total * 0.5f;
+    float y = bar_y + (bar_h - size) * 0.5f;
+    for (const auto& hint : hints) {
+      if (hint.icon) {
+        ui_.DrawText(draw, UiFont::kButtons, hint.icon, icon, x, y + (size - icon) * 0.5f,
+                     IM_COL32_WHITE);
+        x += icon;
+      }
+      ui_.DrawTextShadowed(draw, UiFont::kHub, hint.text, size, x, y, kUiText);
+      x += ui_.TextWidth(UiFont::kHub, hint.text, size) + gap;
+    }
+  }
+
   Rb3UiRenderer ui_;
   LauncherHooks hooks_;
   MenuPads pads_;
@@ -796,5 +1061,20 @@ class Launcher final : public rex::ui::ImGuiDialog {
 };
 
 }  // namespace
+
+bool ShouldShowLauncher() {
+  // A boot handed over from the other executable has been through it already.
+  return REXCVAR_GET(show_launcher) && REXCVAR_GET(debug_input_script).empty() &&
+         !LaunchedByOtherExecutable();
+}
+
+bool LauncherActive() { return g_launcher_active; }
+
+std::unique_ptr<rex::ui::ImGuiDialog> CreateLauncher(
+    rex::ui::ImGuiDrawer* drawer, std::function<rex::ui::ImmediateDrawer*()> immediate_drawer,
+    std::filesystem::path game_root, LauncherHooks hooks) {
+  return std::make_unique<Launcher>(drawer, std::move(immediate_drawer), std::move(game_root),
+                                    std::move(hooks));
+}
 
 }  // namespace rb3pc
