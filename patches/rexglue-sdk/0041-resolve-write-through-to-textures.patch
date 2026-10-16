@@ -460,3 +460,468 @@
    }
  
    // Use true null descriptors when supported; otherwise, keep compatibility
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -284,6 +284,11 @@
+       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
+   std::array<VkPipeline, size_t(draw_util::ResolveCopyShaderIndex::kCount)>
+       resolve_copy_pipelines_{};
++  // kFast32bpp1x2xMSAA and a part of kFull32bpp with resolution scaling, also
++  // writing the texture (VulkanTextureCache::ResolveWriteThrough).
++  VkPipelineLayout resolve_write_through_pipeline_layout_ = VK_NULL_HANDLE;
++  VkPipeline resolve_write_through_pipeline_ = VK_NULL_HANDLE;
++  VkPipeline resolve_write_through_full_pipeline_ = VK_NULL_HANDLE;
+ 
+   // On the fragment shader interlock path, the render pass key is used purely
+   // for passing parameters to pipeline setup - there's always only one render
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -38,6 +38,8 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DECLARE(bool, vulkan_resolve_write_through_verify);
++
+ REXCVAR_DEFINE_BOOL(vulkan_skip_overwritten_transfers, true, "GPU/Vulkan",
+                     "With host render targets, skip copying the EDRAM contents into a render "
+                     "target for a draw that overwrites all of them (a screen-space rectangle "
+@@ -657,6 +659,284 @@
+     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+   }
+ 
++  // Resolution-scaled 32bpp resolves also writing the texture. Ports of
++  // resolve_fast_32bpp_1x2xmsaa_scaled and of the k_8_8_8_8 to k_8_8_8_8 part
++  // of resolve_full_32bpp_scaled as built for this SDK (1x and 2x MSAA samples
++  // being horizontally contiguous in the EDRAM), with the texture written
++  // through its r32ui storage view, as the fused texture load would.
++  if (draw_resolution_scaled) {
++    VkDescriptorSetLayout write_through_set_layouts[] = {
++        descriptor_set_layout_storage_buffer_,
++        command_processor_.GetSingleTransientDescriptorLayout(
++            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute),
++        command_processor_.GetSingleTransientDescriptorLayout(
++            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute)};
++    VkPushConstantRange write_through_push_constant_range = {
++        VK_SHADER_STAGE_COMPUTE_BIT, 0,
++        sizeof(draw_util::ResolveCopyShaderConstants::DestRelative) + sizeof(uint32_t) * 4};
++    VkPipelineLayoutCreateInfo write_through_layout_info = {};
++    write_through_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    write_through_layout_info.setLayoutCount = uint32_t(rex::countof(write_through_set_layouts));
++    write_through_layout_info.pSetLayouts = write_through_set_layouts;
++    write_through_layout_info.pushConstantRangeCount = 1;
++    write_through_layout_info.pPushConstantRanges = &write_through_push_constant_range;
++    static constexpr const char kWriteThroughSource[] = R"(#version 450
++// XE_FULL 0: kFast32bpp1x2xMSAA, 1 invocation = 8 host pixels.
++// XE_FULL 1: kFull32bpp from k_8_8_8_8(_GAMMA) to k_8_8_8_8, 1 invocation = 4
++// host pixels.
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(push_constant) uniform Constants {
++  uint edram_info;
++  uint coordinate_info;
++  uint dest_info;
++  uint dest_coordinate_info;
++  // Texture endianness in 0:1, write the buffer in 2, write the image in 3,
++  // VulkanTextureCache::FusedLoadTransform in 4:5.
++  uint texture_info;
++  // Scaled.
++  uint texture_width;
++  uint texture_height;
++  // Of the destination base within the texture, scaled, X in 0:15, Y in 16:31.
++  uint texture_origin;
++} c;
++layout(std430, set = 0, binding = 0) readonly buffer Edram { uvec4 edram[]; };
++layout(std430, set = 1, binding = 0) writeonly buffer Dest { uvec4 dest[]; };
++layout(set = 2, binding = 0, r32ui) uniform writeonly uimage2D tex;
++
++int TiledOffset2D(ivec2 p, uint pitch_aligned, uint bpb_log2) {
++  int macro = ((p.x >> 5) + (p.y >> 5) * int(pitch_aligned >> 5u)) << (bpb_log2 + 7u);
++  int micro = ((p.x & 7) + ((p.y & 14) << 2)) << bpb_log2;
++  int offset = macro + ((micro & ~15) << 1) + (micro & 15) + ((p.y & 1) << 4);
++  return ((offset & ~511) << 3) + ((p.y & 16) << 7) + ((offset & 448) << 2) +
++         (((((p.y & 8) >> 2) + (p.x >> 3)) & 3) << 6) + (offset & 63);
++}
++
++// Resolution-scaled layout: each 16-byte (4-pixel) group of guest memory
++// holds scale.x * scale.y host groups of 4 pixels, column-major.
++uint DestAddress(uvec2 host, uvec2 scale, uint pitch_aligned) {
++  uvec2 host_group = uvec2(host.x >> 2u, host.y);
++  uvec2 guest_group = host_group / scale;
++  uvec2 group_in_guest = host_group - guest_group * scale;
++  uint address =
++      uint(TiledOffset2D(ivec2(guest_group.x << 2u, guest_group.y), pitch_aligned, 2u));
++  return address * (scale.x * scale.y) + ((group_in_guest.x * scale.y + group_in_guest.y) << 4u);
++}
++
++uvec4 EndianSwap32(uvec4 v, uint endian) {
++  if (endian == 1u || endian == 2u) {
++    v = ((v & 0x00FF00FFu) << 8u) | ((v & 0xFF00FF00u) >> 8u);
++  }
++  if (endian == 2u || endian == 3u) {
++    v = (v << 16u) | (v >> 16u);
++  }
++  return v;
++}
++
++uvec4 Float20e4To32(uvec4 f24u32) {
++  uvec4 mantissa = f24u32 & 0xFFFFFu;
++  uvec4 exponent = f24u32 >> 20u;
++  bvec4 is_denormalized = equal(exponent, uvec4(0u));
++  uvec4 mantissa_lzcnt = uvec4(20u) - uvec4(findMSB(mantissa));
++  exponent = mix(exponent, uvec4(1u) - mantissa_lzcnt, is_denormalized);
++  mantissa = mix(mantissa, (mantissa << mantissa_lzcnt) & 0xFFFFFu, is_denormalized);
++  return mix(((exponent + 112u) << 23u) | (mantissa << 3u), uvec4(0u),
++             equal(f24u32, uvec4(0u)));
++}
++
++uvec2 ResolutionScale() { return (uvec2(c.coordinate_info) >> uvec2(16u, 19u)) & 7u; }
++
++uvec2 HalfPixelFill() {
++  return (c.edram_info & (1u << 29u)) != 0u ? (uvec2(c.coordinate_info) >> uvec2(17u, 20u)) & 3u
++                                            : uvec2(0u);
++}
++
++// Index of the dword with the first needed sample of the pixel in the EDRAM,
++// with 1x and 2x MSAA samples of horizontally adjacent pixels being adjacent.
++uint SourceDword(uvec2 pixel_index) {
++  uvec2 scale = ResolutionScale();
++  uint pitch_tiles = c.edram_info & 1023u;
++  uint msaa_samples = (c.edram_info >> 10u) & 3u;
++  bool is_depth = (c.edram_info & (1u << 12u)) != 0u;
++  uint base_tiles = (c.edram_info >> 13u) & 2047u;
++  uint sample_select = (c.dest_coordinate_info >> 28u) & 7u;
++  if (sample_select > 3u) {
++    sample_select = sample_select == 5u ? 2u : 0u;
++  }
++  uvec2 edram_offset =
++      uvec2((c.coordinate_info & 15u) << 3u, ((c.coordinate_info >> 4u) & 1u) << 3u) * scale;
++  uvec2 sample_position =
++      edram_offset + uvec2(pixel_index.x, max(HalfPixelFill().y, pixel_index.y));
++  sample_position <<= uvec2(msaa_samples >= 2u ? 1u : 0u, msaa_samples >= 1u ? 1u : 0u);
++  sample_position += uvec2((sample_select >> 1u) & 1u, sample_select & 1u);
++  uvec2 tile_size = scale * uvec2(80u, 16u);
++  uvec2 tile_offset = sample_position / tile_size;
++  base_tiles += tile_offset.y * pitch_tiles + tile_offset.x;
++  sample_position -= tile_offset * tile_size;
++  if (is_depth) {
++    uint tile_width_half = tile_size.x >> 1u;
++    sample_position.x = sample_position.x >= tile_width_half
++                            ? sample_position.x - tile_width_half
++                            : sample_position.x + tile_width_half;
++  }
++  uint tile_dwords = tile_size.x * tile_size.y;
++  return (base_tiles * tile_dwords + sample_position.y * tile_size.x + sample_position.x) %
++         (tile_dwords * 2048u);
++}
++
++// The group of 4 pixels (already in the destination endianness) to the buffer
++// and, as loaded, to the texture.
++void StoreGroup(uvec2 group_position, uvec4 stored) {
++  if ((c.texture_info & 4u) != 0u) {
++    dest[DestAddress(group_position, ResolutionScale(), (c.dest_coordinate_info & 1023u) << 5u) >>
++         4u] = stored;
++  }
++  uvec2 texel_position = group_position + (uvec2(c.texture_origin) >> uvec2(0u, 16u) & 0xFFFFu);
++  if ((c.texture_info & 8u) != 0u && texel_position.y < c.texture_height) {
++    uvec4 texels = EndianSwap32(stored, c.texture_info & 3u);
++    // As loaded (24-bit depth in the upper bits as unorm or float).
++    uint transform = (c.texture_info >> 4u) & 3u;
++    if (transform == 1u) {
++      texels = floatBitsToUint(vec4((texels >> 8u) + (texels >> 31u)) * (1.0 / 16777216.0));
++    } else if (transform == 2u) {
++      texels = Float20e4To32(texels >> 8u);
++    }
++    for (uint i = 0u; i < 4u; ++i) {
++      if (texel_position.x + i < c.texture_width) {
++        imageStore(tex, ivec2(texel_position.x + i, texel_position.y),
++                   uvec4(texels[i], 0u, 0u, 0u));
++      }
++    }
++  }
++}
++
++uvec2 DestPosition(uvec2 pixel_index) {
++  return (((uvec2(c.dest_coordinate_info) >> uvec2(20u, 24u)) & 15u) << 3u) * ResolutionScale() +
++         pixel_index;
++}
++
++#if XE_FULL
++
++vec4 UnpackR8G8B8A8UNorm(uint packed) {
++  return vec4(uvec4(packed, packed >> 8u, packed >> 16u, packed >> 24u) & 255u) *
++         (1.0 / 255.0);
++}
++
++uint PackR8G8B8A8UNorm(vec4 value) {
++  uvec4 packed = uvec4(clamp(value, 0.0, 1.0) * 255.0 + 0.5);
++  return packed.x | (packed.y << 8u) | (packed.z << 16u) | (packed.w << 24u);
++}
++
++void main() {
++  uvec2 scale = ResolutionScale();
++  uvec2 pixel_index = uvec2(gl_GlobalInvocationID.x << 2u, gl_GlobalInvocationID.y);
++  if (pixel_index.x >= ((c.coordinate_info >> 5u) & 2047u) * scale.x * 8u) {
++    return;
++  }
++  uint source_dword = SourceDword(pixel_index);
++  uvec4 source = edram[source_dword >> 2u];
++  vec4 pixels[4];
++  for (uint i = 0u; i < 4u; ++i) {
++    pixels[i] = UnpackR8G8B8A8UNorm(source[i]);
++  }
++  float factor =
++      uintBitsToFloat(uint(((int(c.dest_info) << 10) >> 26) << 23) + 0x3F800000u);
++  if (((c.dest_coordinate_info >> 28u) & 7u) >= 4u) {
++    // Average of samples 0 and 1, the second 2x sample being in the next row.
++    factor *= 0.5;
++    source = edram[(source_dword + 80u * scale.x) >> 2u];
++    for (uint i = 0u; i < 4u; ++i) {
++      pixels[i] += UnpackR8G8B8A8UNorm(source[i]);
++    }
++  }
++  bool dest_swap = (c.dest_info & (1u << 24u)) != 0u;
++  uvec4 packed;
++  for (uint i = 0u; i < 4u; ++i) {
++    vec4 pixel = pixels[i] * factor;
++    if (dest_swap) {
++      pixel = pixel.zyxw;
++    }
++    packed[i] = PackR8G8B8A8UNorm(pixel);
++  }
++  uvec2 half_pixel_fill = HalfPixelFill();
++  if (pixel_index.x == 0u && half_pixel_fill.x != 0u) {
++    if (half_pixel_fill.x >= 2u) {
++      if (half_pixel_fill.x >= 3u) {
++        packed.z = packed.w;
++      }
++      packed.y = packed.z;
++    }
++    packed.x = packed.y;
++  }
++  StoreGroup(DestPosition(pixel_index), EndianSwap32(packed, c.dest_info & 7u));
++}
++
++#else
++
++uvec4 SwapRedBlue(uvec4 v, uint format) {
++  if (format <= 1u) {
++    return (v & ~0xFF00FFu) | ((v & 0xFFu) << 16u) | ((v >> 16u) & 0xFFu);
++  }
++  if (format == 2u || format == 3u || format == 10u || format == 12u) {
++    return (v & ~0x3FF003FFu) | ((v & 0x3FFu) << 20u) | ((v >> 20u) & 0x3FFu);
++  }
++  return v;
++}
++
++void main() {
++  uvec2 scale = ResolutionScale();
++  if (gl_GlobalInvocationID.x >= ((c.coordinate_info >> 5u) & 2047u) * scale.x) {
++    return;
++  }
++  uvec2 pixel_index = uvec2(gl_GlobalInvocationID.x << 3u, gl_GlobalInvocationID.y);
++  uint source_index = SourceDword(pixel_index) >> 2u;
++  uvec4 pixels[2];
++  pixels[0] = edram[source_index];
++  pixels[1] = edram[source_index + 1u];
++  uvec2 half_pixel_fill = HalfPixelFill();
++  if (pixel_index.x == 0u && half_pixel_fill.x != 0u) {
++    if (half_pixel_fill.x >= 2u) {
++      if (half_pixel_fill.x >= 3u) {
++        pixels[0].z = pixels[0].w;
++      }
++      pixels[0].y = pixels[0].z;
++    }
++    pixels[0].x = pixels[0].y;
++  }
++  if ((c.dest_info & (1u << 24u)) != 0u) {
++    uint edram_format = (c.edram_info >> 24u) & 15u;
++    pixels[0] = SwapRedBlue(pixels[0], edram_format);
++    pixels[1] = SwapRedBlue(pixels[1], edram_format);
++  }
++  uvec2 dest_position = DestPosition(pixel_index);
++  uint dest_endian = c.dest_info & 7u;
++  StoreGroup(dest_position, EndianSwap32(pixels[0], dest_endian));
++  StoreGroup(dest_position + uvec2(4u, 0u), EndianSwap32(pixels[1], dest_endian));
++}
++
++#endif
++)";
++    if (dfn.vkCreatePipelineLayout(device, &write_through_layout_info, nullptr,
++                                   &resolve_write_through_pipeline_layout_) == VK_SUCCESS) {
++      for (uint32_t full = 0; full <= 1; ++full) {
++        std::string source = kWriteThroughSource;
++        source.insert(source.find('\n') + 1, full ? "#define XE_FULL 1\n" : "#define XE_FULL 0\n");
++        std::vector<uint32_t> spirv;
++        std::string error;
++        if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source, spirv,
++                                                   error)) {
++          REXGPU_WARN(
++              "VulkanRenderTargetCache: Failed to compile the resolve write-through shader: {}",
++              error);
++          continue;
++        }
++        (full ? resolve_write_through_full_pipeline_ : resolve_write_through_pipeline_) =
++            ui::vulkan::util::CreateComputePipeline(vulkan_device,
++                                                    resolve_write_through_pipeline_layout_,
++                                                    spirv.data(), spirv.size() * sizeof(uint32_t));
++      }
++    }
++  }
++
+   if (path_ == Path::kHostRenderTargets) {
+     // Host render targets.
+ 
+@@ -1084,6 +1364,12 @@
+   for (VkPipeline& resolve_copy_pipeline : resolve_copy_pipelines_) {
+     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, resolve_copy_pipeline);
+   }
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
++                                         resolve_write_through_pipeline_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
++                                         resolve_write_through_full_pipeline_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
++                                         resolve_write_through_pipeline_layout_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                          resolve_copy_pipeline_layout_);
+ 
+@@ -1268,6 +1554,58 @@
+           write_descriptor_set_dest.pTexelBufferView = nullptr;
+           dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0, nullptr);
+ 
++          // Write the texture loaded from the destination directly too if
++          // possible.
++          VkPipeline write_through_pipeline = VK_NULL_HANDLE;
++          if (draw_resolution_scaled && !resolve_info.copy_dest_info.copy_dest_array) {
++            if (copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA) {
++              write_through_pipeline = resolve_write_through_pipeline_;
++            } else if (copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp &&
++                       !resolve_info.IsCopyingDepth()) {
++              // Only the conversion RB3 uses: 1x, 2x MSAA samples 0 or 1, or
++              // the average of 2x MSAA samples, from k_8_8_8_8(_GAMMA) to
++              // k_8_8_8_8.
++              draw_util::ResolveEdramInfo edram_info = resolve_info.color_edram_info;
++              xenos::CopySampleSelect sample_select =
++                  resolve_info.copy_dest_coordinate_info.copy_sample_select;
++              bool samples_supported =
++                  edram_info.msaa_samples == xenos::MsaaSamples::k1X
++                      ? sample_select == xenos::CopySampleSelect::k0
++                      : edram_info.msaa_samples == xenos::MsaaSamples::k2X &&
++                            (sample_select == xenos::CopySampleSelect::k0 ||
++                             sample_select == xenos::CopySampleSelect::k1 ||
++                             sample_select == xenos::CopySampleSelect::k01);
++              if (samples_supported && !edram_info.format_is_64bpp &&
++                  (xenos::ColorRenderTargetFormat(edram_info.format) ==
++                       xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
++                   xenos::ColorRenderTargetFormat(edram_info.format) ==
++                       xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) &&
++                  resolve_info.copy_dest_info.copy_dest_format ==
++                      xenos::ColorFormat::k_8_8_8_8) {
++                write_through_pipeline = resolve_write_through_full_pipeline_;
++              }
++            }
++          }
++          VulkanTextureCache::ResolveWriteThrough write_through;
++          bool write_through_used =
++              write_through_pipeline != VK_NULL_HANDLE &&
++              texture_cache.BeginResolveWriteThrough(
++                  resolve_info.copy_dest_base,
++                  resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 << 5,
++                  write_through);
++          bool write_through_verify =
++              write_through_used && REXCVAR_GET(vulkan_resolve_write_through_verify);
++          uint32_t write_through_constants[8];
++          if (write_through_used) {
++            std::memcpy(write_through_constants, &copy_shader_constants.dest_relative,
++                        sizeof(copy_shader_constants.dest_relative));
++            write_through_constants[4] = write_through.endian | (write_through_verify ? 0 : 4) | 8 |
++                                         (write_through.transform << 4);
++            write_through_constants[5] = write_through.width;
++            write_through_constants[6] = write_through.height;
++            write_through_constants[7] = write_through.origin_x | (write_through.origin_y << 16);
++          }
++
+           // Submit the resolve.
+           if (draw_resolution_scaled) {
+             texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
+@@ -1277,34 +1615,62 @@
+                                                             uint32_t(copy_dest_use_length)));
+           }
+           UseEdramBuffer(EdramBufferUsage::kComputeRead);
+-          command_processor_.BindExternalComputePipeline(
+-              resolve_copy_pipelines_[size_t(copy_shader)]);
+-          VkDescriptorSet descriptor_sets[kResolveCopyDescriptorSetCount] = {};
+-          descriptor_sets[kResolveCopyDescriptorSetEdram] = edram_storage_buffer_descriptor_set_;
+-          descriptor_sets[kResolveCopyDescriptorSetDest] = descriptor_set_dest;
+-          command_buffer.CmdVkBindDescriptorSets(
+-              VK_PIPELINE_BIND_POINT_COMPUTE, resolve_copy_pipeline_layout_, 0,
+-              uint32_t(rex::countof(descriptor_sets)), descriptor_sets, 0, nullptr);
+-          if (draw_resolution_scaled) {
+-            command_buffer.CmdVkPushConstants(
+-                resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+-                sizeof(copy_shader_constants.dest_relative), &copy_shader_constants.dest_relative);
++          auto bind_write_through = [&]() {
++            VkDescriptorSet write_through_sets[] = {edram_storage_buffer_descriptor_set_,
++                                                    descriptor_set_dest,
++                                                    write_through.image_descriptor_set};
++            command_processor_.BindExternalComputePipeline(write_through_pipeline);
++            command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                                   resolve_write_through_pipeline_layout_, 0,
++                                                   uint32_t(rex::countof(write_through_sets)),
++                                                   write_through_sets, 0, nullptr);
++            command_buffer.CmdVkPushConstants(resolve_write_through_pipeline_layout_,
++                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                              sizeof(write_through_constants),
++                                              write_through_constants);
++          };
++          if (write_through_used && !write_through_verify) {
++            bind_write_through();
+           } else {
+-            // TODO(Triang3l): Proper dest_base in case of one 512 MB shared
+-            // memory binding, or multiple shared memory bindings in case of
+-            // splitting due to maxStorageBufferRange overflow.
+-            copy_shader_constants.dest_base -=
+-                uint32_t(write_descriptor_set_dest_buffer_info.offset);
+-            command_buffer.CmdVkPushConstants(
+-                resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+-                sizeof(copy_shader_constants), &copy_shader_constants);
++            command_processor_.BindExternalComputePipeline(
++                resolve_copy_pipelines_[size_t(copy_shader)]);
++            VkDescriptorSet descriptor_sets[kResolveCopyDescriptorSetCount] = {};
++            descriptor_sets[kResolveCopyDescriptorSetEdram] = edram_storage_buffer_descriptor_set_;
++            descriptor_sets[kResolveCopyDescriptorSetDest] = descriptor_set_dest;
++            command_buffer.CmdVkBindDescriptorSets(
++                VK_PIPELINE_BIND_POINT_COMPUTE, resolve_copy_pipeline_layout_, 0,
++                uint32_t(rex::countof(descriptor_sets)), descriptor_sets, 0, nullptr);
++            if (draw_resolution_scaled) {
++              command_buffer.CmdVkPushConstants(
++                  resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                  sizeof(copy_shader_constants.dest_relative), &copy_shader_constants.dest_relative);
++            } else {
++              // TODO(Triang3l): Proper dest_base in case of one 512 MB shared
++              // memory binding, or multiple shared memory bindings in case of
++              // splitting due to maxStorageBufferRange overflow.
++              copy_shader_constants.dest_base -=
++                  uint32_t(write_descriptor_set_dest_buffer_info.offset);
++              command_buffer.CmdVkPushConstants(
++                  resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                  sizeof(copy_shader_constants), &copy_shader_constants);
++            }
+           }
+           command_processor_.SubmitBarriers(true);
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
++          if (write_through_verify) {
++            // The same resolve again, writing only the texture, compared with
++            // the buffer written the usual way.
++            bind_write_through();
++            command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
++            texture_cache.VerifyResolveWriteThrough(write_through);
++          }
+ 
+           // Invalidate textures and mark the range as scaled if needed.
+           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                             resolve_info.copy_dest_extent_length);
++          if (write_through_used) {
++            texture_cache.EndResolveWriteThrough(write_through);
++          }
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
