@@ -1,0 +1,478 @@
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -231,6 +231,8 @@
+     // directly into the texture (while also writing them to memory), mark the
+     // base as up to date again and watch it. The mips aren't touched.
+     void MakeBaseUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
++    // The same for a mip level written directly, the other mips not changed.
++    void MakeMipsUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+ 
+     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+ 
+@@ -562,6 +564,14 @@
+     auto global_lock = global_critical_region_.Acquire();
+     texture.MakeBaseUpToDateAndWatch(global_lock);
+   }
++  bool IsTextureMipsOutdated(const Texture& texture) {
++    auto global_lock = global_critical_region_.Acquire();
++    return texture.mips_outdated(global_lock);
++  }
++  void MakeTextureMipsUpToDateAndWatch(Texture& texture) {
++    auto global_lock = global_critical_region_.Acquire();
++    texture.MakeMipsUpToDateAndWatch(global_lock);
++  }
+ 
+  private:
+   struct PendingTextureLoad {
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -768,6 +768,21 @@
+   outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+ }
+ 
++void TextureCache::Texture::MakeMipsUpToDateAndWatch(
++    const std::unique_lock<std::recursive_mutex>& global_lock) {
++  if (!mips_outdated_) {
++    return;
++  }
++  SharedMemory& shared_memory = texture_cache().shared_memory();
++  if (!shared_memory.IsRangeValid(key().mip_page << 12, GetGuestMipsSize())) {
++    return;
++  }
++  mips_outdated_ = false;
++  mips_watch_handle_ = shared_memory.WatchMemoryRange(
++      key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
++  outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
++}
++
+ void TextureCache::Texture::MarkAsUsed() {
+   if (!in_usage_list_) {
+     return;
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -11,7 +11,6 @@
+  */
+ 
+ #include <array>
+-#include <map>
+ #include <chrono>
+ #include <memory>
+ #include <unordered_map>
+@@ -133,15 +132,18 @@
+   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
+   void UseScaledResolveBufferForRead();
+ 
+-  // Writing a resolution-scaled 32bpp resolve also directly into the texture
+-  // last loaded from the destination (if it's up to date otherwise), so it
+-  // doesn't need to be loaded from the scaled resolve buffer again.
++  // Writing a resolution-scaled 32bpp resolve also directly into the textures
++  // loaded from the destination (base or mip levels, if they're up to date
++  // otherwise), so they don't need to be loaded from the scaled resolve buffer
++  // again.
+  private:
+   class VulkanTexture;
+ 
+  public:
+-  struct ResolveWriteThrough {
++  struct ResolveWriteThroughTarget {
+     VulkanTexture* texture;
++    // 0 for the base, otherwise one of the mips.
++    uint32_t level;
+     VkDescriptorSet image_descriptor_set;
+     // Endianness in bits 0:1 (like the fused load).
+     uint32_t endian;
+@@ -150,18 +152,26 @@
+     // Scaled.
+     uint32_t width;
+     uint32_t height;
+-    // Of the destination base within the texture, scaled.
++    // Of the destination base within the level, scaled.
+     uint32_t origin_x;
+     uint32_t origin_y;
+   };
+-  // Inserts the barrier for writing the image if returning true.
++  // Multiple textures may be loaded from the same memory (RB3's bloom mips are
++  // sampled with different mip ranges).
++  static constexpr uint32_t kMaxResolveWriteThroughTargets = 4;
++  struct ResolveWriteThrough {
++    uint32_t target_count;
++    ResolveWriteThroughTarget targets[kMaxResolveWriteThroughTargets];
++  };
++  // Inserts the barriers for writing the images if returning true.
+   bool BeginResolveWriteThrough(uint32_t dest_base, uint32_t dest_pitch_blocks,
++                                uint32_t dest_extent_start, uint32_t dest_extent_length,
+                                 ResolveWriteThrough& write_through_out);
+-  // After the resolve has been marked in memory (invalidating the texture).
++  // After the resolve has been marked in memory (invalidating the textures).
+   void EndResolveWriteThrough(const ResolveWriteThrough& write_through);
+   // Compares the written image with the scaled resolve buffer
+   // (vulkan_resolve_write_through_verify).
+-  void VerifyResolveWriteThrough(const ResolveWriteThrough& write_through);
++  void VerifyResolveWriteThrough(const ResolveWriteThroughTarget& target);
+   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
+                                       uint64_t written_length_scaled);
+ 
+@@ -411,13 +421,14 @@
+   bool TryLoadScaledResolveFused(VulkanTexture& texture, LoadShaderIndex load_shader,
+                                  const HostFormat& host_format, uint32_t level_first,
+                                  uint32_t level_last);
+-  // Textures whose base level was last loaded with the fused load, by base
+-  // page, for resolve write-through.
++  // Textures whose levels have been loaded with the fused load, for resolve
++  // write-through.
+   struct ResolveWriteThroughTexture {
+-    VulkanTexture* texture;
+     FusedLoadTransform transform;
++    bool base;
++    bool mips;
+   };
+-  std::map<uint32_t, ResolveWriteThroughTexture> resolve_write_through_textures_;
++  std::unordered_map<VulkanTexture*, ResolveWriteThroughTexture> resolve_write_through_textures_;
+   VkPipelineLayout resolve_write_through_verify_pipeline_layout_ = VK_NULL_HANDLE;
+   VkPipeline resolve_write_through_verify_pipeline_ = VK_NULL_HANDLE;
+   VkBuffer resolve_write_through_verify_buffer_ = VK_NULL_HANDLE;
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -2107,106 +2107,150 @@
+                                       sizeof(load.constants), load.constants);
+     command_buffer.CmdVkDispatch((load.constants[2] + 31) / 32, (load.constants[3] + 15) / 16, 1);
+   }
+-  if (level_first == 0) {
+-    resolve_write_through_textures_[texture_key.base_page] = {&texture, transform};
+-  }
++  ResolveWriteThroughTexture& write_through_texture = resolve_write_through_textures_[&texture];
++  write_through_texture.transform = transform;
++  write_through_texture.base |= level_first == 0;
++  write_through_texture.mips |= level_last > 0;
+   return true;
+ }
+ 
+ bool VulkanTextureCache::BeginResolveWriteThrough(uint32_t dest_base, uint32_t dest_pitch_blocks,
++                                                  uint32_t dest_extent_start,
++                                                  uint32_t dest_extent_length,
+                                                   ResolveWriteThrough& write_through_out) {
+-  if (!REXCVAR_GET(vulkan_resolve_write_through) || (dest_base & 0xFFF)) {
+-    return false;
+-  }
+-  // The destination may also be within the texture (RB3 resolves some images
+-  // in two halves).
+-  auto it = resolve_write_through_textures_.upper_bound(dest_base >> 12);
+-  if (it == resolve_write_through_textures_.begin()) {
+-    return false;
+-  }
+-  --it;
+-  VulkanTexture& texture = *it->second.texture;
+-  uint32_t dest_offset = dest_base - (it->first << 12);
+-  if (dest_offset >= texture.GetGuestBaseSize()) {
+-    return false;
+-  }
+-  // Only if what's in the texture is current, then the parts not resolved
+-  // stay current too.
+-  if ((texture.outdated_mask() & Texture::kOutdatedBitBase) || IsTextureBaseOutdated(texture)) {
+-    return false;
+-  }
+-  TextureKey texture_key = texture.key();
+-  if (texture.guest_layout().base.row_pitch_bytes / 4 != dest_pitch_blocks) {
+-    return false;
+-  }
++  write_through_out.target_count = 0;
+   // Whole 32x32 macro tiles of 32bpp blocks are 4 KB, the tiled address
+   // offsets of the rest of the coordinates are the same within each.
+-  uint32_t dest_offset_macro_tiles = dest_offset >> 12;
+   uint32_t pitch_macro_tiles = dest_pitch_blocks >> 5;
+-  if (!pitch_macro_tiles) {
+-    return false;
+-  }
+-  VkImageView storage_view = texture.GetStorageLoadView(0);
+-  if (storage_view == VK_NULL_HANDLE) {
+-    return false;
+-  }
+-  VkDescriptorSet image_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+-      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
+-  if (image_descriptor_set == VK_NULL_HANDLE) {
++  if (!REXCVAR_GET(vulkan_resolve_write_through) || (dest_base & 0xFFF) || !pitch_macro_tiles) {
+     return false;
+   }
+-  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+-  VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, storage_view, VK_IMAGE_LAYOUT_GENERAL};
+-  VkWriteDescriptorSet write = {};
+-  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-  write.dstSet = image_descriptor_set;
+-  write.descriptorCount = 1;
+-  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+-  write.pImageInfo = &image_info;
+-  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0,
+-                                                    nullptr);
++  uint32_t dest_extent_end = dest_extent_start + dest_extent_length;
++  for (auto& texture_pair : resolve_write_through_textures_) {
++    if (write_through_out.target_count >= kMaxResolveWriteThroughTargets) {
++      break;
++    }
++    VulkanTexture& texture = *texture_pair.first;
++    TextureKey texture_key = texture.key();
++    const texture_util::TextureGuestLayout& guest_layout = texture.guest_layout();
++    // The destination may also be within the level (RB3 resolves some images
++    // in two halves).
++    uint32_t level = UINT32_MAX, level_address = 0;
++    if (texture_pair.second.base && texture_key.base_page &&
++        dest_base >= (texture_key.base_page << 12) &&
++        dest_base - (texture_key.base_page << 12) < texture.GetGuestBaseSize()) {
++      level = 0;
++      level_address = texture_key.base_page << 12;
++    } else if (texture_pair.second.mips && texture_key.mip_page &&
++               dest_base >= (texture_key.mip_page << 12) &&
++               dest_base - (texture_key.mip_page << 12) < texture.GetGuestMipsSize()) {
++      // Only within one mip level, as all mips are made up to date together.
++      uint32_t level_last = std::min(uint32_t(texture_key.mip_max_level),
++                                     guest_layout.packed_level - 1);
++      for (uint32_t mip = 1; mip <= level_last; ++mip) {
++        uint32_t mip_address = (texture_key.mip_page << 12) + guest_layout.mip_offsets_bytes[mip];
++        if (dest_base >= mip_address && dest_extent_start >= mip_address &&
++            dest_extent_end <= mip_address + guest_layout.mips[mip].level_data_extent_bytes) {
++          level = mip;
++          level_address = mip_address;
++          break;
++        }
++      }
++    }
++    if (level == UINT32_MAX) {
++      continue;
++    }
++    const texture_util::TextureGuestLayout::Level& level_layout =
++        level ? guest_layout.mips[level] : guest_layout.base;
++    uint32_t dest_offset = dest_base - level_address;
++    if (level_layout.row_pitch_bytes / 4 != dest_pitch_blocks || (dest_offset & 0xFFF)) {
++      continue;
++    }
++    // Only if what's in the texture is current, then the parts not resolved
++    // stay current too.
++    if (level ? ((texture.outdated_mask() & Texture::kOutdatedBitMips) ||
++                 IsTextureMipsOutdated(texture))
++              : ((texture.outdated_mask() & Texture::kOutdatedBitBase) ||
++                 IsTextureBaseOutdated(texture))) {
++      continue;
++    }
++    VkImageView storage_view = texture.GetStorageLoadView(level);
++    if (storage_view == VK_NULL_HANDLE) {
++      continue;
++    }
++    VkDescriptorSet image_descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
++        VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
++    if (image_descriptor_set == VK_NULL_HANDLE) {
++      break;
++    }
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++    VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, storage_view, VK_IMAGE_LAYOUT_GENERAL};
++    VkWriteDescriptorSet write = {};
++    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write.dstSet = image_descriptor_set;
++    write.descriptorCount = 1;
++    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++    write.pImageInfo = &image_info;
++    vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0,
++                                                      nullptr);
+ 
+-  texture.MarkAsUsed();
+-  // Only a part may be overwritten, keep the contents.
+-  VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kStorageDestination);
+-  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+-  VkAccessFlags src_access_mask, dst_access_mask;
+-  VkImageLayout old_layout, new_layout;
+-  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+-  GetTextureUsageMasks(VulkanTexture::Usage::kStorageDestination, dst_stage_mask,
+-                       dst_access_mask, new_layout);
+-  command_processor_.PushImageMemoryBarrier(
+-      texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+-      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
+-      src_access_mask, dst_access_mask, old_layout, new_layout);
++    texture.MarkAsUsed();
++    // Only a part may be overwritten, keep the contents.
++    VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kStorageDestination);
++    VkPipelineStageFlags src_stage_mask, dst_stage_mask;
++    VkAccessFlags src_access_mask, dst_access_mask;
++    VkImageLayout old_layout, new_layout;
++    GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
++    GetTextureUsageMasks(VulkanTexture::Usage::kStorageDestination, dst_stage_mask,
++                         dst_access_mask, new_layout);
++    command_processor_.PushImageMemoryBarrier(
++        texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
++        src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
++        src_access_mask, dst_access_mask, old_layout, new_layout);
+ 
+-  write_through_out.texture = &texture;
+-  write_through_out.image_descriptor_set = image_descriptor_set;
+-  write_through_out.endian = uint32_t(texture_key.endianness);
+-  write_through_out.transform = uint32_t(it->second.transform);
+-  write_through_out.width = texture_key.GetWidth() * draw_resolution_scale_x();
+-  write_through_out.height = texture_key.GetHeight() * draw_resolution_scale_y();
+-  write_through_out.origin_x =
+-      (dest_offset_macro_tiles % pitch_macro_tiles) * 32 * draw_resolution_scale_x();
+-  write_through_out.origin_y =
+-      (dest_offset_macro_tiles / pitch_macro_tiles) * 32 * draw_resolution_scale_y();
+-  return true;
++    ResolveWriteThroughTarget& target = write_through_out.targets[write_through_out.target_count++];
++    target.texture = &texture;
++    target.level = level;
++    target.image_descriptor_set = image_descriptor_set;
++    target.endian = uint32_t(texture_key.endianness);
++    target.transform = uint32_t(texture_pair.second.transform);
++    target.width = std::max(texture_key.GetWidth() >> level, uint32_t(1)) * draw_resolution_scale_x();
++    target.height =
++        std::max(texture_key.GetHeight() >> level, uint32_t(1)) * draw_resolution_scale_y();
++    uint32_t dest_offset_macro_tiles = dest_offset >> 12;
++    target.origin_x = (dest_offset_macro_tiles % pitch_macro_tiles) * 32 * draw_resolution_scale_x();
++    target.origin_y = (dest_offset_macro_tiles / pitch_macro_tiles) * 32 * draw_resolution_scale_y();
++  }
++  return write_through_out.target_count != 0;
+ }
+ 
+ void VulkanTextureCache::EndResolveWriteThrough(const ResolveWriteThrough& write_through) {
+-  MakeTextureBaseUpToDateAndWatch(*write_through.texture);
++  for (uint32_t i = 0; i < write_through.target_count; ++i) {
++    const ResolveWriteThroughTarget& target = write_through.targets[i];
++    if (target.level) {
++      MakeTextureMipsUpToDateAndWatch(*target.texture);
++    } else {
++      MakeTextureBaseUpToDateAndWatch(*target.texture);
++    }
++  }
+ }
+ 
+-void VulkanTextureCache::VerifyResolveWriteThrough(const ResolveWriteThrough& write_through) {
++void VulkanTextureCache::VerifyResolveWriteThrough(const ResolveWriteThroughTarget& target) {
+   if (resolve_write_through_verify_pipeline_ == VK_NULL_HANDLE ||
+       !resolve_write_through_verify_mapping_) {
+     return;
+   }
+-  VulkanTexture& texture = *write_through.texture;
++  VulkanTexture& texture = *target.texture;
+   TextureKey texture_key = texture.key();
++  const texture_util::TextureGuestLayout& guest_layout = texture.guest_layout();
++  const texture_util::TextureGuestLayout::Level& level_layout =
++      target.level ? guest_layout.mips[target.level] : guest_layout.base;
++  uint32_t level_address =
++      target.level ? (texture_key.mip_page << 12) + guest_layout.mip_offsets_bytes[target.level]
++                   : texture_key.base_page << 12;
++  uint32_t level_size = target.level ? level_layout.level_data_extent_bytes : texture.GetGuestBaseSize();
+   uint64_t source_start, source_range;
+-  if (!GetScaledResolveRange(texture_key.base_page << 12, texture.GetGuestBaseSize(), 4,
+-                             source_start, source_range)) {
++  if (!GetScaledResolveRange(level_address, level_size, 4, source_start, source_range)) {
+     return;
+   }
+   VkDescriptorSet sets[3] = {
+@@ -2221,7 +2265,7 @@
+   }
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   VkDescriptorBufferInfo source_info = {scaled_resolve_buffer_, source_start, source_range};
+-  VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, texture.GetStorageLoadView(0),
++  VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, texture.GetStorageLoadView(target.level),
+                                       VK_IMAGE_LAYOUT_GENERAL};
+   VkDescriptorBufferInfo counter_info = {resolve_write_through_verify_buffer_, 0, VK_WHOLE_SIZE};
+   VkWriteDescriptorSet writes[3] = {};
+@@ -2248,10 +2292,10 @@
+   uint32_t constants[5];
+   constants[0] = (uint32_t(texture_key.endianness) << 2) | (draw_resolution_scale_x() << 4) |
+                  (draw_resolution_scale_y() << 7);
+-  constants[1] = texture.guest_layout().base.row_pitch_bytes / 4;
+-  constants[2] = write_through.width;
+-  constants[3] = write_through.height;
+-  constants[4] = write_through.transform;
++  constants[1] = level_layout.row_pitch_bytes / 4;
++  constants[2] = target.width;
++  constants[3] = target.height;
++  constants[4] = target.transform;
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+   command_processor_.BindExternalComputePipeline(resolve_write_through_verify_pipeline_);
+   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+@@ -2333,11 +2377,7 @@
+   {
+     auto& write_through_textures =
+         static_cast<VulkanTextureCache&>(texture_cache()).resolve_write_through_textures_;
+-    auto write_through_it = write_through_textures.find(key().base_page);
+-    if (write_through_it != write_through_textures.end() &&
+-        write_through_it->second.texture == this) {
+-      write_through_textures.erase(write_through_it);
+-    }
++    write_through_textures.erase(this);
+   }
+   const VulkanTextureCache& vulkan_texture_cache =
+       static_cast<const VulkanTextureCache&>(texture_cache());
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1636,19 +1636,10 @@
+               texture_cache.BeginResolveWriteThrough(
+                   resolve_info.copy_dest_base,
+                   resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 << 5,
++                  resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+                   write_through);
+           bool write_through_verify =
+               write_through_used && REXCVAR_GET(vulkan_resolve_write_through_verify);
+-          uint32_t write_through_constants[8];
+-          if (write_through_used) {
+-            std::memcpy(write_through_constants, &copy_shader_constants.dest_relative,
+-                        sizeof(copy_shader_constants.dest_relative));
+-            write_through_constants[4] = write_through.endian | (write_through_verify ? 0 : 4) | 8 |
+-                                         (write_through.transform << 4);
+-            write_through_constants[5] = write_through.width;
+-            write_through_constants[6] = write_through.height;
+-            write_through_constants[7] = write_through.origin_x | (write_through.origin_y << 16);
+-          }
+ 
+           // Submit the resolve.
+           if (draw_resolution_scaled) {
+@@ -1659,10 +1650,21 @@
+                                                             uint32_t(copy_dest_use_length)));
+           }
+           UseEdramBuffer(EdramBufferUsage::kComputeRead);
+-          auto bind_write_through = [&]() {
++          // Only the first target also writes the buffer.
++          auto bind_write_through = [&](uint32_t target_index, bool write_buffer) {
++            const VulkanTextureCache::ResolveWriteThroughTarget& target =
++                write_through.targets[target_index];
++            uint32_t write_through_constants[8];
++            std::memcpy(write_through_constants, &copy_shader_constants.dest_relative,
++                        sizeof(copy_shader_constants.dest_relative));
++            write_through_constants[4] =
++                target.endian | (write_buffer ? 4 : 0) | 8 | (target.transform << 4);
++            write_through_constants[5] = target.width;
++            write_through_constants[6] = target.height;
++            write_through_constants[7] = target.origin_x | (target.origin_y << 16);
+             VkDescriptorSet write_through_sets[] = {edram_storage_buffer_descriptor_set_,
+                                                     descriptor_set_dest,
+-                                                    write_through.image_descriptor_set};
++                                                    target.image_descriptor_set};
+             command_processor_.BindExternalComputePipeline(write_through_pipeline);
+             command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                    resolve_write_through_pipeline_layout_, 0,
+@@ -1674,7 +1676,7 @@
+                                               write_through_constants);
+           };
+           if (write_through_used && !write_through_verify) {
+-            bind_write_through();
++            bind_write_through(0, true);
+           } else {
+             command_processor_.BindExternalComputePipeline(
+                 resolve_copy_pipelines_[size_t(copy_shader)]);
+@@ -1701,12 +1703,16 @@
+           }
+           command_processor_.SubmitBarriers(true);
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+-          if (write_through_verify) {
+-            // The same resolve again, writing only the texture, compared with
+-            // the buffer written the usual way.
+-            bind_write_through();
++          // The other textures, and, for verification, the same resolve
++          // again, writing only the texture, compared with the buffer written
++          // the usual way.
++          for (uint32_t i = write_through_verify ? 0 : 1;
++               write_through_used && i < write_through.target_count; ++i) {
++            bind_write_through(i, false);
+             command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+-            texture_cache.VerifyResolveWriteThrough(write_through);
++            if (write_through_verify) {
++              texture_cache.VerifyResolveWriteThrough(write_through.targets[i]);
++            }
+           }
+ 
+           // Invalidate textures and mark the range as scaled if needed.

@@ -1,0 +1,148 @@
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -703,6 +703,16 @@
+ layout(std430, set = 1, binding = 0) writeonly buffer Dest { uvec4 dest[]; };
+ layout(set = 2, binding = 0, r32ui) uniform writeonly uimage2D tex;
+ 
++#if XE_FULL
++const uint kPixelsPerInvocation = 4u;
++#else
++const uint kPixelsPerInvocation = 8u;
++#endif
++// The texels of the workgroup, written to the texture together after all are
++// ready, so neighboring invocations write neighboring texels.
++const uint kTileWidth = 8u * kPixelsPerInvocation;
++shared uint texel_tile[kTileWidth * 8u];
++
+ int TiledOffset2D(ivec2 p, uint pitch_aligned, uint bpb_log2) {
+   int macro = ((p.x >> 5) + (p.y >> 5) * int(pitch_aligned >> 5u)) << (bpb_log2 + 7u);
+   int micro = ((p.x & 7) + ((p.y & 14) << 2)) << bpb_log2;
+@@ -784,14 +794,14 @@
+ }
+ 
+ // The group of 4 pixels (already in the destination endianness) to the buffer
+-// and, as loaded, to the texture.
+-void StoreGroup(uvec2 group_position, uvec4 stored) {
++// and, as loaded, to the texel tile, at the group_index-th group of the
++// invocation.
++void StoreGroup(uvec2 group_position, uint group_index, uvec4 stored) {
+   if ((c.texture_info & 4u) != 0u) {
+     dest[DestAddress(group_position, ResolutionScale(), (c.dest_coordinate_info & 1023u) << 5u) >>
+          4u] = stored;
+   }
+-  uvec2 texel_position = group_position + (uvec2(c.texture_origin) >> uvec2(0u, 16u) & 0xFFFFu);
+-  if ((c.texture_info & 8u) != 0u && texel_position.y < c.texture_height) {
++  if ((c.texture_info & 8u) != 0u) {
+     uvec4 texels = EndianSwap32(stored, c.texture_info & 3u);
+     // As loaded (24-bit depth in the upper bits as unorm or float).
+     uint transform = (c.texture_info >> 4u) & 3u;
+@@ -800,11 +810,10 @@
+     } else if (transform == 2u) {
+       texels = Float20e4To32(texels >> 8u);
+     }
++    uint tile_index = gl_LocalInvocationID.y * kTileWidth +
++                      gl_LocalInvocationID.x * kPixelsPerInvocation + (group_index << 2u);
+     for (uint i = 0u; i < 4u; ++i) {
+-      if (texel_position.x + i < c.texture_width) {
+-        imageStore(tex, ivec2(texel_position.x + i, texel_position.y),
+-                   uvec4(texels[i], 0u, 0u, 0u));
+-      }
++      texel_tile[tile_index + i] = texels[i];
+     }
+   }
+ }
+@@ -814,6 +823,30 @@
+          pixel_index;
+ }
+ 
++// Called by all invocations after StoreGroup, writes the texel tile to the
++// texture, with each 32 invocations writing 16x2 texels.
++void StoreTile(uint invocation_count_x) {
++  if ((c.texture_info & 8u) == 0u) {
++    return;
++  }
++  barrier();
++  uvec2 tile_position = DestPosition(gl_WorkGroupID.xy * uvec2(kTileWidth, 8u)) +
++                        (uvec2(c.texture_origin) >> uvec2(0u, 16u) & 0xFFFFu);
++  for (uint i = 0u; i < kTileWidth / 8u; ++i) {
++    uint index = (i << 6u) + gl_LocalInvocationIndex;
++    uvec2 texel = uvec2((index & 15u) | ((index >> 7u) << 4u), (index >> 4u) & 7u);
++    uvec2 position = tile_position + texel;
++    if (gl_WorkGroupID.x * 8u + texel.x / kPixelsPerInvocation < invocation_count_x &&
++        all(lessThan(position, uvec2(c.texture_width, c.texture_height)))) {
++      imageStore(tex, ivec2(position), uvec4(texel_tile[texel.y * kTileWidth + texel.x], 0u, 0u, 0u));
++    }
++  }
++}
++
++uint InvocationCountX() {
++  return ((c.coordinate_info >> 5u) & 2047u) * ResolutionScale().x * (8u / kPixelsPerInvocation);
++}
++
+ #if XE_FULL
+ 
+ vec4 UnpackR8G8B8A8UNorm(uint packed) {
+@@ -826,12 +859,19 @@
+   return packed.x | (packed.y << 8u) | (packed.z << 16u) | (packed.w << 24u);
+ }
+ 
++void ResolveFull();
++
+ void main() {
++  uint invocation_count_x = InvocationCountX();
++  if (gl_GlobalInvocationID.x < invocation_count_x) {
++    ResolveFull();
++  }
++  StoreTile(invocation_count_x);
++}
++
++void ResolveFull() {
+   uvec2 scale = ResolutionScale();
+   uvec2 pixel_index = uvec2(gl_GlobalInvocationID.x << 2u, gl_GlobalInvocationID.y);
+-  if (pixel_index.x >= ((c.coordinate_info >> 5u) & 2047u) * scale.x * 8u) {
+-    return;
+-  }
+   uint source_dword = SourceDword(pixel_index);
+   uvec4 source = edram[source_dword >> 2u];
+   vec4 pixels[4];
+@@ -867,7 +907,7 @@
+     }
+     packed.x = packed.y;
+   }
+-  StoreGroup(DestPosition(pixel_index), EndianSwap32(packed, c.dest_info & 7u));
++  StoreGroup(DestPosition(pixel_index), 0u, EndianSwap32(packed, c.dest_info & 7u));
+ }
+ 
+ #else
+@@ -882,11 +922,7 @@
+   return v;
+ }
+ 
+-void main() {
+-  uvec2 scale = ResolutionScale();
+-  if (gl_GlobalInvocationID.x >= ((c.coordinate_info >> 5u) & 2047u) * scale.x) {
+-    return;
+-  }
++void ResolveFast() {
+   uvec2 pixel_index = uvec2(gl_GlobalInvocationID.x << 3u, gl_GlobalInvocationID.y);
+   uint source_index = SourceDword(pixel_index) >> 2u;
+   uvec4 pixels[2];
+@@ -909,8 +945,16 @@
+   }
+   uvec2 dest_position = DestPosition(pixel_index);
+   uint dest_endian = c.dest_info & 7u;
+-  StoreGroup(dest_position, EndianSwap32(pixels[0], dest_endian));
+-  StoreGroup(dest_position + uvec2(4u, 0u), EndianSwap32(pixels[1], dest_endian));
++  StoreGroup(dest_position, 0u, EndianSwap32(pixels[0], dest_endian));
++  StoreGroup(dest_position + uvec2(4u, 0u), 1u, EndianSwap32(pixels[1], dest_endian));
++}
++
++void main() {
++  uint invocation_count_x = InvocationCountX();
++  if (gl_GlobalInvocationID.x < invocation_count_x) {
++    ResolveFast();
++  }
++  StoreTile(invocation_count_x);
+ }
+ 
+ #endif
