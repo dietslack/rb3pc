@@ -1,0 +1,354 @@
+--- a/include/rex/graphics/util/draw_extent_estimator.h
++++ b/include/rex/graphics/util/draw_extent_estimator.h
+@@ -32,9 +32,11 @@
+   // For a draw of a single screen-space rectangle (a 3-vertex rectangle list
+   // with clipping and the viewport transform disabled), its bounds in pixels
+   // (with the half-pixel offset applied), from the vertex shader run on the
+-  // CPU. False if the draw isn't one or can't be evaluated.
++  // CPU. False if the draw isn't one or can't be evaluated. If requested, the
++  // position Z if all the vertices export the same one, NaN otherwise.
+   bool EstimateScreenSpaceRectangle(const Shader& vertex_shader, float& left_out, float& top_out,
+-                                    float& right_out, float& bottom_out);
++                                    float& right_out, float& bottom_out,
++                                    float* uniform_z_out = nullptr);
+   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
+ 
+  private:
+@@ -46,6 +48,7 @@
+     void Reset() {
+       position_x_.reset();
+       position_y_.reset();
++      position_z_.reset();
+       position_w_.reset();
+       point_size_.reset();
+       vertex_kill_.reset();
+@@ -53,6 +56,7 @@
+ 
+     const std::optional<float>& position_x() const { return position_x_; }
+     const std::optional<float>& position_y() const { return position_y_; }
++    const std::optional<float>& position_z() const { return position_z_; }
+     const std::optional<float>& position_w() const { return position_w_; }
+     const std::optional<float>& point_size() const { return point_size_; }
+     const std::optional<uint32_t>& vertex_kill() const { return vertex_kill_; }
+@@ -60,6 +64,7 @@
+    private:
+     std::optional<float> position_x_;
+     std::optional<float> position_y_;
++    std::optional<float> position_z_;
+     std::optional<float> position_w_;
+     std::optional<float> point_size_;
+     std::optional<uint32_t> vertex_kill_;
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cfloat>
++#include <limits>
+ #include <cstdint>
+ 
+ #include <rex/assert.h>
+@@ -74,6 +75,9 @@
+     if (value_mask & 0b0010) {
+       position_y_ = value[1];
+     }
++    if (value_mask & 0b0100) {
++      position_z_ = value[2];
++    }
+     if (value_mask & 0b1000) {
+       position_w_ = value[3];
+     }
+@@ -261,7 +265,8 @@
+ 
+ bool DrawExtentEstimator::EstimateScreenSpaceRectangle(const Shader& vertex_shader,
+                                                        float& left_out, float& top_out,
+-                                                       float& right_out, float& bottom_out) {
++                                                       float& right_out, float& bottom_out,
++                                                       float* uniform_z_out) {
+   const RegisterFile& regs = register_file_;
+   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+   if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+@@ -294,6 +299,7 @@
+   float half_pixel =
+       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+   float left = FLT_MAX, top = FLT_MAX, right = -FLT_MAX, bottom = -FLT_MAX;
++  float uniform_z = std::numeric_limits<float>::quiet_NaN();
+   shader_interpreter_.SetShader(vertex_shader);
+   PositionYExportSink export_sink;
+   shader_interpreter_.SetExportSink(&export_sink);
+@@ -316,6 +322,12 @@
+       valid = false;
+       break;
+     }
++    float z = export_sink.position_z().value_or(std::numeric_limits<float>::quiet_NaN());
++    if (!i) {
++      uniform_z = z;
++    } else if (z != uniform_z) {
++      uniform_z = std::numeric_limits<float>::quiet_NaN();
++    }
+     left = std::min(left, x);
+     top = std::min(top, y);
+     right = std::max(right, x);
+@@ -329,6 +341,9 @@
+   top_out = top;
+   right_out = right;
+   bottom_out = bottom;
++  if (uniform_z_out) {
++    *uniform_z_out = uniform_z;
++  }
+   return true;
+ }
+ 
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -377,6 +377,24 @@
+     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
+     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
+ 
++    // Whether the depth / stencil in the tile range contains only a single
++    // value written by a clear draw (and nothing else has been written since),
++    // so transfers from it can be replaced with clears of the destination.
++    bool IsClearOnly(uint32_t start_tiles, uint32_t end_tiles) const {
++      return clear_only_ && start_tiles >= clear_only_start_tiles_ &&
++             end_tiles <= clear_only_end_tiles_;
++    }
++    float clear_only_depth() const { return clear_only_depth_; }
++    uint32_t clear_only_stencil() const { return clear_only_stencil_; }
++    void SetClearOnly(float depth, uint32_t stencil, uint32_t start_tiles, uint32_t end_tiles) {
++      clear_only_ = true;
++      clear_only_depth_ = depth;
++      clear_only_stencil_ = stencil;
++      clear_only_start_tiles_ = start_tiles;
++      clear_only_end_tiles_ = end_tiles;
++    }
++    void ResetClearOnly() { clear_only_ = false; }
++
+    private:
+     VulkanRenderTargetCache& render_target_cache_;
+ 
+@@ -401,6 +419,12 @@
+ 
+     // Temporary storage for indices in operations like transfers and dumps.
+     uint32_t temporary_sort_index_ = 0;
++
++    bool clear_only_ = false;
++    float clear_only_depth_ = 0.0f;
++    uint32_t clear_only_stencil_ = 0;
++    uint32_t clear_only_start_tiles_ = 0;
++    uint32_t clear_only_end_tiles_ = 0;
+   };
+ 
+   struct FramebufferKey {
+@@ -878,6 +902,8 @@
+ 
+   // Temporary storage for PerformTransfersAndResolveClears.
+   std::vector<TransferInvocation> current_transfer_invocations_;
++  // Transfers to the current destination that aren't replaced with clears.
++  std::vector<Transfer> current_transfers_not_cleared_;
+ 
+   // Temporary storage for DumpRenderTargets.
+   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -14,6 +14,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <limits>
+ #include <memory>
+ #include <tuple>
+ #include <utility>
+@@ -48,6 +49,11 @@
+                     "per bit) until a draw tests or otherwise depends on the stencil contents "
+                     "(RB3 only writes it)");
+ 
++REXCVAR_DEFINE_BOOL(vulkan_clear_only_depth_transfers, true, "GPU/Vulkan",
++                    "With host render targets, replace copying depth / stencil from a render "
++                    "target containing only an exact 0 or 1 depth clear (such as RB3's clears "
++                    "through 4x MSAA aliases) with a clear of the destination");
++
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -1486,8 +1492,14 @@
+ 
+       const std::vector<Transfer>* render_target_transfers = last_update_transfers();
+       std::vector<Transfer> kept_transfers[1 + xenos::kMaxColorRenderTargets];
++      // The depth clear value of a draw replacing the whole depth / stencil
++      // with an exactly representable constant.
++      bool depth_clear_known = false;
++      float depth_clear_value = 0.0f;
++      uint32_t depth_clear_start_tiles = 0, depth_clear_end_tiles = 0;
+       if (REXCVAR_GET(vulkan_skip_overwritten_transfers)) {
+         float rectangle[4];
++        float rectangle_z = 0.0f;
+         bool rectangle_known = false, rectangle_checked = false;
+         bool any_skipped = false;
+         bool skip[1 + xenos::kMaxColorRenderTargets] = {};
+@@ -1498,7 +1510,8 @@
+           if (!rectangle_checked) {
+             rectangle_checked = true;
+             rectangle_known = draw_extent_estimator().EstimateScreenSpaceRectangle(
+-                vertex_shader, rectangle[0], rectangle[1], rectangle[2], rectangle[3]);
++                vertex_shader, rectangle[0], rectangle[1], rectangle[2], rectangle[3],
++                &rectangle_z);
+           }
+           if (rectangle_known &&
+               DoesDrawOverwriteTransfers(i, *depth_and_color_render_targets[i],
+@@ -1508,6 +1521,43 @@
+             any_skipped = true;
+           }
+         }
++        if (skip[0] && REXCVAR_GET(vulkan_clear_only_depth_transfers)) {
++          // Only depth values reproduced exactly by a clear: either the depth
++          // is the Z offset alone, or the Z is passed through unchanged, and
++          // without polygon offset.
++          const RegisterFile& regs = register_file();
++          auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
++          auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
++          float scale_z = pa_cl_vte_cntl.vport_z_scale_ena
++                              ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE)
++                              : 1.0f;
++          float offset_z = pa_cl_vte_cntl.vport_z_offset_ena
++                               ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET)
++                               : 0.0f;
++          float depth = std::numeric_limits<float>::quiet_NaN();
++          if (!pa_su_sc_mode_cntl.poly_offset_front_enable &&
++              !pa_su_sc_mode_cntl.poly_offset_back_enable) {
++            if (rectangle_z == 0.0f) {
++              depth = offset_z;
++            } else if (pa_cl_vte_cntl.vtx_z_fmt && scale_z == 1.0f && offset_z == 0.0f) {
++              depth = rectangle_z;
++            }
++          }
++          // The transferred ranges must be contiguous to be described as one.
++          const std::vector<Transfer>& depth_transfers = render_target_transfers[0];
++          uint32_t start_tiles = UINT32_MAX, end_tiles = 0, total_tiles = 0;
++          for (const Transfer& transfer : depth_transfers) {
++            start_tiles = std::min(start_tiles, transfer.start_tiles);
++            end_tiles = std::max(end_tiles, transfer.end_tiles);
++            total_tiles += transfer.end_tiles - transfer.start_tiles;
++          }
++          if ((depth == 0.0f || depth == 1.0f) && total_tiles == end_tiles - start_tiles) {
++            depth_clear_known = true;
++            depth_clear_value = depth == 0.0f ? 0.0f : 1.0f;
++            depth_clear_start_tiles = start_tiles;
++            depth_clear_end_tiles = end_tiles;
++          }
++        }
+         if (any_skipped) {
+           for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+             if (!skip[i]) {
+@@ -1521,6 +1571,18 @@
+                                        depth_and_color_render_targets, render_target_transfers);
+ 
+       if (depth_and_color_render_targets[0]) {
++        auto& depth_rt = *static_cast<VulkanRenderTarget*>(depth_and_color_render_targets[0]);
++        if (depth_clear_known) {
++          depth_rt.SetClearOnly(depth_clear_value,
++                                register_file().Get<reg::RB_STENCILREFMASK>().stencilref,
++                                depth_clear_start_tiles, depth_clear_end_tiles);
++        } else if ((normalized_depth_control.z_enable && normalized_depth_control.z_write_enable) ||
++                   normalized_depth_control.stencil_enable) {
++          depth_rt.ResetClearOnly();
++        }
++      }
++
++      if (depth_and_color_render_targets[0]) {
+         render_pass_key.depth_and_color_used |= 1 << 0;
+         render_pass_key.depth_format = depth_and_color_render_targets[0]->key().GetDepthFormat();
+       }
+@@ -4894,13 +4956,41 @@
+       continue;
+     }
+ 
+-    const std::vector<Transfer>& current_transfers = render_target_transfers[i];
+-    if (current_transfers.empty() && !resolve_clear_needed) {
++    const std::vector<Transfer>* current_transfers_ptr = &render_target_transfers[i];
++    if (current_transfers_ptr->empty() && !resolve_clear_needed) {
+       continue;
+     }
+ 
+     auto& dest_vulkan_rt = *static_cast<VulkanRenderTarget*>(dest_rt);
+     RenderTargetKey dest_rt_key = dest_vulkan_rt.key();
++    // Written by something other than a clear draw now.
++    dest_vulkan_rt.ResetClearOnly();
++
++    // Depth / stencil sources containing only a clear value (with an exact
++    // host depth, so a separate host depth source isn't needed) - clear
++    // instead of copying.
++    uint32_t clear_only_transfer_count = 0;
++    if (dest_rt_key.is_depth && REXCVAR_GET(vulkan_clear_only_depth_transfers)) {
++      for (const Transfer& transfer : *current_transfers_ptr) {
++        auto& source_vulkan_rt = *static_cast<const VulkanRenderTarget*>(transfer.source);
++        if (source_vulkan_rt.key().is_depth &&
++            source_vulkan_rt.IsClearOnly(transfer.start_tiles, transfer.end_tiles)) {
++          ++clear_only_transfer_count;
++        }
++      }
++    }
++    if (clear_only_transfer_count) {
++      current_transfers_not_cleared_.clear();
++      for (const Transfer& transfer : *current_transfers_ptr) {
++        auto& source_vulkan_rt = *static_cast<const VulkanRenderTarget*>(transfer.source);
++        if (!source_vulkan_rt.key().is_depth ||
++            !source_vulkan_rt.IsClearOnly(transfer.start_tiles, transfer.end_tiles)) {
++          current_transfers_not_cleared_.push_back(transfer);
++        }
++      }
++    }
++    const std::vector<Transfer>& current_transfers =
++        clear_only_transfer_count ? current_transfers_not_cleared_ : *current_transfers_ptr;
+ 
+     // Late barriers in case there was cross-copying that prevented merging of
+     // barriers.
+@@ -4956,6 +5046,49 @@
+     VkImageView transfer_dest_view = dest_rt_key.is_depth ? dest_vulkan_rt.view_depth_stencil()
+                                                           : dest_vulkan_rt.view_color_transfer();
+ 
++    if (clear_only_transfer_count) {
++      command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
++          transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
++      uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
++      for (const Transfer& transfer : *current_transfers_ptr) {
++        auto& source_vulkan_rt = *static_cast<const VulkanRenderTarget*>(transfer.source);
++        if (!source_vulkan_rt.key().is_depth ||
++            !source_vulkan_rt.IsClearOnly(transfer.start_tiles, transfer.end_tiles)) {
++          continue;
++        }
++        Transfer::Rectangle clear_rectangles[Transfer::kMaxRectanglesWithCutout];
++        uint32_t clear_rectangle_count =
++            transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
++                                   dest_rt_key.msaa_samples, false, clear_rectangles,
++                                   resolve_clear_rectangle);
++        if (!clear_rectangle_count) {
++          continue;
++        }
++        VkClearAttachment* clear_attachment;
++        VkClearRect* clear_rect_write_ptr;
++        command_buffer.CmdClearAttachmentsEmplace(1, clear_attachment, clear_rectangle_count,
++                                                  clear_rect_write_ptr);
++        clear_attachment->aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++        clear_attachment->colorAttachment = 0;
++        clear_attachment->clearValue.depthStencil.depth = source_vulkan_rt.clear_only_depth();
++        clear_attachment->clearValue.depthStencil.stencil = source_vulkan_rt.clear_only_stencil();
++        for (uint32_t j = 0; j < clear_rectangle_count; ++j) {
++          const Transfer::Rectangle& clear_rectangle = clear_rectangles[j];
++          clear_rect_write_ptr->rect.offset.x =
++              int32_t(clear_rectangle.x_pixels * draw_resolution_scale_x());
++          clear_rect_write_ptr->rect.offset.y =
++              int32_t(clear_rectangle.y_pixels * draw_resolution_scale_y());
++          clear_rect_write_ptr->rect.extent.width =
++              clear_rectangle.width_pixels * draw_resolution_scale_x();
++          clear_rect_write_ptr->rect.extent.height =
++              clear_rectangle.height_pixels * draw_resolution_scale_y();
++          clear_rect_write_ptr->baseArrayLayer = 0;
++          clear_rect_write_ptr->layerCount = 1;
++          ++clear_rect_write_ptr;
++        }
++      }
++    }
++
+     if (!current_transfers.empty()) {
+       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
+       bool dest_is_64bpp = dest_rt_key.Is64bpp();
