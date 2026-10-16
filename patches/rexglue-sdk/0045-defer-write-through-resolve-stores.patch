@@ -1,0 +1,470 @@
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -172,6 +172,28 @@
+   // Compares the written image with the scaled resolve buffer
+   // (vulkan_resolve_write_through_verify).
+   void VerifyResolveWriteThrough(const ResolveWriteThroughTarget& target);
++
++  // Resolves written only to the first write-through texture, not to the
++  // scaled resolve buffer, which is updated from the texture only if
++  // something needs it before the same rectangle is resolved again.
++  // The rectangle is scaled, relative to the destination base.
++  struct ResolveRectangle {
++    uint32_t dest_base;
++    uint32_t dest_pitch_blocks;
++    uint32_t x, y, width, height;
++  };
++  // Whether the resolve may skip writing the scaled resolve buffer.
++  bool CanDeferResolveStore(const ResolveWriteThrough& write_through,
++                            const ResolveRectangle& rectangle) const;
++  void DeferResolveStore(const ResolveWriteThrough& write_through,
++                         const ResolveRectangle& rectangle, uint32_t extent_start,
++                         uint32_t extent_length);
++  // Before a resolve to the range: drops the deferred stores the resolve
++  // overwrites entirely, writes the rest to the buffer.
++  void PrepareResolveOverDeferredStores(const ResolveRectangle& rectangle, uint32_t extent_start,
++                                        uint32_t extent_length);
++  // Before reading the scaled resolve buffer in the range.
++  void FlushDeferredResolveStores(uint32_t start, uint32_t length);
+   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
+                                       uint64_t written_length_scaled);
+ 
+@@ -429,6 +451,23 @@
+     bool mips;
+   };
+   std::unordered_map<VulkanTexture*, ResolveWriteThroughTexture> resolve_write_through_textures_;
++  struct DeferredResolveStore {
++    ResolveRectangle rectangle;
++    uint32_t extent_start;
++    uint32_t extent_end;
++    VulkanTexture* texture;
++    uint32_t level;
++    // Of the destination base within the level, scaled.
++    uint32_t origin_x;
++    uint32_t origin_y;
++    uint64_t frame;
++  };
++  std::vector<DeferredResolveStore> deferred_resolve_stores_;
++  uint64_t deferred_resolve_store_frame_ = 0;
++  void StoreDeferredResolve(const DeferredResolveStore& store);
++  // For textures being reloaded or destroyed.
++  void FlushDeferredResolveStoresOfTexture(const VulkanTexture& texture);
++  VkPipeline deferred_resolve_store_pipeline_ = VK_NULL_HANDLE;
+   VkPipelineLayout resolve_write_through_verify_pipeline_layout_ = VK_NULL_HANDLE;
+   VkPipeline resolve_write_through_verify_pipeline_ = VK_NULL_HANDLE;
+   VkBuffer resolve_write_through_verify_buffer_ = VK_NULL_HANDLE;
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -40,6 +40,10 @@
+                     "With resolution scaling, write 32bpp resolves (the fast copy kind) also "
+                     "directly into the texture last loaded from the destination, so it doesn't "
+                     "have to be loaded from the scaled resolve buffer again");
++REXCVAR_DEFINE_BOOL(vulkan_resolve_defer_store, true, "GPU/Vulkan",
++                    "With vulkan_resolve_write_through, don't write the resolve to the scaled "
++                    "resolve buffer, only to the texture, until something reads the buffer "
++                    "before the same rectangle is resolved again");
+ REXCVAR_DEFINE_BOOL(vulkan_resolve_write_through_verify, false, "GPU/Vulkan",
+                     "Debug: perform resolves the usual way, write the textures through a separate "
+                     "pass, and log how many texels differ from what loading would give");
+@@ -504,6 +508,9 @@
+   if (fused_load_pipeline_layout_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyPipelineLayout(device, fused_load_pipeline_layout_, nullptr);
+   }
++  if (deferred_resolve_store_pipeline_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyPipeline(device, deferred_resolve_store_pipeline_, nullptr);
++  }
+   if (resolve_write_through_verify_pipeline_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyPipeline(device, resolve_write_through_verify_pipeline_, nullptr);
+   }
+@@ -535,6 +542,11 @@
+ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
+   TextureCache::BeginSubmission(new_submission_index);
+ 
++  // Not to be destroyed while holding the only copy of a resolve.
++  for (const DeferredResolveStore& store : deferred_resolve_stores_) {
++    store.texture->MarkAsUsed();
++  }
++
+   if (!null_images_cleared_ && null_image_2d_array_cube_ != VK_NULL_HANDLE &&
+       null_image_3d_ != VK_NULL_HANDLE) {
+     VkImage null_images[] = {null_image_2d_array_cube_, null_image_3d_};
+@@ -569,6 +581,18 @@
+ void VulkanTextureCache::BeginFrame() {
+   TextureCache::BeginFrame();
+ 
++  // Store the deferred resolves not resolved again for a few frames.
++  ++deferred_resolve_store_frame_;
++  for (size_t i = 0; i < deferred_resolve_stores_.size();) {
++    if (deferred_resolve_store_frame_ - deferred_resolve_stores_[i].frame > 3) {
++      StoreDeferredResolve(deferred_resolve_stores_[i]);
++      deferred_resolve_stores_[i] = deferred_resolve_stores_.back();
++      deferred_resolve_stores_.pop_back();
++    } else {
++      ++i;
++    }
++  }
++
+   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
+ }
+ 
+@@ -1330,6 +1354,17 @@
+                                                                bool load_mips) {
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
++  // The texture may be the only holder of a resolve, and loading may read the
++  // scaled resolve buffer.
++  if (!deferred_resolve_stores_.empty()) {
++    FlushDeferredResolveStoresOfTexture(vulkan_texture);
++    if (load_base) {
++      FlushDeferredResolveStores(texture_key.base_page << 12, vulkan_texture.GetGuestBaseSize());
++    }
++    if (load_mips) {
++      FlushDeferredResolveStores(texture_key.mip_page << 12, vulkan_texture.GetGuestMipsSize());
++    }
++  }
+   // Get the pipeline.
+   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
+   bool host_format_is_signed;
+@@ -2316,6 +2351,186 @@
+   }
+ }
+ 
++bool VulkanTextureCache::CanDeferResolveStore(const ResolveWriteThrough& write_through,
++                                              const ResolveRectangle& rectangle) const {
++  if (!REXCVAR_GET(vulkan_resolve_defer_store) ||
++      deferred_resolve_store_pipeline_ == VK_NULL_HANDLE || !write_through.target_count ||
++      deferred_resolve_stores_.size() >= 64) {
++    return false;
++  }
++  // Only from a texture having the same bits as the memory, and everything
++  // written must be in it.
++  const ResolveWriteThroughTarget& target = write_through.targets[0];
++  return target.transform == uint32_t(FusedLoadTransform::kNone) &&
++         target.origin_x + rectangle.x + rectangle.width <= target.width &&
++         target.origin_y + rectangle.y + rectangle.height <= target.height;
++}
++
++void VulkanTextureCache::DeferResolveStore(const ResolveWriteThrough& write_through,
++                                           const ResolveRectangle& rectangle,
++                                           uint32_t extent_start, uint32_t extent_length) {
++  const ResolveWriteThroughTarget& target = write_through.targets[0];
++  DeferredResolveStore& store = deferred_resolve_stores_.emplace_back();
++  store.rectangle = rectangle;
++  store.extent_start = extent_start;
++  store.extent_end = extent_start + extent_length;
++  store.texture = target.texture;
++  store.level = target.level;
++  store.origin_x = target.origin_x;
++  store.origin_y = target.origin_y;
++  store.frame = deferred_resolve_store_frame_;
++}
++
++void VulkanTextureCache::PrepareResolveOverDeferredStores(const ResolveRectangle& rectangle,
++                                                          uint32_t extent_start,
++                                                          uint32_t extent_length) {
++  uint32_t extent_end = extent_start + extent_length;
++  for (size_t i = 0; i < deferred_resolve_stores_.size();) {
++    const DeferredResolveStore& store = deferred_resolve_stores_[i];
++    if (store.extent_start >= extent_end || store.extent_end <= extent_start) {
++      ++i;
++      continue;
++    }
++    // With the same pitch and the bases whole 32x32 macro tiles apart, compare
++    // the rectangles in the same coordinates (for instance, RB3 resolves some
++    // images in two halves, their memory extents interleaved).
++    const ResolveRectangle& store_rectangle = store.rectangle;
++    uint32_t pitch_macro_tiles = rectangle.dest_pitch_blocks >> 5;
++    int64_t store_x = 0, store_y = 0;
++    bool comparable = store_rectangle.dest_pitch_blocks == rectangle.dest_pitch_blocks &&
++                      pitch_macro_tiles && !((store_rectangle.dest_base ^ rectangle.dest_base) & 0xFFF);
++    if (comparable) {
++      int64_t delta_macro_tiles =
++          (int64_t(store_rectangle.dest_base) - int64_t(rectangle.dest_base)) >> 12;
++      int64_t delta_rows = delta_macro_tiles >= 0
++                               ? delta_macro_tiles / pitch_macro_tiles
++                               : -((-delta_macro_tiles + pitch_macro_tiles - 1) / pitch_macro_tiles);
++      store_x = store_rectangle.x +
++                (delta_macro_tiles - delta_rows * pitch_macro_tiles) * 32 * draw_resolution_scale_x();
++      store_y = store_rectangle.y + delta_rows * 32 * draw_resolution_scale_y();
++      // Not wrapping to the next rows.
++      int64_t pitch_scaled = int64_t(rectangle.dest_pitch_blocks) * draw_resolution_scale_x();
++      comparable = store_x + store_rectangle.width <= pitch_scaled &&
++                   rectangle.x + rectangle.width <= pitch_scaled;
++    }
++    if (comparable &&
++        (store_x >= rectangle.x + rectangle.width || store_x + store_rectangle.width <= rectangle.x ||
++         store_y >= rectangle.y + rectangle.height ||
++         store_y + store_rectangle.height <= rectangle.y)) {
++      // Different pixels, not overwritten.
++      ++i;
++      continue;
++    }
++    bool overwritten = comparable && store_x >= rectangle.x && store_y >= rectangle.y &&
++                       store_x + store_rectangle.width <= rectangle.x + rectangle.width &&
++                       store_y + store_rectangle.height <= rectangle.y + rectangle.height;
++    if (!overwritten) {
++      StoreDeferredResolve(store);
++    }
++    deferred_resolve_stores_[i] = deferred_resolve_stores_.back();
++    deferred_resolve_stores_.pop_back();
++  }
++}
++
++void VulkanTextureCache::FlushDeferredResolveStores(uint32_t start, uint32_t length) {
++  uint32_t end = start + length;
++  for (size_t i = 0; i < deferred_resolve_stores_.size();) {
++    const DeferredResolveStore& store = deferred_resolve_stores_[i];
++    if (store.extent_start >= end || store.extent_end <= start) {
++      ++i;
++      continue;
++    }
++    StoreDeferredResolve(store);
++    deferred_resolve_stores_[i] = deferred_resolve_stores_.back();
++    deferred_resolve_stores_.pop_back();
++  }
++}
++
++void VulkanTextureCache::FlushDeferredResolveStoresOfTexture(const VulkanTexture& texture) {
++  for (size_t i = 0; i < deferred_resolve_stores_.size();) {
++    if (deferred_resolve_stores_[i].texture != &texture) {
++      ++i;
++      continue;
++    }
++    StoreDeferredResolve(deferred_resolve_stores_[i]);
++    deferred_resolve_stores_[i] = deferred_resolve_stores_.back();
++    deferred_resolve_stores_.pop_back();
++  }
++}
++
++void VulkanTextureCache::StoreDeferredResolve(const DeferredResolveStore& store) {
++  VulkanTexture& texture = *store.texture;
++  TextureKey texture_key = texture.key();
++  const texture_util::TextureGuestLayout& guest_layout = texture.guest_layout();
++  const texture_util::TextureGuestLayout::Level& level_layout =
++      store.level ? guest_layout.mips[store.level] : guest_layout.base;
++  uint32_t level_address =
++      store.level ? (texture_key.mip_page << 12) + guest_layout.mip_offsets_bytes[store.level]
++                  : texture_key.base_page << 12;
++  uint32_t level_size = store.level ? level_layout.level_data_extent_bytes : texture.GetGuestBaseSize();
++  uint64_t buffer_start, buffer_range;
++  VkImageView storage_view = texture.GetStorageLoadView(store.level);
++  VkDescriptorSet buffer_set = command_processor_.AllocateSingleTransientDescriptor(
++      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
++  VkDescriptorSet image_set = command_processor_.AllocateSingleTransientDescriptor(
++      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute);
++  if (!GetScaledResolveRange(level_address, level_size, 4, buffer_start, buffer_range) ||
++      storage_view == VK_NULL_HANDLE || buffer_set == VK_NULL_HANDLE ||
++      image_set == VK_NULL_HANDLE) {
++    REXGPU_ERROR("VulkanTextureCache: Failed to store a deferred resolve to 0x{:08X}",
++                 store.rectangle.dest_base);
++    return;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  VkDescriptorBufferInfo buffer_info = {scaled_resolve_buffer_, buffer_start, buffer_range};
++  VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, storage_view, VK_IMAGE_LAYOUT_GENERAL};
++  VkWriteDescriptorSet writes[2] = {};
++  writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++  writes[0].dstSet = buffer_set;
++  writes[0].descriptorCount = 1;
++  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++  writes[0].pBufferInfo = &buffer_info;
++  writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++  writes[1].dstSet = image_set;
++  writes[1].descriptorCount = 1;
++  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++  writes[1].pImageInfo = &image_info;
++  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 2, writes, 0,
++                                                    nullptr);
++
++  texture.MarkAsUsed();
++  VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kStorageDestination);
++  VkPipelineStageFlags src_stage_mask;
++  VkAccessFlags src_access_mask;
++  VkImageLayout old_layout;
++  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
++  command_processor_.PushImageMemoryBarrier(
++      texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
++      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, src_access_mask,
++      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, old_layout, VK_IMAGE_LAYOUT_GENERAL);
++  UseScaledResolveBufferForWrite(buffer_start, buffer_range);
++  command_processor_.SubmitBarriers(true);
++
++  const ResolveRectangle& rectangle = store.rectangle;
++  uint32_t constants[5];
++  constants[0] = (uint32_t(texture_key.endianness) << 2) | (draw_resolution_scale_x() << 4) |
++                 (draw_resolution_scale_y() << 7);
++  constants[1] = level_layout.row_pitch_bytes / 4;
++  constants[2] = (store.origin_x + rectangle.x) | ((store.origin_y + rectangle.y) << 16);
++  constants[3] = rectangle.width | (rectangle.height << 16);
++  constants[4] = 0;
++  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  command_processor_.BindExternalComputePipeline(deferred_resolve_store_pipeline_);
++  VkDescriptorSet sets[] = {buffer_set, image_set};
++  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                         fused_load_pipeline_layout_, 0, 2, sets, 0, nullptr);
++  command_buffer.CmdVkPushConstants(fused_load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                    sizeof(constants), constants);
++  command_buffer.CmdVkDispatch((((rectangle.width + 3) >> 2) + 7) >> 3,
++                               (rectangle.height + 7) >> 3, 1);
++}
++
+ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
+   uint32_t bindings_remaining = fetch_constant_mask;
+   uint32_t binding_index;
+@@ -2378,6 +2593,17 @@
+     auto& write_through_textures =
+         static_cast<VulkanTextureCache&>(texture_cache()).resolve_write_through_textures_;
+     write_through_textures.erase(this);
++    // Kept alive while having deferred stores (but not on shutdown).
++    auto& deferred_stores =
++        static_cast<VulkanTextureCache&>(texture_cache()).deferred_resolve_stores_;
++    for (size_t i = 0; i < deferred_stores.size();) {
++      if (deferred_stores[i].texture == this) {
++        deferred_stores[i] = deferred_stores.back();
++        deferred_stores.pop_back();
++      } else {
++        ++i;
++      }
++    }
+   }
+   const VulkanTextureCache& vulkan_texture_cache =
+       static_cast<const VulkanTextureCache&>(texture_cache());
+@@ -3692,6 +3918,69 @@
+             spirv.size() * sizeof(uint32_t));
+       }
+     }
++    if (fused_load_pipeline_layout_ != VK_NULL_HANDLE) {
++      // The inverse of the 32bpb fused load for a rectangle.
++      static constexpr const char kStoreSource[] = R"(#version 450
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(push_constant) uniform Constants {
++  uint endian_scale;
++  uint guest_pitch_aligned;
++  // X in 0:15, Y in 16:31, scaled.
++  uint origin;
++  uint size;
++} c;
++layout(std430, set = 0, binding = 0) writeonly buffer Dest { uvec4 data[]; } dest;
++layout(set = 1, binding = 0, r32ui) uniform readonly uimage2D source;
++
++int TiledOffset2D(ivec2 p, uint pitch_aligned, uint bpb_log2) {
++  int macro = ((p.x >> 5) + (p.y >> 5) * int(pitch_aligned >> 5u)) << (bpb_log2 + 7u);
++  int micro = ((p.x & 7) + ((p.y & 14) << 2)) << bpb_log2;
++  int offset = macro + ((micro & ~15) << 1) + (micro & 15) + ((p.y & 1) << 4);
++  return ((offset & ~511) << 3) + ((p.y & 16) << 7) + ((offset & 448) << 2) +
++         (((((p.y & 8) >> 2) + (p.x >> 3)) & 3) << 6) + (offset & 63);
++}
++
++void main() {
++  uvec2 size = (uvec2(c.size) >> uvec2(0u, 16u)) & 0xFFFFu;
++  uvec2 relative = uvec2(gl_GlobalInvocationID.x << 2u, gl_GlobalInvocationID.y);
++  if (relative.x >= size.x || relative.y >= size.y) {
++    return;
++  }
++  uvec2 position = ((uvec2(c.origin) >> uvec2(0u, 16u)) & 0xFFFFu) + relative;
++  uvec2 scale = (uvec2(c.endian_scale) >> uvec2(4u, 7u)) & 7u;
++  uvec2 host_group = uvec2(position.x >> 2u, position.y);
++  uvec2 guest_group = host_group / scale;
++  uvec2 group_in_guest = host_group - guest_group * scale;
++  uint address = uint(TiledOffset2D(ivec2(guest_group.x << 2u, guest_group.y),
++                                    c.guest_pitch_aligned, 2u));
++  address = address * (scale.x * scale.y) +
++            ((group_in_guest.x * scale.y + group_in_guest.y) << 4u);
++  uvec4 v;
++  for (uint i = 0u; i < 4u; ++i) {
++    v[i] = imageLoad(source, ivec2(position.x + i, position.y)).x;
++  }
++  uint endian = (c.endian_scale >> 2u) & 3u;
++  if (endian == 1u || endian == 2u) {
++    v = ((v & 0x00FF00FFu) << 8u) | ((v & 0xFF00FF00u) >> 8u);
++  }
++  if (endian == 2u || endian == 3u) {
++    v = (v << 16u) | (v >> 16u);
++  }
++  dest.data[address >> 4u] = v;
++}
++)";
++      std::vector<uint32_t> spirv;
++      std::string error;
++      if (command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kStoreSource, spirv,
++                                                error)) {
++        deferred_resolve_store_pipeline_ = ui::vulkan::util::CreateComputePipeline(
++            vulkan_device, fused_load_pipeline_layout_, spirv.data(),
++            spirv.size() * sizeof(uint32_t));
++      } else {
++        REXGPU_WARN("VulkanTextureCache: Failed to compile the deferred resolve store shader: {}",
++                    error);
++      }
++    }
+     if (REXCVAR_GET(vulkan_resolve_write_through_verify)) {
+       VkDescriptorSetLayout verify_set_layouts[] = {
+           fused_set_layouts[0], fused_set_layouts[1],
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1641,6 +1641,24 @@
+               }
+             }
+           }
++          // The rectangle written, for deferring writing to the scaled resolve
++          // buffer.
++          VulkanTextureCache::ResolveRectangle resolve_rectangle;
++          resolve_rectangle.dest_base = resolve_info.copy_dest_base;
++          resolve_rectangle.dest_pitch_blocks =
++              resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 << 5;
++          resolve_rectangle.x = (resolve_info.copy_dest_coordinate_info.offset_x_div_8 << 3) *
++                                draw_resolution_scale_x();
++          resolve_rectangle.y = (resolve_info.copy_dest_coordinate_info.offset_y_div_8 << 3) *
++                                draw_resolution_scale_y();
++          resolve_rectangle.width =
++              (resolve_info.coordinate_info.width_div_8 << 3) * draw_resolution_scale_x();
++          resolve_rectangle.height = (resolve_info.height_div_8 << 3) * draw_resolution_scale_y();
++          if (draw_resolution_scaled) {
++            texture_cache.PrepareResolveOverDeferredStores(resolve_rectangle,
++                                                           resolve_info.copy_dest_extent_start,
++                                                           resolve_info.copy_dest_extent_length);
++          }
+           VulkanTextureCache::ResolveWriteThrough write_through;
+           bool write_through_used =
+               write_through_pipeline != VK_NULL_HANDLE &&
+@@ -1651,6 +1669,8 @@
+                   write_through);
+           bool write_through_verify =
+               write_through_used && REXCVAR_GET(vulkan_resolve_write_through_verify);
++          bool store_deferred = write_through_used && !write_through_verify &&
++                                texture_cache.CanDeferResolveStore(write_through, resolve_rectangle);
+ 
+           // Submit the resolve.
+           if (draw_resolution_scaled) {
+@@ -1687,7 +1707,7 @@
+                                               write_through_constants);
+           };
+           if (write_through_used && !write_through_verify) {
+-            bind_write_through(0, true);
++            bind_write_through(0, !store_deferred);
+           } else {
+             command_processor_.BindExternalComputePipeline(
+                 resolve_copy_pipelines_[size_t(copy_shader)]);
+@@ -1731,6 +1751,11 @@
+                                             resolve_info.copy_dest_extent_length);
+           if (write_through_used) {
+             texture_cache.EndResolveWriteThrough(write_through);
++            if (store_deferred) {
++              texture_cache.DeferResolveStore(write_through, resolve_rectangle,
++                                              resolve_info.copy_dest_extent_start,
++                                              resolve_info.copy_dest_extent_length);
++            }
+           }
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4788,6 +4788,8 @@
+     }
+     dfn.vkUpdateDescriptorSets(device, 2, descriptor_writes, 0, nullptr);
+ 
++    // The resolve may have been written only to a texture.
++    texture_cache_->FlushDeferredResolveStores(written_address, written_length);
+     texture_cache_->UseScaledResolveBufferForRead();
+     SubmitBarriers(true);
+ 
