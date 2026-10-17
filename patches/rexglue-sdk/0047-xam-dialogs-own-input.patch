@@ -1,0 +1,67 @@
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -15,6 +15,7 @@
+ #include <rex/system/flags.h>
+ #include <rex/system/kernel_state.h>
+ 
++#include <fmt/format.h>
+ #include <imgui.h>
+ 
+ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+@@ -227,12 +228,15 @@
+ 
+   void OnDraw(ImGuiIO& io) override {
+     bool first_draw = false;
++    // The popup's ID is this dialog's own, so two with the same title don't
++    // clash.
++    std::string popup_id = fmt::format("{}##{}", title_, static_cast<const void*>(this));
+     if (!has_opened_) {
+-      ImGui::OpenPopup(title_.c_str());
++      ImGui::OpenPopup(popup_id.c_str());
+       has_opened_ = true;
+       first_draw = true;
+     }
+-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
++    if (ImGui::BeginPopupModal(popup_id.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+       if (description_.size()) {
+         ImGui::Text("%s", description_.c_str());
+       }
+@@ -367,12 +371,15 @@
+ 
+   void OnDraw(ImGuiIO& io) override {
+     bool first_draw = false;
++    // The popup's ID is this dialog's own, so two with the same title don't
++    // clash.
++    std::string popup_id = fmt::format("{}##{}", title_, static_cast<const void*>(this));
+     if (!has_opened_) {
+-      ImGui::OpenPopup(title_.c_str());
++      ImGui::OpenPopup(popup_id.c_str());
+       has_opened_ = true;
+       first_draw = true;
+     }
+-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
++    if (ImGui::BeginPopupModal(popup_id.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+       if (description_.size()) {
+         ImGui::TextWrapped("%s", description_.c_str());
+       }
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -29,6 +29,7 @@
+ #include <rex/audio/sdl/sdl_audio_system.h>
+ #include <rex/input/input_system.h>
+ #include <rex/kernel/init.h>
++#include <rex/kernel/xam/module.h>
+ #include <rex/string/numeric.h>
+ #include <rex/system.h>
+ #include <rex/system/achievement_manager.h>
+@@ -252,6 +253,10 @@
+     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+     if (input_sys) {
+       input_sys->SetActiveCallback([this]() {
++        // A system dialog (XAM: the keyboard, message boxes) owns the input
++        // while it's open, as on the console: the title gets none.
++        if (rex::kernel::xam::xeXamIsUIActive())
++          return false;
+         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+           return true;
+         return !imgui_drawer_->GetIO().WantCaptureMouse;

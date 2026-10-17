@@ -66,6 +66,7 @@
 #include <rex/hook.h>
 #include <rex/input/input.h>
 #include <rex/input/mnk/mnk_input_driver.h>
+#include <rex/kernel/xam/module.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
@@ -103,6 +104,7 @@ REXCVAR_DECLARE(bool, mnk_mode);
 #define MM_DXMESH_DRAW sub_82738E38
 #define MM_CONTROLLER_TYPE sub_82525C40
 #define MM_USER_FROM_PAD sub_82524AF8
+#define MM_SLIDER_DRAW sub_8280A260
 #define MM_COMPONENT_POLL_ORIG __imp__sub_827FFAA8
 #define MM_BANDBUTTON_DRAW_ORIG __imp__sub_823446B0
 #define MM_BANDLIST_DRAW_ORIG __imp__sub_8233B7F8
@@ -119,6 +121,7 @@ REXCVAR_DECLARE(bool, mnk_mode);
 #define MM_DXMESH_DRAW_ORIG __imp__sub_82738E38
 #define MM_CONTROLLER_TYPE_ORIG __imp__sub_82525C40
 #define MM_USER_FROM_PAD_ORIG __imp__sub_82524AF8
+#define MM_SLIDER_DRAW_ORIG __imp__sub_8280A260
 #else
 #define MM_COMPONENT_POLL sub_827DA580
 #define MM_BANDBUTTON_DRAW sub_82331C40
@@ -136,6 +139,7 @@ REXCVAR_DECLARE(bool, mnk_mode);
 #define MM_DXMESH_DRAW sub_82713E08
 #define MM_CONTROLLER_TYPE sub_82512708
 #define MM_USER_FROM_PAD sub_82511618
+#define MM_SLIDER_DRAW sub_827E4C98
 #define MM_COMPONENT_POLL_ORIG __imp__sub_827DA580
 #define MM_BANDBUTTON_DRAW_ORIG __imp__sub_82331C40
 #define MM_BANDLIST_DRAW_ORIG __imp__sub_82329348
@@ -152,6 +156,7 @@ REXCVAR_DECLARE(bool, mnk_mode);
 #define MM_DXMESH_DRAW_ORIG __imp__sub_82713E08
 #define MM_CONTROLLER_TYPE_ORIG __imp__sub_82512708
 #define MM_USER_FROM_PAD_ORIG __imp__sub_82511618
+#define MM_SLIDER_DRAW_ORIG __imp__sub_827E4C98
 #endif
 
 REX_EXTERN(MM_COMPONENT_POLL_ORIG);      // UIComponent::Poll (this = RndPollable, component + 216)
@@ -170,6 +175,7 @@ REX_EXTERN(MM_REVIEW_DRAW_ORIG);         // ReviewDisplay::DrawShowing
 REX_EXTERN(MM_DXMESH_DRAW_ORIG);         // DxMesh::DrawShowing
 REX_EXTERN(MM_CONTROLLER_TYPE);          // JoypadControllerTypePadNum(int pad) -> Symbol (r3 = result)
 REX_EXTERN(MM_USER_FROM_PAD);            // JoypadGetUserFromPadNum(int pad) -> LocalUser*
+REX_EXTERN(MM_SLIDER_DRAW_ORIG);         // UISlider::DrawShowing
 
 namespace {
 
@@ -187,10 +193,17 @@ constexpr uint32_t kUIButton = rb3pc::exe::kDeluxe ? 0x82125794 : 0x8211FF1C;
 constexpr uint32_t kBandList = rb3pc::exe::kDeluxe ? 0x82037E3C : 0x820372EC;
 constexpr uint32_t kUIList = rb3pc::exe::kDeluxe ? 0x82121F3C : 0x8211C724;
 
+constexpr uint32_t kUISlider = rb3pc::exe::kDeluxe ? 0x82124C9C : 0x8211F41C;
+
 bool IsList(uint32_t vtable) { return vtable == kBandList || vtable == kUIList; }
 bool IsPointable(uint32_t vtable) {
-  return vtable == kBandButton || vtable == kUIButton || IsList(vtable);
+  return vtable == kBandButton || vtable == kUIButton || IsList(vtable) || vtable == kUISlider;
 }
+
+// UISlider: ScrollSelect at +0x140 (select-to-scroll +0x144, stored step while
+// selected +0x148, else -1); current step +0x14C, step count +0x150, vertical +0x154.
+constexpr uint32_t kSliderSelectToScroll = 0x144, kSliderSelectedAux = 0x148, kSliderCurrent = 0x14C,
+                   kSliderSteps = 0x150, kSliderVertical = 0x154;
 
 struct Vec3 {
   float x, y, z;
@@ -426,6 +439,26 @@ constexpr uint32_t kListDir = 376, kListState = 392;
 constexpr uint32_t kDirOrientation = 0x1E4, kDirSpacing = 0x1EC;
 constexpr uint32_t kStateNumDisplay = 4, kStateFirstShowing = 0x30, kStateSelectedDisplay = 0x38;
 
+// Row placement learned from the meshes a list draws (DxMesh hook): row i's
+// centre is (i + centre) spacings along. Art varies (song list 0.5, My Goals
+// a fifth of a row higher), so centre is the circular mean of mesh positions.
+// across_min/max bound the drawn meshes, so My Goals' category column beside
+// the grid doesn't count as the list.
+struct ListRows {
+  double sum_cos = 0, sum_sin = 0;
+  float top = -1e30f;
+  float low = 1e30f, high = -1e30f;
+  std::vector<float> alongs;
+  std::vector<float> acrosses;
+  int meshes = 0;
+  float centre = 0.5f;
+  float across_min = -1e30f, across_max = 1e30f;
+  // Median, not mean: My Goals' rows draw one stray mesh 25 below their icons.
+  float across_mid = 0;
+};
+std::unordered_map<uint32_t, ListRows> g_list_rows;
+uint32_t g_list_drawing = 0;
+
 int ListItemAt(const uint8_t* base, uint32_t list, Vec3 local) {
   uint32_t dir = Load32(base, list + kListDir);
   if (!dir) return -1;
@@ -433,15 +466,82 @@ int ListItemAt(const uint8_t* base, uint32_t list, Vec3 local) {
   float spacing = LoadF(base, dir + kDirSpacing);
   int num_display = int(Load32(base, list + kListState + kStateNumDisplay));
   if (!(spacing > 0) || num_display <= 0) return -1;
-  int item = int(std::floor((vertical ? -local.z : local.x) / spacing));
+  auto rows = g_list_rows.find(list);
+  float centre = rows != g_list_rows.end() ? rows->second.centre : 0.5f;
+  if (rows != g_list_rows.end()) {
+    float across = vertical ? local.x : local.z, margin = spacing * 0.25f;
+    if (across < rows->second.across_min - margin || across > rows->second.across_max + margin) return -1;
+  }
+  int item = int(std::floor((vertical ? -local.z : local.x) / spacing - centre + 0.5f));
   return item >= 0 && item < num_display ? item : -1;
 }
 
-// Components in the same menu as the focused one: those its navigation links
-// (UIComponent NavRight / NavDown, ObjPtrs whose target is at +0xEC / +0xF8)
-// reach, either way. Menus drawn but not active (a hub's other pages, faded
-// out) aren't linked to it.
+void NoteListMesh(const uint8_t* base, uint32_t list, uint32_t mesh, Vec3 world, float radius) {
+  uint32_t dir = Load32(base, list + kListDir);
+  if (!dir) return;
+  float spacing = LoadF(base, dir + kDirSpacing);
+  if (!(spacing > 0)) return;
+  bool vertical = Load32(base, dir + kDirOrientation) == 0;
+  Vec3 local = ToLocal(base, list, world);
+  float along = (vertical ? -local.z : local.x) / spacing;
+  ListRows& rows = g_list_rows[list];
+  if (rows.alongs.size() < 256) rows.alongs.push_back(along);
+  rows.top = std::max(rows.top, -along);
+  float across = vertical ? local.x : local.z;
+  rows.low = std::min(rows.low, across - radius);
+  rows.high = std::max(rows.high, across + radius);
+  if (rows.acrosses.size() < 256) rows.acrosses.push_back(across);
+  ++rows.meshes;
+  (void)mesh;
+}
+
+void FinishListRows(uint32_t list) {
+  auto it = g_list_rows.find(list);
+  if (it == g_list_rows.end()) return;
+  ListRows& rows = it->second;
+  rows.sum_cos = rows.sum_sin = 0;
+  for (float along : rows.alongs) {
+    double angle = along * 2 * 3.14159265358979;
+    rows.sum_cos += std::cos(angle);
+    rows.sum_sin += std::sin(angle);
+  }
+  if (rows.meshes >= 2 && std::hypot(rows.sum_cos, rows.sum_sin) > 0.2 * rows.meshes) {
+    double phase = std::atan2(rows.sum_sin, rows.sum_cos) / (2 * 3.14159265358979);
+    phase -= std::floor(phase);  // [0, 1)
+    // Row 0 is at phase or phase - 1, whichever is nearer the topmost mesh.
+    float first = -rows.top;
+    rows.centre = std::fabs(first - float(phase)) <= std::fabs(first - float(phase - 1)) ? float(phase)
+                                                                                         : float(phase - 1);
+  }
+  if (rows.meshes >= 2 && rows.high > rows.low) {
+    rows.across_min = rows.low;
+    rows.across_max = rows.high;
+    if (!rows.acrosses.empty()) {
+      auto mid = rows.acrosses.begin() + rows.acrosses.size() / 2;
+      std::nth_element(rows.acrosses.begin(), mid, rows.acrosses.end());
+      rows.across_mid = *mid;
+    }
+  }
+  rows.alongs.clear();
+  rows.acrosses.clear();
+  rows.sum_cos = rows.sum_sin = 0;
+  rows.top = -1e30f;
+  rows.low = 1e30f;
+  rows.high = -1e30f;
+  rows.meshes = 0;
+}
+
+// Active menu: what the focused component's NavRight / NavDown links reach,
+// either way. A hub's faded-out pages are drawn but unlinked.
 constexpr uint32_t kNavRight = 0xEC, kNavDown = 0xF8;
+
+// UIList::mParent (+484): set on the row lists of a list of lists (My Goals).
+constexpr uint32_t kListParent = 484;
+uint32_t ListParent(const uint8_t* base, uint32_t list) {
+  if (!IsList(Load32(base, list))) return 0;
+  uint32_t parent = Load32(base, list + kListParent);
+  return parent && g_drawn.count(parent) && IsList(Load32(base, parent)) ? parent : 0;
+}
 
 std::vector<uint32_t> ActiveMenu(const uint8_t* base, uint32_t focused) {
   std::vector<uint32_t> menu{focused};
@@ -455,8 +555,10 @@ std::vector<uint32_t> ActiveMenu(const uint8_t* base, uint32_t focused) {
     };
     add(Load32(base, c + kNavRight));
     add(Load32(base, c + kNavDown));
+    add(ListParent(base, c));
     for (const auto& [other, drawn] : g_drawn) {
       if (Load32(base, other + kNavRight) == c || Load32(base, other + kNavDown) == c) add(other);
+      if (ListParent(base, other) == c) add(other);
     }
   }
   return menu;
@@ -476,6 +578,31 @@ struct LocalBox {
   float left, top, right, bottom;  // x, z (z up)
 };
 
+// Slider extent and knob travel, from the bounding spheres of the meshes it
+// drew (RndDrawable: centre +0xC, radius +0x1C, mesh space; world xfm +0x80).
+// Knob is the smallest; track the largest sphere holding the knob's centre.
+std::unordered_map<uint32_t, LocalBox> g_slider_boxes;
+struct SliderTravel {
+  float from = 0, to = 0;
+};
+std::unordered_map<uint32_t, SliderTravel> g_slider_travel;
+struct SliderMesh {
+  Vec3 centre;
+  float radius;
+};
+uint32_t g_slider_drawing = 0;
+std::vector<SliderMesh> g_slider_meshes;
+constexpr uint32_t kMeshSphere = 0xC, kMeshRadius = 0x1C;
+
+bool InSlider(uint32_t slider, Vec3 local) {
+  auto it = g_slider_boxes.find(slider);
+  if (it == g_slider_boxes.end()) return false;
+  const LocalBox& b = it->second;
+  constexpr float kMargin = 4;
+  return b.right > b.left && local.x >= b.left - kMargin && local.x <= b.right + kMargin &&
+         local.z <= b.top + kMargin && local.z >= b.bottom - kMargin;
+}
+
 bool InButton(const uint8_t* base, uint32_t comp, Vec3 local, LocalBox* line = nullptr) {
   uint32_t text = Load32(base, comp + 324);
   if (!text) return false;
@@ -494,11 +621,24 @@ bool InButton(const uint8_t* base, uint32_t comp, Vec3 local, LocalBox* line = n
 uint32_t FocusedComponent(const uint8_t* base);
 bool g_log_hover = false;
 
-// The component of the active menu under the pointer, and the hit in its
-// local space.
+// Distance across a list from its middle, in spacings: overlapping lists (a
+// grid's rows) go to the nearest.
+float ListAcrossDistance(const uint8_t* base, uint32_t list, Vec3 local) {
+  auto rows = g_list_rows.find(list);
+  uint32_t dir = Load32(base, list + kListDir);
+  if (rows == g_list_rows.end() || !dir) return 0;
+  float spacing = std::max(LoadF(base, dir + kDirSpacing), 1.f);
+  bool vertical = Load32(base, dir + kDirOrientation) == 0;
+  return std::fabs((vertical ? local.x : local.z) - rows->second.across_mid) / spacing;
+}
+
+// Buttons beat lists.
 uint32_t Hover(const uint8_t* base, float px, float py, Vec3& local) {
   uint32_t focused = FocusedComponent(base);
   if (!focused) return 0;
+  uint32_t best_list = 0;
+  float best_distance = 1e30f;
+  Vec3 best_local{};
   for (uint32_t comp : ActiveMenu(base, focused)) {
     uint32_t vtable = Load32(base, comp), cam = g_drawn[comp].cam;
     if (!cam || !IsPointable(vtable) || base[comp + kCompState] == kDisabled) continue;
@@ -508,17 +648,32 @@ uint32_t Hover(const uint8_t* base, float px, float py, Vec3& local) {
     Vec3 b = Unproject(base, cam, px, py, depth * 4.0f);
     Vec3 hit;
     if (!PlaneHit(base, comp, a, b, hit)) continue;
-    bool inside = IsList(vtable) ? ListItemAt(base, comp, hit) >= 0 : InButton(base, comp, hit);
+    bool inside = IsList(vtable)          ? ListItemAt(base, comp, hit) >= 0
+                  : vtable == kUISlider ? InSlider(comp, hit)
+                                        : InButton(base, comp, hit);
     if (g_log_hover) {
       REXLOG_INFO("Pointer: {:08X} vt {:08X} state {} local {:.1f},{:.1f}: {}", comp, vtable,
                   base[comp + kCompState], hit.x, hit.z, inside ? "inside" : "outside");
     }
-    if (inside) {
+    if (!inside) continue;
+    // A list of lists is pointed at through its rows' lists.
+    if (IsList(vtable) && std::any_of(g_drawn.begin(), g_drawn.end(),
+                                      [&](const auto& d) { return ListParent(base, d.first) == comp; })) {
+      continue;
+    }
+    if (!IsList(vtable)) {
       local = hit;
       return comp;
     }
+    float distance = ListAcrossDistance(base, comp, hit);
+    if (distance < best_distance) {
+      best_list = comp;
+      best_distance = distance;
+      best_local = hit;
+    }
   }
-  return 0;
+  if (best_list) local = best_local;
+  return best_list;
 }
 
 // Each panel keeps a focused component; the latest drawn (a dialog) wins.
@@ -1193,6 +1348,49 @@ uint16_t ActionButton(uint32_t action, bool gamepad) {
 }
 
 
+// Driven by d-pad presses so the game's scroll messages and scripts run;
+// select-to-scroll sliders get A before and after.
+struct SliderDrag {
+  uint32_t slider = 0;
+  bool entered = false;
+  int expected = -1;     // step the queued presses should reach
+  Clock::time_point last_press;
+};
+SliderDrag g_slider_drag;
+
+bool SliderCanScroll(const uint8_t* base, uint32_t slider) {
+  return !base[slider + kSliderSelectToScroll] || int32_t(Load32(base, slider + kSliderSelectedAux)) != -1;
+}
+
+int SliderStepAt(const uint8_t* base, uint32_t slider, Vec3 local) {
+  const SliderTravel& travel = g_slider_travel[slider];
+  int steps = std::max(int(Load32(base, slider + kSliderSteps)), 1);
+  bool vertical = base[slider + kSliderVertical];
+  float t = ((vertical ? local.z : local.x) - travel.from) / std::max(travel.to - travel.from, 1e-3f);
+  return int(std::lround(std::clamp(t, 0.f, 1.f) * float(steps - 1)));
+}
+
+// At most four presses: the device's queue depth.
+void StepSlider(const uint8_t* base, uint32_t slider, int target) {
+  using namespace rex::input;
+  if (mnk::PressesPending() || !SliderCanScroll(base, slider)) return;
+  int current = int(Load32(base, slider + kSliderCurrent));
+  auto now = Clock::now();
+  if (g_slider_drag.expected >= 0 && current != g_slider_drag.expected &&
+      now - g_slider_drag.last_press < std::chrono::milliseconds(300)) {
+    return;
+  }
+  if (current == target) return;
+  bool vertical = base[slider + kSliderVertical], up = target > current;
+  int count = std::min(std::abs(target - current), 4);
+  for (int n = 0; n < count; ++n) {
+    Press(vertical ? (up ? X_INPUT_GAMEPAD_DPAD_UP : X_INPUT_GAMEPAD_DPAD_DOWN)
+                   : (up ? X_INPUT_GAMEPAD_DPAD_RIGHT : X_INPUT_GAMEPAD_DPAD_LEFT));
+  }
+  g_slider_drag.expected = current + (up ? count : -count);
+  g_slider_drag.last_press = now;
+}
+
 void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   static bool wheel_hooked = [] {
     rex::input::mnk::SetWheelHandler([](int32_t notches) {
@@ -1219,7 +1417,33 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
       it = now - it->second.when > std::chrono::milliseconds(200) ? drawn->erase(it) : std::next(it);
     }
   }
-  if (!REXCVAR_GET(mnk_mode)) return;
+  for (auto it = g_slider_boxes.begin(); it != g_slider_boxes.end();) {
+    it = g_drawn.count(it->first) ? std::next(it) : g_slider_boxes.erase(it);
+  }
+  for (auto it = g_slider_travel.begin(); it != g_slider_travel.end();) {
+    it = g_drawn.count(it->first) ? std::next(it) : g_slider_travel.erase(it);
+  }
+  for (auto it = g_list_rows.begin(); it != g_list_rows.end();) {
+    it = g_drawn.count(it->first) ? std::next(it) : g_list_rows.erase(it);
+  }
+  // Nothing while a system dialog (the keyboard, a message box) is up: it
+  // has the input, and the menu behind it shouldn't move.
+  if (!REXCVAR_GET(mnk_mode) || rex::kernel::xam::xeXamIsUIActive()) {
+    g_pointer_on_list = false;
+    g_click_buttons = -1;
+    g_slider_drag = {};
+    return;
+  }
+  if (REXCVAR_GET(mouse_menu_debug)) {
+    static std::unordered_map<uint32_t, int> logged;
+    for (const auto& [c, b] : g_slider_boxes) {
+      if (logged[c]++ % 300) continue;
+      const SliderTravel& t = g_slider_travel[c];
+      REXLOG_INFO("Pointer: slider {:08X} box {:.1f},{:.1f}-{:.1f},{:.1f} knob {:.1f}-{:.1f} step {}/{}{}", c, b.left,
+                  b.top, b.right, b.bottom, t.from, t.to, int(Load32(base, c + kSliderCurrent)),
+                  int(Load32(base, c + kSliderSteps)), SliderCanScroll(base, c) ? "" : " (select to scroll)");
+    }
+  }
   float px, py;
   if (!PointerPosition(px, py)) {
     g_review_preview_comp = 0;
@@ -1227,6 +1451,7 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
     g_pointer_on_list = false;
     g_click_buttons = -1;
     g_drag = {};
+    g_slider_drag = {};
     std::lock_guard lock(g_highlight_mutex);
     g_highlights.clear();
     return;
@@ -1263,8 +1488,17 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   }
   g_left_was_down = left;
   if (g_drag.bar && (!left || !g_scrollbars.count(g_drag.bar))) g_drag = {};
-  if (g_drag.bar) {
-    // Dragging: the thumb follows the pointer, wherever it is.
+  if (g_slider_drag.slider && (!left || !g_drawn.count(g_slider_drag.slider))) {
+    if (g_slider_drag.entered && g_drawn.count(g_slider_drag.slider)) Press(rex::input::X_INPUT_GAMEPAD_A);
+    g_slider_drag = {};
+  }
+  if (g_slider_drag.slider) {
+    uint32_t slider = g_slider_drag.slider;
+    Vec3 hit;
+    if (PointerOnPlane(base, slider, g_drawn[slider].cam, px, py, hit)) StepSlider(base, slider, SliderStepAt(base, slider, hit));
+    click = 0;
+    comp = 0;
+  } else if (g_drag.bar) {
     Vec3 hit;
     Scrollbar sb;
     if (ReadScrollbar(base, g_drag.bar, g_scrollbars[g_drag.bar].cam, sb)) {
@@ -1344,6 +1578,23 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
       highlights.push_back(std::move(h));
     }
     if (debug) REXLOG_INFO("Pointer: over help action {}: button {:04X}", action, click);
+  } else if (comp && Load32(base, comp) == kUISlider) {
+    // Sliders take drags and the wheel, not A.
+    click = 0;
+    if (base[comp + kCompState] == kFocused) {
+      g_pointer_on_list = true;
+      if (pressed) {
+        g_slider_drag = {comp};
+        if (!SliderCanScroll(base, comp)) {
+          Press(rex::input::X_INPUT_GAMEPAD_A);
+          g_slider_drag.entered = true;
+        }
+        if (REXCVAR_GET(mouse_menu_debug)) {
+          REXLOG_INFO("Pointer: slider {:08X} grabbed at step {} (now {}){}", comp, SliderStepAt(base, comp, local),
+                      int(Load32(base, comp + kSliderCurrent)), g_slider_drag.entered ? ", selected first" : "");
+        }
+      }
+    }
   } else if (on_list && IsSongList(base, comp)) {
     bool selected = base[comp + kCompState] == kFocused &&
                     item == int(Load32(base, comp + kListState + kStateSelectedDisplay));
@@ -1359,13 +1610,29 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   if (moved && comp && (comp != g_target.comp || item != g_target.item)) {
     g_target = {comp, item, 0};
     if (debug) {
-      REXLOG_INFO("Pointer: over {:08X} (vtable {:08X}) item {} at local {:.2f} {:.2f} {:.2f}",
-                  comp, Load32(base, comp), item, local.x, local.y, local.z);
+      REXLOG_INFO("Pointer: over {:08X} (vtable {:08X}) item {} at local {:.2f} {:.2f} {:.2f}{}", comp,
+                  Load32(base, comp), item, local.x, local.y, local.z,
+                  g_list_rows.count(comp) ? fmt::format(", rows centred {:.2f} along, middle {:.1f} across",
+                                                        g_list_rows[comp].centre, g_list_rows[comp].across_mid)
+                                          : "");
     }
   }
   if (int notches = g_wheel_notches.exchange(0)) {
     uint32_t focused = FocusedComponent(base);
-    if (focused && IsList(Load32(base, focused))) {
+    if (focused && Load32(base, focused) == kUISlider && !g_slider_drag.slider) {
+      int current = int(Load32(base, focused + kSliderCurrent));
+      int steps = int(Load32(base, focused + kSliderSteps));
+      for (int n = 0; n < std::min(std::abs(notches), 4); ++n) {
+        int target = std::clamp(current + (notches > 0 ? 1 : -1) * (n + 1), 0, steps - 1);
+        if (target == current) break;
+        using namespace rex::input;
+        bool vertical = base[focused + kSliderVertical], up = notches > 0;
+        if (SliderCanScroll(base, focused)) {
+          Press(vertical ? (up ? X_INPUT_GAMEPAD_DPAD_UP : X_INPUT_GAMEPAD_DPAD_DOWN)
+                         : (up ? X_INPUT_GAMEPAD_DPAD_RIGHT : X_INPUT_GAMEPAD_DPAD_LEFT));
+        }
+      }
+    } else if (focused && IsList(Load32(base, focused))) {
       if (IsSongList(base, focused)) {
         ScrollSongList(ctx, base, focused, notches);
       } else {
@@ -1392,7 +1659,9 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
     return;
   }
   using namespace rex::input;
-  uint32_t target = g_target.comp;
+  // List of lists: the parent holds focus; pick the row there first.
+  uint32_t row_parent = ListParent(base, g_target.comp);
+  uint32_t target = row_parent ? row_parent : g_target.comp;
   if (base[target + kCompState] != kFocused) {
     uint32_t focused = FocusedComponent(base);
     // Nested screens (song list's VIEW MORE INFO) are their own PanelDir, but
@@ -1421,8 +1690,33 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
     g_target = {};
     return;
   }
-  // Within the focused list: select the item under the pointer, with the
-  // view where it is (scrolling is the wheel's job).
+  if (row_parent) {
+    // Empty cell in a short last row.
+    int child_first = int(Load32(base, g_target.comp + kListState + kStateFirstShowing));
+    if (child_first + g_target.item > NumShowing(ctx, base, g_target.comp) - 1) {
+      g_target = {};
+      return;
+    }
+    // Row = offset from the topmost row list, in parent spacings.
+    uint32_t dir = Load32(base, row_parent + kListDir);
+    bool vertical = Load32(base, dir + kDirOrientation) == 0;
+    float spacing = LoadF(base, dir + kDirSpacing);
+    auto along = [&](uint32_t c) {
+      Vec3 l = ToLocal(base, row_parent, LoadVec(base, c + kCompXfm + 48));
+      return vertical ? -l.z : l.x;
+    };
+    float top = 1e30f;
+    for (const auto& [c, drawn] : g_drawn) {
+      if (ListParent(base, c) == row_parent) top = std::min(top, along(c));
+    }
+    int row = spacing > 0 ? int(std::lround((along(g_target.comp) - top) / spacing)) : -1;
+    int first = int(Load32(base, row_parent + kListState + kStateFirstShowing));
+    int selected = int(Load32(base, row_parent + kListState + kStateSelectedDisplay));
+    if (row >= 0 && row != selected && first + row <= NumShowing(ctx, base, row_parent) - 1) {
+      SelectListItem(ctx, base, row_parent, first + row, first);
+    }
+    target = g_target.comp;
+  }
   int first = int(Load32(base, target + kListState + kStateFirstShowing));
   int selected = int(Load32(base, target + kListState + kStateSelectedDisplay));
   // Rows past the end of a short list are empty: nothing to select there.
@@ -1460,16 +1754,50 @@ REX_HOOK_RAW(MM_BANDBUTTON_DRAW) {
   MM_BANDBUTTON_DRAW_ORIG(ctx, base);
 }
 REX_HOOK_RAW(MM_BANDLIST_DRAW) {
-  NoteDrawn(ctx.r3.u32, base);
+  uint32_t list = ctx.r3.u32, outer = g_list_drawing;  // a list of lists draws its rows' lists
+  NoteDrawn(list, base);
+  g_list_drawing = list;
   MM_BANDLIST_DRAW_ORIG(ctx, base);
+  g_list_drawing = outer;
+  FinishListRows(list);
 }
 REX_HOOK_RAW(MM_LABEL_DRAW) {
   NoteDrawn(ctx.r3.u32, base);
   MM_LABEL_DRAW_ORIG(ctx, base);
 }
 REX_HOOK_RAW(MM_UILIST_DRAW) {
-  NoteDrawn(ctx.r3.u32, base);
+  uint32_t list = ctx.r3.u32, outer = g_list_drawing;
+  NoteDrawn(list, base);
+  g_list_drawing = list;
   MM_UILIST_DRAW_ORIG(ctx, base);
+  g_list_drawing = outer;
+  FinishListRows(list);
+}
+REX_HOOK_RAW(MM_SLIDER_DRAW) {
+  uint32_t slider = ctx.r3.u32;
+  NoteDrawn(slider, base);
+  g_slider_meshes.clear();
+  g_slider_drawing = slider;
+  MM_SLIDER_DRAW_ORIG(ctx, base);
+  g_slider_drawing = 0;
+  const SliderMesh* knob = nullptr;
+  for (const auto& m : g_slider_meshes) {
+    if (m.radius > 0 && (!knob || m.radius < knob->radius)) knob = &m;
+  }
+  if (!knob) return;
+  bool vertical = base[slider + kSliderVertical];
+  auto along = [&](Vec3 v) { return vertical ? v.z : v.x; };
+  auto across = [&](Vec3 v) { return vertical ? v.x : v.z; };
+  const SliderMesh* track = nullptr;
+  for (const auto& m : g_slider_meshes) {
+    if (&m == knob || std::fabs(along(m.centre) - along(knob->centre)) > m.radius) continue;
+    if (!track || m.radius > track->radius) track = &m;
+  }
+  if (!track) return;
+  float lo = along(track->centre) - track->radius, hi = along(track->centre) + track->radius;
+  float mid = across(knob->centre), half = knob->radius;
+  g_slider_boxes[slider] = vertical ? LocalBox{mid - half, hi, mid + half, lo} : LocalBox{lo, mid + half, hi, mid - half};
+  g_slider_travel[slider] = {lo + knob->radius, hi - knob->radius};
 }
 // Preview picks to dim: scores in (from, to].
 uint32_t g_review_drawing = 0;
@@ -1483,6 +1811,28 @@ constexpr uint32_t kMeshMat = 0xF8, kMatColor = 0x2C;
 constexpr float kReviewDimmed = 0.65f;
 REX_HOOK_RAW(MM_DXMESH_DRAW) {
   uint32_t mesh = ctx.r3.u32;
+  if (g_list_drawing && !g_slider_drawing) {
+    auto scale = [&](uint32_t xfm) {
+      Vec3 a = LoadVec(base, xfm);
+      return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    };
+    float list_scale = scale(g_list_drawing + kCompXfm);
+    float radius = list_scale > 1e-6f ? LoadF(base, mesh + kMeshRadius) * scale(mesh + kCompXfm) / list_scale : 0;
+    NoteListMesh(base, g_list_drawing, mesh, Transform(base, mesh + kCompXfm, LoadVec(base, mesh + kMeshSphere)),
+                 std::clamp(radius, 0.f, 1000.f));
+  }
+  if (g_slider_drawing && g_slider_meshes.size() < 16) {
+    auto scale = [&](uint32_t xfm) {
+      Vec3 a = LoadVec(base, xfm);
+      return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    };
+    float slider_scale = scale(g_slider_drawing + kCompXfm);
+    Vec3 world = Transform(base, mesh + kCompXfm, LoadVec(base, mesh + kMeshSphere));
+    if (slider_scale > 1e-6f) {
+      g_slider_meshes.push_back({ToLocal(base, g_slider_drawing, world),
+                                 LoadF(base, mesh + kMeshRadius) * scale(mesh + kCompXfm) / slider_scale});
+    }
+  }
   uint32_t mat = g_review_drawing ? Load32(base, mesh + kMeshMat) : 0;
   if (mat < 0x40000000 || mat >= 0x50000000) return MM_DXMESH_DRAW_ORIG(ctx, base);
   Vec3 local = ToLocal(base, g_review_drawing, LoadVec(base, mesh + kCompXfm + 48));

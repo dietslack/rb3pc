@@ -17,8 +17,8 @@ contains no game files, and the build only works with files you provide.
 
 ## Known issues
 
-Windows builds haven't been tried yet. Not every Rock Band 3 Deluxe feature
-has been checked.
+The mouse only controls player 1. Windows builds haven't been tried yet. Not
+every Rock Band 3 Deluxe feature has been checked.
 
 ## Credits
 

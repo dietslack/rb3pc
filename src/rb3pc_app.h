@@ -29,6 +29,7 @@
 #include "mouse_menus.h"
 #include "rb3_ui.h"
 #include "custom_songs.h"
+#include "mouse_cursor.h"
 #include "profile.h"
 #include "screenshot.h"
 #include "script_patches.h"
@@ -125,6 +126,7 @@ class Rb3pcApp : public rex::ReXApp {
                             }
                           });
 
+    mouse_cursor_ = rb3pc::CreateMouseCursorController(drawer, window());
     fps_overlay_ = rb3pc::CreateFpsOverlay(drawer);
     pointer_overlay_ = rb3pc::CreatePointerOverlay(
         drawer, [this] { return immediate_drawer(); }, game_data_root());
@@ -153,6 +155,7 @@ class Rb3pcApp : public rex::ReXApp {
     display_dialog_.reset();
     fps_overlay_.reset();
     pointer_overlay_.reset();
+    mouse_cursor_.reset();
     loading_screen_.reset();
     launcher_.reset();
   }
@@ -198,6 +201,7 @@ class Rb3pcApp : public rex::ReXApp {
   std::unique_ptr<rex::ui::ImGuiDialog> display_dialog_;
   std::unique_ptr<rex::ui::ImGuiDialog> fps_overlay_;
   std::unique_ptr<rex::ui::ImGuiDialog> pointer_overlay_;
+  std::unique_ptr<rex::ui::ImGuiDialog> mouse_cursor_;
   std::unique_ptr<rex::ui::ImGuiDialog> loading_screen_;
   std::unique_ptr<rex::ui::ImGuiDialog> launcher_;
   rex::ui::ImGuiDrawer* imgui_drawer_ = nullptr;

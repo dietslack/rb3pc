@@ -28,6 +28,7 @@
 #include "display_options.h"
 #include "input_bindings.h"
 #include "instrument_input.h"
+#include "mouse_cursor.h"
 #include "profile.h"
 #include "rb3_ui.h"
 
@@ -183,6 +184,9 @@ class Repeater {
 };
 
 constexpr const char* kControllerTypes[] = {"auto", "guitar", "drums", "gamepad", "none"};
+constexpr const char* kMouseCursorLabels[] = {"HIDE WHEN IDLE", "ALWAYS SHOW", "ALWAYS HIDE"};
+static_assert(std::size(kMouseCursorLabels) == std::size(rb3pc::kMouseCursorModes));
+
 constexpr const char* kControllerTypeLabels[] = {"AUTO", "GUITAR", "DRUMS", "GAMEPAD / VOCALS",
                                                "NONE (IGNORED)"};
 
@@ -220,6 +224,7 @@ enum class Row {
   kController3,
   kController4,
   kMouseKeyboard,
+  kMouseCursor,
   kShowLauncher,
   kQuit,
   kCount,
@@ -245,7 +250,7 @@ std::vector<Row> SectionRows(Section section, size_t extra_songs_folders) {
     case Section::kAudio: return {Row::kAudioBuffer, Row::kAudioDevice};
     case Section::kControllers:
       return {Row::kController1, Row::kController2, Row::kController3, Row::kController4,
-              Row::kMouseKeyboard};
+              Row::kMouseKeyboard, Row::kMouseCursor};
     case Section::kGame: return {Row::kProfile, Row::kQuickStart, Row::kShowLauncher};
     default: return {};
   }
@@ -379,6 +384,14 @@ class Launcher final : public rex::ui::ImGuiDialog {
     if (!hooks_.config_path.empty()) rex::cvar::SaveConfig(hooks_.config_path);
   }
 
+  static int MouseCursorIndex() {
+    std::string mode = MouseCursorMode();
+    for (int i = 0; i < int(std::size(kMouseCursorModes)); ++i) {
+      if (mode == kMouseCursorModes[i]) return i;
+    }
+    return 0;
+  }
+
   static int ControllerIndex(int slot) {
     std::string value = rex::cvar::GetFlagByName(ControllerCvar(slot).c_str());
     for (int i = 0; i < int(std::size(kControllerTypes)); ++i) {
@@ -410,6 +423,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
         return kAudioQueueCount;
       case Row::kAudioDevice:
         return kAudioDeviceCount;
+      case Row::kMouseCursor:
+        return int(std::size(kMouseCursorModes));
       case Row::kController1:
       case Row::kController2:
       case Row::kController3:
@@ -444,6 +459,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
         return AudioQueueIndex();
       case Row::kAudioDevice:
         return AudioDeviceIndex();
+      case Row::kMouseCursor:
+        return MouseCursorIndex();
       case Row::kController1:
       case Row::kController2:
       case Row::kController3:
@@ -488,6 +505,9 @@ class Launcher final : public rex::ui::ImGuiDialog {
         break;
       case Row::kAudioDevice:
         SetAudioDeviceIndex(index);
+        break;
+      case Row::kMouseCursor:
+        SetMouseCursorMode(kMouseCursorModes[index]);
         break;
       case Row::kController1:
       case Row::kController2:
@@ -569,6 +589,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kController3: return "CONTROLLER 3";
       case Row::kController4: return "CONTROLLER 4";
       case Row::kMouseKeyboard: return "MOUSE & KEYBOARD IN MENUS";
+      case Row::kMouseCursor: return "MOUSE CURSOR";
       case Row::kShowLauncher: return "SHOW THIS SCREEN AT STARTUP";
       case Row::kQuit: return "QUIT";
       default: return "";
@@ -604,6 +625,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kFrameLimit: return Upper(kLimitLabels[index]);
       case Row::kAudioBuffer: return Upper(kAudioQueueLabels[index]);
       case Row::kAudioDevice: return Upper(kAudioDeviceLabels[index]);
+      case Row::kMouseCursor: return kMouseCursorLabels[index];
       case Row::kController1:
       case Row::kController2:
       case Row::kController3:
@@ -623,6 +645,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
     if (SelectedRow() != songs_remove_armed_) songs_remove_armed_ = Row::kCount;
     uint32_t held = pads_.Poll();
     uint32_t pad_pressed = repeater_.Update(held);
+    if (pad_pressed) NoteControllerPress();
     uint32_t pressed = pad_pressed;
 
     auto key = [](ImGuiKey k) { return ImGui::IsKeyPressed(k, true); };

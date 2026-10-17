@@ -20,6 +20,8 @@
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
 
+#include "mouse_cursor.h"
+
 
 // By SDL connection order. "auto" uses SDL's joystick type, else gamepad.
 // "none" hides the device; the next one takes its player slot.
@@ -261,6 +263,15 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
       out_state->gamepad.buttons = uint16_t(out_state->gamepad.buttons) | scripted;
       out_state->packet_number = uint32_t(out_state->packet_number) + script_packets;
     }
+    {
+      std::lock_guard lock(mutex_);
+      for (auto& device : devices_) {
+        if (device.id != id) continue;
+        uint16_t buttons = out_state->gamepad.buttons;
+        if (buttons & ~device.last_buttons) NoteControllerPress();
+        device.last_buttons = buttons;
+      }
+    }
     if (REXCVAR_GET(instrument_input_log)) {
       LogState(id, instrument, *out_state);
     }
@@ -294,6 +305,7 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
     Instrument instrument = Instrument::kGamepad;
     std::string setting;  // controller_type_N value the instrument came from
     X_INPUT_STATE last_logged{};
+    uint16_t last_buttons = 0;  // for NoteControllerPress
   };
 
   Instrument Resolve(Device& device) {
