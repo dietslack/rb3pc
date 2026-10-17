@@ -895,3 +895,15 @@
            assert_not_zero(transfer_invocation_rectangle_count);
            for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
              const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3963,7 +3963,8 @@
+     }
+   }
+   // Set up the render targets - this may perform dispatches and draws.
+-  render_target_cache_->SetNextDrawPixelShaderKills(pixel_shader && pixel_shader->kills_pixels());
++  render_target_cache_->SetNextDrawPixelShader(pixel_shader, interpolator_mask,
++                                               ps_param_gen_pos != UINT32_MAX);
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
