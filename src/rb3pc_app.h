@@ -72,12 +72,9 @@ class Rb3pcApp : public rex::ReXApp {
     if (!rex::cvar::HasNonDefaultValue("gpu_allow_invalid_fetch_constants")) {
       rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
     }
-    // RB3 opens custom song packages one at a time when it first adds them
-    // to its song cache, each open completing asynchronously. The SDK waits
-    // 100 ms before completing each (console-like latency), so a first scan
-    // of 1,000 packages took 100 s just waiting. 1 ms keeps it asynchronous.
-    if (!rex::cvar::HasNonDefaultValue("xam_deferred_overlapped_delay_ms")) {
-      rex::cvar::SetFlagByName("xam_deferred_overlapped_delay_ms", "1");
+    // Old builds saved 1 ms, which hung the content scan ~1 boot in 3.
+    if (rex::cvar::GetFlagByName("xam_deferred_overlapped_delay_ms") == "1") {
+      rex::cvar::SetFlagByName("xam_deferred_overlapped_delay_ms", "100");
     }
     // Character textures are GPU-composited then CPU-compressed into the same
     // memory each time; "some" reads back only once (stale characters), "full"

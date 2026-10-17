@@ -61,6 +61,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -806,6 +807,14 @@ void SelectListItem(PPCContext& ctx, uint8_t* base, uint32_t list, int pos, int 
 }
 
 
+// Lists whose highlight is fixed: circular (UIListState::mCircular, +0; DX's
+// overshell modifiers) or seen scrolling on a pointer select. Hover-select
+// would run away to the end, so these are wheel + click, like the song list.
+std::unordered_set<uint32_t> g_pinned_lists;
+bool IsPinnedList(const uint8_t* base, uint32_t list) {
+  return base[list + kListState] != 0 || g_pinned_lists.count(list);
+}
+
 void ScrollList(PPCContext& ctx, uint8_t* base, uint32_t list, int notches) {
   int first = int(Load32(base, list + kListState + kStateFirstShowing));
   int display = int(Load32(base, list + kListState + kStateSelectedDisplay));
@@ -1426,8 +1435,10 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   for (auto it = g_list_rows.begin(); it != g_list_rows.end();) {
     it = g_drawn.count(it->first) ? std::next(it) : g_list_rows.erase(it);
   }
-  // Nothing while a system dialog (the keyboard, a message box) is up: it
-  // has the input, and the menu behind it shouldn't move.
+  for (auto it = g_pinned_lists.begin(); it != g_pinned_lists.end();) {
+    it = g_drawn.count(*it) ? std::next(it) : g_pinned_lists.erase(it);
+  }
+  // XAM dialogs (keyboard, message box) own the input.
   if (!REXCVAR_GET(mnk_mode) || rex::kernel::xam::xeXamIsUIActive()) {
     g_pointer_on_list = false;
     g_click_buttons = -1;
@@ -1595,6 +1606,23 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
         }
       }
     }
+  } else if (on_list && !IsSongList(base, comp) && IsPinnedList(base, comp)) {
+    // Click selects the row, then A; on the highlighted row the click's own A does it.
+    bool focused = base[comp + kCompState] == kFocused;
+    int selected = int(Load32(base, comp + kListState + kStateSelectedDisplay));
+    if (focused && item >= 0 && item != selected) {
+      click = 0;
+      int count = NumShowing(ctx, base, comp);
+      if (pressed && count > 0) {
+        int first = int(Load32(base, comp + kListState + kStateFirstShowing));
+        int pos = base[comp + kListState] ? (first + item) % count : first + item;
+        if (pos < count) {
+          SelectListItem(ctx, base, comp, pos, first);
+          Press(rex::input::X_INPUT_GAMEPAD_A);
+        }
+      }
+    }
+    item = -1;
   } else if (on_list && IsSongList(base, comp)) {
     bool selected = base[comp + kCompState] == kFocused &&
                     item == int(Load32(base, comp + kListState + kStateSelectedDisplay));
@@ -1723,6 +1751,7 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   int last = NumShowing(ctx, base, target) - 1;
   if (selected != g_target.item && first + g_target.item <= last) {
     SelectListItem(ctx, base, target, first + g_target.item, first);
+    if (int(Load32(base, target + kListState + kStateFirstShowing)) != first) g_pinned_lists.insert(target);
   }
   g_target = {};
 }
@@ -1762,7 +1791,15 @@ REX_HOOK_RAW(MM_BANDLIST_DRAW) {
   FinishListRows(list);
 }
 REX_HOOK_RAW(MM_LABEL_DRAW) {
-  NoteDrawn(ctx.r3.u32, base);
+  uint32_t label = ctx.r3.u32;
+  // The overshell's controller ring (pad_num.lbl: the Xbox ring-of-light
+  // quadrant of the player's controller, a buttons-font glyph): there's no
+  // ring of light here, so it isn't drawn.
+  if (uint32_t object = Load32(base, label + 0x30);
+      object > label && object < label + 0x400 && ObjectName(base, object) == "pad_num.lbl") {
+    return;
+  }
+  NoteDrawn(label, base);
   MM_LABEL_DRAW_ORIG(ctx, base);
 }
 REX_HOOK_RAW(MM_UILIST_DRAW) {

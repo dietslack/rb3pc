@@ -1,0 +1,209 @@
+--- a/include/rex/filesystem/devices/stfs_container_device.h
++++ b/include/rex/filesystem/devices/stfs_container_device.h
+@@ -15,6 +15,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <unordered_map>
+ 
+@@ -122,6 +123,13 @@
+ 
+   const StfsHashEntry* GetBlockHash(uint32_t block_index);
+ 
++  friend class StfsContainerEntry;
++  friend class StfsContainerFile;
++  // Fills an STFS file's block list (its chain of blocks, from the hash
++  // tables) if it hasn't been yet: done when the file is opened rather than
++  // for every file when the package is mounted.
++  void ResolveBlocks(StfsContainerEntry* entry);
++
+   std::string name_;
+   std::filesystem::path host_path_;
+ 
+@@ -137,6 +145,9 @@
+   uint32_t block_step[2];
+ 
+   std::unordered_map<size_t, StfsHashTable> cached_hash_tables_;
++  // Guards the package's file handles (each read is a seek, then a read)
++  // and the hash table cache: files are opened and read on any thread.
++  std::mutex io_mutex_;
+ };
+ 
+ }  // namespace rex::filesystem
+--- a/include/rex/filesystem/devices/stfs_container_entry.h
++++ b/include/rex/filesystem/devices/stfs_container_entry.h
+@@ -55,6 +55,12 @@
+   size_t data_size_;
+   size_t block_;
+   std::vector<BlockRecord> block_list_;
++  // STFS files: block_list_ is filled when the file is first opened (see
++  // StfsContainerDevice::ResolveBlocks), from these.
++  bool blocks_pending_ = false;
++  bool contiguous_ = false;
++  uint32_t start_block_ = 0;
++  uint32_t allocated_blocks_ = 0;
+ };
+ 
+ }  // namespace rex::filesystem
+--- a/src/filesystem/devices/stfs_container_device.cpp
++++ b/src/filesystem/devices/stfs_container_device.cpp
+@@ -596,41 +596,15 @@
+ 
+       all_entries.push_back(entry.get());
+ 
+-      // Fill in all block records.
+-      // It's easier to do this now and just look them up later, at the cost
+-      // of some memory. Nasty chain walk.
+-      // TODO(benvanik): optimize if flags.contiguous is set.
++      // The file's blocks are found when it's opened (ResolveBlocks): the
++      // chain walk reads one hash table per 170 blocks, scattered through the
++      // package, which for every file of a multi-gigabyte package took
++      // seconds per mount, on every boot. Listing needs only names and sizes.
+       if (entry->attributes() & system::X_FILE_ATTRIBUTE_NORMAL) {
+-        uint32_t block_index = dir_entry.start_block_number();
+-        size_t remaining_size = dir_entry.length;
+-        while (remaining_size && block_index != kEndOfChain) {
+-          size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
+-          size_t offset = BlockToOffsetSTFS(block_index);
+-          entry->block_list_.push_back({0, offset, block_size});
+-          remaining_size -= block_size;
+-          auto block_hash = GetBlockHash(block_index);
+-          block_index = block_hash->level0_next_block();
+-        }
+-
+-        if (remaining_size) {
+-          // Loop above must have exited prematurely, bad hash tables?
+-          REXFS_WARN(
+-              "STFS file {} only found {} bytes for file, expected {} ({} "
+-              "bytes missing)",
+-              name, dir_entry.length.get() - remaining_size, dir_entry.length.get(),
+-              remaining_size);
+-          assert_always();
+-        }
+-
+-        // Check that the number of blocks retrieved from hash entries matches
+-        // the block count read from the file entry
+-        if (entry->block_list_.size() != dir_entry.allocated_data_blocks()) {
+-          REXFS_WARN(
+-              "STFS failed to read correct block-chain for entry {}, read {} "
+-              "blocks, expected {}",
+-              entry->name_, entry->block_list_.size(), dir_entry.allocated_data_blocks());
+-          assert_always();
+-        }
++        entry->blocks_pending_ = true;
++        entry->contiguous_ = dir_entry.flags.contiguous;
++        entry->start_block_ = dir_entry.start_block_number();
++        entry->allocated_blocks_ = dir_entry.allocated_data_blocks();
+       }
+ 
+       parent_entry->children_.emplace_back(std::move(entry));
+@@ -652,6 +626,62 @@
+   return Error::kSuccess;
+ }
+ 
++void StfsContainerDevice::ResolveBlocks(StfsContainerEntry* entry) {
++  std::lock_guard lock(io_mutex_);
++  if (!entry->blocks_pending_) {
++    return;
++  }
++  entry->blocks_pending_ = false;
++  // Blocks that follow each other in the file share one record (reads walk
++  // the records, so fewer is faster, and a big file has thousands of
++  // blocks). A contiguous file's blocks are consecutive: no hash tables.
++  auto& records = entry->block_list_;
++  auto add_block = [&records](size_t offset, size_t size) {
++    if (!records.empty() && records.back().file == 0 &&
++        records.back().offset + records.back().length == offset) {
++      records.back().length += size;
++    } else {
++      records.push_back({0, offset, size});
++    }
++  };
++  uint32_t block_index = entry->start_block_;
++  size_t remaining_size = entry->data_size_;
++  size_t block_count = 0;
++  if (entry->contiguous_) {
++    while (remaining_size) {
++      size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
++      add_block(BlockToOffsetSTFS(block_index), block_size);
++      remaining_size -= block_size;
++      ++block_index;
++      ++block_count;
++    }
++  } else {
++    while (remaining_size && block_index != kEndOfChain) {
++      size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
++      add_block(BlockToOffsetSTFS(block_index), block_size);
++      remaining_size -= block_size;
++      ++block_count;
++      auto block_hash = GetBlockHash(block_index);
++      if (!block_hash) {
++        break;
++      }
++      block_index = block_hash->level0_next_block();
++    }
++  }
++
++  if (remaining_size) {
++    // Loop above must have exited prematurely, bad hash tables?
++    REXFS_WARN("STFS file {} only found {} bytes for file, expected {} ({} bytes missing)",
++               entry->name_, entry->data_size_ - remaining_size, entry->data_size_, remaining_size);
++  }
++  // Check that the number of blocks retrieved from hash entries matches the
++  // block count read from the file entry
++  if (block_count != entry->allocated_blocks_) {
++    REXFS_WARN("STFS failed to read correct block-chain for entry {}, read {} blocks, expected {}",
++               entry->name_, block_count, entry->allocated_blocks_);
++  }
++}
++
+ size_t StfsContainerDevice::BlockToOffsetSTFS(uint64_t block_index) const {
+   // For every level there is a hash table
+   // Level 0: hash table of next 170 blocks
+--- a/src/filesystem/devices/stfs_container_entry.cpp
++++ b/src/filesystem/devices/stfs_container_entry.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/filesystem/devices/stfs_container_entry.h>
++#include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/filesystem/devices/stfs_container_file.h>
+ 
+ #include <map>
+@@ -34,6 +35,9 @@
+ }
+ 
+ X_STATUS StfsContainerEntry::Open(uint32_t desired_access, File** out_file) {
++  if (blocks_pending_) {
++    static_cast<StfsContainerDevice*>(device_)->ResolveBlocks(this);
++  }
+   *out_file = new StfsContainerFile(desired_access, this);
+   return X_STATUS_SUCCESS;
+ }
+--- a/src/filesystem/devices/stfs_container_file.cpp
++++ b/src/filesystem/devices/stfs_container_file.cpp
+@@ -9,10 +9,12 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/filesystem/devices/stfs_container_entry.h>
+ #include <rex/filesystem/devices/stfs_container_file.h>
+ 
+ #include <algorithm>
++#include <mutex>
+ #include <cmath>
+ 
+ #include <rex/math.h>
+@@ -39,6 +41,9 @@
+   size_t remaining_length = std::min(buffer.size(), entry_->size() - byte_offset);
+ 
+   *out_bytes_read = 0;
++  // One file handle per package part, shared by every file in it: seek and
++  // read without another thread's seek in between.
++  std::lock_guard lock(static_cast<StfsContainerDevice*>(entry_->device())->io_mutex_);
+   for (size_t i = 0; i < entry_->block_list().size(); i++) {
+     auto& record = entry_->block_list()[i];
+     if (src_offset + record.length <= byte_offset) {

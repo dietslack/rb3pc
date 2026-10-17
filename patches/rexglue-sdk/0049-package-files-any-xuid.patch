@@ -1,0 +1,16 @@
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -244,8 +244,11 @@
+ 
+ const ContentManager::PackageFile* ContentManager::FindPackageFile(
+     const XCONTENT_AGGREGATE_DATA& data) const {
+-  uint64_t xuid = data.xuid;
+-  if (package_files_.empty() || (xuid != 0 && xuid != uint64_t(-1))) {
++  // Package files belong to no profile, so the request's xuid doesn't
++  // matter: enumerations list them with 0, but titles keep the content data
++  // and pass it back later with their own xuid filled in (RB3's song cache
++  // does for marketplace content, type 2), and that has to find it too.
++  if (package_files_.empty()) {
+     return nullptr;
+   }
+   std::string file_name = data.file_name();
