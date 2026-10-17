@@ -150,7 +150,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/game/rb3dx/default.xex")
     add_custom_target(rb3pc_dx_codegen
         DEPENDS "${RB3PC_DX_GENERATED_DIR}/codegen.build.stamp")
 
-    add_executable(rb3pc-dx ${RB3PC_SOURCES} src/deluxe_exe.cpp "${RB3PC_DX_REFERENCE}")
+    add_executable(rb3pc-dx ${RB3PC_SOURCES} src/deluxe_exe.cpp src/rb3e_functions.cpp
+        "${RB3PC_DX_REFERENCE}")
     target_compile_definitions(rb3pc-dx PRIVATE RB3PC_DX)
     if(RB3PC_DX_GENERATED_SOURCES)
         add_library(rb3pc-dx_recomp OBJECT ${RB3PC_DX_GENERATED_SOURCES})

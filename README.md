@@ -17,7 +17,8 @@ contains no game files, and the build only works with files you provide.
 
 ## Known issues
 
-Windows builds haven't been tried yet.
+Windows builds haven't been tried yet. Not every Rock Band 3 Deluxe feature
+has been checked.
 
 ## Credits
 
@@ -26,4 +27,6 @@ Windows builds haven't been tried yet.
 | [ReXGlue](https://github.com/rexglue/rexglue-sdk) | The recompiler and Xbox 360 runtime this port is built on |
 | [Xenia](https://github.com/xenia-project/xenia) | The Xbox 360 emulator that ReXGlue's runtime and graphics come from |
 | [Rock Band 3 decompilation](https://github.com/DarkRTA/rb3) | Reference for the game's internals: class layouts, function names, file formats |
+| [Rock Band 3 Deluxe](https://github.com/hmxmilohax/rock-band-3-deluxe) | The mod rb3pc can run; its executable is recompiled as `rb3pc-dx` |
+| [RB3Enhanced](https://github.com/RBEnhanced/RB3Enhanced) | Reference for the script functions Deluxe expects (rb3pc has its own versions) and their Xbox 360 addresses |
 | [onyx](https://github.com/mtolly/onyx) (moggcrypt) | The decryption keys for the game's song audio files |

@@ -47,7 +47,8 @@ bool NeedsOtherExecutable();
 // Returns an error message on failure.
 std::string RunOtherExecutable();
 
-// Set in a process started by RunOtherExecutable: the launcher already ran.
+// Same, for this executable (game restart).
+std::string RestartExecutable();
 bool LaunchedByOtherExecutable();
 
 // rb3pc-dx: writes dx_settings.dta in the overlay from launcher options.

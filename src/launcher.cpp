@@ -199,6 +199,7 @@ enum class Row {
   kPlay,
   kProfile,
   kDeluxe,
+  kDeluxeRb3e,
   kDeluxeInstall,
   kSongsDefault,
   kSongsExtra1,
@@ -230,7 +231,7 @@ static_assert(int(Row::kSongsAdd) - int(Row::kSongsExtra1) == int(rb3pc::kMaxExt
 
 std::vector<Row> SectionRows(Section section, size_t extra_songs_folders) {
   switch (section) {
-    case Section::kDeluxe: return {Row::kDeluxe, Row::kDeluxeInstall};
+    case Section::kDeluxe: return {Row::kDeluxe, Row::kDeluxeRb3e, Row::kDeluxeInstall};
     case Section::kSongs: {
       std::vector<Row> rows = {Row::kSongsDefault};
       for (size_t i = 0; i < extra_songs_folders; ++i) {
@@ -393,6 +394,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
   int ChoiceCount(Row row) const {
     switch (row) {
       case Row::kDeluxe:
+      case Row::kDeluxeRb3e:
         return DeluxeInstalled() && DeluxeExecutableAvailable() ? 2 : 0;
       case Row::kQuickStart:
       case Row::kMouseKeyboard:
@@ -422,6 +424,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
     switch (row) {
       case Row::kDeluxe:
         return DeluxeEnabled() ? 1 : 0;
+      case Row::kDeluxeRb3e:
+        return GetBoolFlag("deluxe_rb3e_functions") ? 1 : 0;
       case Row::kDisplayMode:
         return hooks_.is_fullscreen() ? 1 : 0;
       case Row::kFpsCounter:
@@ -454,6 +458,9 @@ class Launcher final : public rex::ui::ImGuiDialog {
     switch (row) {
       case Row::kDeluxe:
         SetDeluxeEnabled(index == 1);
+        break;
+      case Row::kDeluxeRb3e:
+        rex::cvar::SetFlagByName("deluxe_rb3e_functions", index ? "true" : "false");
         break;
       case Row::kDisplayMode:
         hooks_.set_fullscreen(index == 1);
@@ -541,6 +548,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kPlay: return "PLAY";
       case Row::kProfile: return "PROFILE NAME";
       case Row::kDeluxe: return "ROCK BAND 3 DELUXE";
+      case Row::kDeluxeRb3e: return "RB3ENHANCED FEATURES";
       case Row::kDeluxeInstall: return DeluxeInstalled() ? "UPDATE DELUXE" : "INSTALL DELUXE";
       case Row::kSongsDefault: return "SONGS FOLDER";
       case Row::kSongsExtra1:
@@ -576,6 +584,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
         return SanitizeProfileName(name).empty() ? ProfileName() : SanitizeProfileName(name);
       }
       case Row::kDeluxe:
+      case Row::kDeluxeRb3e:
         if (!DeluxeExecutableAvailable()) return "NOT BUILT";
         return DeluxeInstalled() ? (index ? "ON" : "OFF") : "NOT INSTALLED";
       case Row::kDeluxeInstall: {
@@ -957,7 +966,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
 
   bool IsCheckbox(Row row) const {
     return (row == Row::kFpsCounter || row == Row::kQuickStart || row == Row::kShowLauncher ||
-            row == Row::kDeluxe || row == Row::kMouseKeyboard) &&
+            row == Row::kDeluxe || row == Row::kDeluxeRb3e || row == Row::kMouseKeyboard) &&
            ChoiceCount(row);
   }
 

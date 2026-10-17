@@ -31,6 +31,11 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(deluxe, false, "rb3pc", "Load Rock Band 3 Deluxe (when installed)");
+// Used by rb3pc-dx (rb3e_functions.cpp); defined here for the launcher.
+REXCVAR_DEFINE_BOOL(deluxe_rb3e_functions, true, "rb3pc",
+                    "Rock Band 3 Deluxe: provide the RB3Enhanced script functions it uses (song "
+                    "details, Play a Show, deleting the song cache, restarting the game)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 
 namespace rb3pc {
@@ -386,11 +391,10 @@ bool LaunchedByOtherExecutable() {
   return value && *value;
 }
 
-std::string RunOtherExecutable() {
-  fs::path target = OtherExecutable();
-  // Never bounce back and forth: a handed-off process doesn't hand off again.
-  if (LaunchedByOtherExecutable()) return "Already handed over once; not switching again.";
-  REXLOG_INFO("Deluxe: switching to {}", target.string());
+namespace {
+
+std::string ReplaceProcess(const fs::path& target) {
+  rex::FlushLogging();
 #ifdef _WIN32
   _putenv_s(kHandoffEnv, "1");
   int argc = 0;
@@ -416,6 +420,29 @@ std::string RunOtherExecutable() {
   execv(target_str.c_str(), argv.data());
   return "Couldn't start " + target_str + ": " + std::strerror(errno);
 #endif
+}
+
+}  // namespace
+
+std::string RunOtherExecutable() {
+  fs::path target = OtherExecutable();
+  // No ping-pong.
+  if (LaunchedByOtherExecutable()) return "Already handed over once; not switching again.";
+  REXLOG_INFO("Deluxe: switching to {}", target.string());
+  return ReplaceProcess(target);
+}
+
+std::string RestartExecutable() {
+#ifdef _WIN32
+  wchar_t path[MAX_PATH];
+  fs::path target(std::wstring(path, GetModuleFileNameW(nullptr, path, MAX_PATH)));
+#else
+  std::error_code ec;
+  fs::path target = fs::read_symlink("/proc/self/exe", ec);
+  if (ec) return "Couldn't find this executable: " + ec.message();
+#endif
+  REXLOG_INFO("Deluxe: restarting {}", target.string());
+  return ReplaceProcess(target);
 }
 
 #ifdef RB3PC_DX
