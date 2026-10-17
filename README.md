@@ -4,7 +4,7 @@ A PC port of Rock Band 3.
 
 The Xbox 360 version of the game is converted ahead of time into a regular
 PC program, then fixed up and extended so it plays well on a computer: windowed or
-fullscreen play and mouse support.
+fullscreen play, mouse support, and custom songs.
 It can also run the popular [Rock Band 3 Deluxe](https://github.com/hmxmilohax/rock-band-3-deluxe)
 mod.
 
@@ -26,3 +26,4 @@ Windows builds haven't been tried yet.
 | [ReXGlue](https://github.com/rexglue/rexglue-sdk) | The recompiler and Xbox 360 runtime this port is built on |
 | [Xenia](https://github.com/xenia-project/xenia) | The Xbox 360 emulator that ReXGlue's runtime and graphics come from |
 | [Rock Band 3 decompilation](https://github.com/DarkRTA/rb3) | Reference for the game's internals: class layouts, function names, file formats |
+| [onyx](https://github.com/mtolly/onyx) (moggcrypt) | The decryption keys for the game's song audio files |

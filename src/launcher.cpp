@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,10 +18,12 @@
 #include <SDL3/SDL.h>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/input.h>
 #include <rex/ui/imgui_dialog.h>
 
 #include "audio_options.h"
+#include "custom_songs.h"
 #include "deluxe.h"
 #include "display_options.h"
 #include "input_bindings.h"
@@ -197,6 +200,13 @@ enum class Row {
   kProfile,
   kDeluxe,
   kDeluxeInstall,
+  kSongsDefault,
+  kSongsExtra1,
+  kSongsExtra2,
+  kSongsExtra3,
+  kSongsExtra4,
+  kSongsExtra5,
+  kSongsAdd,
   kDisplayMode,
   kResolution,
   kFrameLimit,
@@ -214,13 +224,21 @@ enum class Row {
   kCount,
 };
 
-// The top level lists PLAY, these categories and QUIT; a category opens its
-// settings (green / A / Enter), and red / B / Escape goes back.
-enum class Section { kDeluxe, kVideo, kAudio, kControllers, kGame, kCount };
+enum class Section { kDeluxe, kSongs, kVideo, kAudio, kControllers, kGame, kCount };
 
-std::vector<Row> SectionRows(Section section) {
+static_assert(int(Row::kSongsAdd) - int(Row::kSongsExtra1) == int(rb3pc::kMaxExtraSongsFolders));
+
+std::vector<Row> SectionRows(Section section, size_t extra_songs_folders) {
   switch (section) {
     case Section::kDeluxe: return {Row::kDeluxe, Row::kDeluxeInstall};
+    case Section::kSongs: {
+      std::vector<Row> rows = {Row::kSongsDefault};
+      for (size_t i = 0; i < extra_songs_folders; ++i) {
+        rows.push_back(Row(int(Row::kSongsExtra1) + int(i)));
+      }
+      if (extra_songs_folders < rb3pc::kMaxExtraSongsFolders) rows.push_back(Row::kSongsAdd);
+      return rows;
+    }
     case Section::kVideo:
       return {Row::kDisplayMode, Row::kResolution, Row::kFrameLimit, Row::kFpsCounter};
     case Section::kAudio: return {Row::kAudioBuffer, Row::kAudioDevice};
@@ -235,6 +253,7 @@ std::vector<Row> SectionRows(Section section) {
 const char* SectionLabel(Section section) {
   switch (section) {
     case Section::kDeluxe: return "ROCK BAND 3 DELUXE";
+    case Section::kSongs: return "CUSTOM SONGS";
     case Section::kVideo: return "VIDEO";
     case Section::kAudio: return "AUDIO";
     case Section::kControllers: return "CONTROLLERS";
@@ -300,7 +319,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       for (int s = 0; s < int(Section::kCount); ++s) items.push_back({Item::kSection, Section(s)});
       items.push_back({Item::kQuit});
     } else {
-      for (Row row : SectionRows(section_)) items.push_back({Item::kSetting, section_, row});
+      for (Row row : SectionRows(section_, songs_folders_.size())) items.push_back({Item::kSetting, section_, row});
       items.push_back({Item::kBack});
     }
     return items;
@@ -330,6 +349,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
   std::string SectionSummary(Section section) const {
     switch (section) {
       case Section::kDeluxe: return Value(Row::kDeluxe);
+      case Section::kSongs:
+        return songs_count_ == 1 ? "1 PACKAGE" : std::to_string(songs_count_) + " PACKAGES";
       case Section::kVideo: {
         std::string scale = kScaleLabels[ScaleIndex()];  // "2x (2560x1440)"
         int limit = kLimits[LimitIndex()];
@@ -521,6 +542,13 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kProfile: return "PROFILE NAME";
       case Row::kDeluxe: return "ROCK BAND 3 DELUXE";
       case Row::kDeluxeInstall: return DeluxeInstalled() ? "UPDATE DELUXE" : "INSTALL DELUXE";
+      case Row::kSongsDefault: return "SONGS FOLDER";
+      case Row::kSongsExtra1:
+      case Row::kSongsExtra2:
+      case Row::kSongsExtra3:
+      case Row::kSongsExtra4:
+      case Row::kSongsExtra5: return "FOLDER " + std::to_string(int(row) - int(Row::kSongsExtra1) + 2);
+      case Row::kSongsAdd: return "ADD A FOLDER";
       case Row::kDisplayMode: return "DISPLAY";
       case Row::kResolution: return "INTERNAL RESOLUTION";
       case Row::kFrameLimit: return "FRAME RATE LIMIT";
@@ -557,6 +585,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
         }
         return "CHOOSE ZIP...";
       }
+      case Row::kSongsAdd: return songs_status_.empty() ? "CHOOSE FOLDER..." : songs_status_;
       case Row::kDisplayMode: return index ? "FULLSCREEN" : "WINDOWED";
       case Row::kQuickStart:
       case Row::kFpsCounter:
@@ -581,6 +610,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
 
   void HandleInput(ImGuiIO& io) {
     PollDeluxeInstall();
+    PollSongsFolder();
+    if (SelectedRow() != songs_remove_armed_) songs_remove_armed_ = Row::kCount;
     uint32_t held = pads_.Poll();
     uint32_t pad_pressed = repeater_.Update(held);
     uint32_t pressed = pad_pressed;
@@ -653,6 +684,12 @@ class Launcher final : public rex::ui::ImGuiDialog {
             if (!(pad_pressed & kConfirm)) StartEditing();
           } else if (item.row == Row::kDeluxeInstall) {
             PickDeluxeZip();
+          } else if (item.row == Row::kSongsDefault) {
+            OpenSongsFolder();
+          } else if (IsExtraSongsFolder(item.row)) {
+            RemoveSongsFolder(item.row);
+          } else if (item.row == Row::kSongsAdd) {
+            PickSongsFolder();
           } else if (IsListChoice(item.row)) {
             StartAdjusting(item.row);
           } else {
@@ -707,8 +744,91 @@ class Launcher final : public rex::ui::ImGuiDialog {
     }
   }
 
-  // The note on the right of the install row: the last install's error, or
-  // what to pick until something is installed.
+  static bool IsExtraSongsFolder(Row row) {
+    return row >= Row::kSongsExtra1 && row <= Row::kSongsExtra5;
+  }
+
+  void PickSongsFolder() {
+    auto* picked = new std::shared_ptr<PickedFolder>(songs_picked_);
+    std::string start = rex::path_to_utf8(
+        songs_folders_.empty() ? rex::filesystem::GetUserFolder() : songs_folders_.back());
+    SDL_ShowOpenFolderDialog(
+        [](void* userdata, const char* const* folders, int) {
+          std::unique_ptr<std::shared_ptr<PickedFolder>> picked(
+              static_cast<std::shared_ptr<PickedFolder>*>(userdata));
+          if (!folders || !folders[0]) return;  // cancelled, or an error
+          std::lock_guard lock((*picked)->mutex);
+          (*picked)->path = std::filesystem::path(folders[0]);
+        },
+        picked, nullptr, start.c_str(), false);
+  }
+
+  void PollSongsFolder() {
+    std::optional<std::filesystem::path> path;
+    {
+      std::lock_guard lock(songs_picked_->mutex);
+      path.swap(songs_picked_->path);
+    }
+    if (!path) return;
+    songs_status_.clear();
+    if (rex::path_to_utf8(*path).find(';') != std::string::npos) {
+      songs_status_ = "NO ; IN FOLDER NAMES";
+      return;
+    }
+    if (songs_folders_.size() >= kMaxExtraSongsFolders ||
+        std::find(songs_folders_.begin(), songs_folders_.end(), *path) != songs_folders_.end()) {
+      return;
+    }
+    songs_folders_.push_back(*path);
+    SaveSongsFolders();
+    if (section_ == Section::kSongs) selected_ = int(songs_folders_.size());
+  }
+
+  // Needs a second press. Files on disk stay.
+  void RemoveSongsFolder(Row row) {
+    if (songs_remove_armed_ != row) {
+      songs_remove_armed_ = row;
+      return;
+    }
+    songs_remove_armed_ = Row::kCount;
+    size_t index = size_t(int(row) - int(Row::kSongsExtra1));
+    if (index >= songs_folders_.size()) return;
+    songs_folders_.erase(songs_folders_.begin() + index);
+    SaveSongsFolders();
+  }
+
+  void SaveSongsFolders() {
+    SetExtraSongsFolders(songs_folders_);
+    Save();
+    songs_count_ = CountSongPackages(SongsFolders());
+  }
+
+  static void OpenSongsFolder() {
+    std::filesystem::path folder = DefaultSongsFolder();
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    std::string url = "file://";
+    for (unsigned char c : rex::path_to_utf8(folder)) {
+      if (std::isalnum(c) || std::strchr("/-._~", c)) {
+        url += char(c);
+      } else {
+        url += '%';
+        url += "0123456789ABCDEF"[c >> 4];
+        url += "0123456789ABCDEF"[c & 15];
+      }
+    }
+    SDL_OpenURL(url.c_str());
+  }
+
+  std::string SongsFolderNote(Row row) const {
+    if (row == songs_remove_armed_) return "PRESS AGAIN TO REMOVE";
+    std::filesystem::path folder = DefaultSongsFolder();
+    if (IsExtraSongsFolder(row)) folder = songs_folders_[size_t(int(row) - int(Row::kSongsExtra1))];
+    std::string text = rex::path_to_utf8(folder);
+    if (text.size() > 44) text = "..." + text.substr(text.size() - 41);
+    return text;
+  }
+
   std::string DeluxeNote() const {
     if (!install_status_.empty()) return install_status_;
     return DeluxeInstalled() ? "" : "THE XBOX 360 RELEASE ZIP";
@@ -971,6 +1091,14 @@ class Launcher final : public rex::ui::ImGuiDialog {
                      y + (l.row_h - small) * 0.5f,
                      selected ? IM_COL32(40, 40, 30, 255) : kUiMuted);
       }
+      if (row == Row::kSongsDefault || IsExtraSongsFolder(row)) {
+        std::string note = SongsFolderNote(row);
+        float small = 15.0f * l.scale;
+        float w = ui_.TextWidth(UiFont::kDisplay, note, small);
+        ImU32 color = selected ? IM_COL32(40, 40, 30, 255) : kUiMuted;
+        ui_.DrawText(draw, UiFont::kDisplay, note, small, l.menu_x + l.menu_w - pad - w,
+                     y + (l.row_h - small) * 0.5f, color);
+      }
 
       if (row >= Row::kController1 && row <= Row::kController4) {
         size_t slot = size_t(int(row) - int(Row::kController1));
@@ -1011,8 +1139,15 @@ class Launcher final : public rex::ui::ImGuiDialog {
                {"r", "BACK"},
                {nullptr, "START: PLAY"}};
     } else if (InSection()) {
+      Row row = SelectedRow();
+      const char* confirm = IsListChoice(row)            ? "SELECT"
+                            : row == Row::kSongsDefault  ? "OPEN"
+                            : row == songs_remove_armed_ ? "REMOVE (FILES STAY)"
+                            : IsExtraSongsFolder(row)    ? "REMOVE"
+                            : row == Row::kSongsAdd      ? "ADD"
+                                                         : "CHANGE";
       hints = {{nullptr, "STRUM: MOVE"},
-               {"g", IsListChoice(SelectedRow()) ? "SELECT" : "CHANGE"},
+               {"g", confirm},
                {"r", "BACK"},
                {nullptr, "START: PLAY"}};
     } else {
@@ -1058,6 +1193,15 @@ class Launcher final : public rex::ui::ImGuiDialog {
   bool finished_ = false;
   std::shared_ptr<DeluxeInstallJob> install_ = std::make_shared<DeluxeInstallJob>();
   std::string install_status_;  // the last install's error, if it failed
+  struct PickedFolder {
+    std::mutex mutex;
+    std::optional<std::filesystem::path> path;
+  };
+  std::shared_ptr<PickedFolder> songs_picked_ = std::make_shared<PickedFolder>();
+  std::vector<std::filesystem::path> songs_folders_ = ExtraSongsFolders();  // besides the default
+  std::string songs_status_;  // why the last pick wasn't added, if it wasn't
+  Row songs_remove_armed_ = Row::kCount;  // pressed once to remove
+  size_t songs_count_ = CountSongPackages(SongsFolders());
 };
 
 }  // namespace

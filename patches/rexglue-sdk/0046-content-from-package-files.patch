@@ -1,0 +1,230 @@
+--- a/include/rex/system/xam/content_manager.h
++++ b/include/rex/system/xam/content_manager.h
+@@ -177,6 +177,12 @@
+   // Returns the host filesystem path for an open content package, or empty.
+   std::filesystem::path GetOpenPackagePath(const std::string_view root_name) const;
+ 
++  // Makes the read-only STFS packages (CON / LIVE / PIRS files) in the folder
++  // and its subfolders available as content of no particular user (xuid 0)
++  // of the running title, of the content type in each package's header,
++  // mounted directly from the files. Returns the number of packages found.
++  size_t AddPackageFolder(const std::filesystem::path& folder);
++
+   // Installs an STFS content package from an arbitrary host path.
+   // Extracts the package into root_path_/0000000000000000/{title_id}/00000002/{filename}/
+   // and writes a .header file for XAM enumeration.
+@@ -185,6 +191,15 @@
+  private:
+   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
+                                            uint32_t title_id = -1);
++  struct PackageFile {
++    std::filesystem::path path;
++    XContentType content_type;
++    std::string file_name;
++    std::u16string display_name;
++    uint32_t license_mask;
++  };
++  // A package file the content data refers to, or null.
++  const PackageFile* FindPackageFile(const XCONTENT_AGGREGATE_DATA& data) const;
+   std::filesystem::path ResolvePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+   std::filesystem::path ResolvePackageHeaderPath(const std::string_view file_name, uint64_t xuid,
+                                                  uint32_t title_id,
+@@ -203,6 +218,7 @@
+   rex::thread::global_critical_region global_critical_region_;
+   std::unordered_map<string::string_key_case, ContentPackage*, string::string_key_case::Hash>
+       open_packages_;
++  std::vector<PackageFile> package_files_;
+ };
+ 
+ }  // namespace xam
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -46,8 +46,14 @@
+   content_data_ = data;
+ 
+   auto fs = kernel_state_->file_system();
+-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+-                                                                  /*allow_share_delete=*/true);
++  std::unique_ptr<rex::filesystem::Device> device;
++  if (std::filesystem::is_regular_file(package_path)) {
++    // A package file (see ContentManager::AddPackageFolder).
++    device = std::make_unique<rex::filesystem::StfsContainerDevice>(device_path_, package_path);
++  } else {
++    device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
++                                                               /*allow_share_delete=*/true);
++  }
+   device->Initialize();
+   fs->RegisterDevice(std::move(device));
+   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+@@ -101,6 +107,9 @@
+ 
+ std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
+                                                          const XCONTENT_AGGREGATE_DATA& data) {
++  if (const PackageFile* package_file = FindPackageFile(data)) {
++    return package_file->path;
++  }
+   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+ 
+   // DLCs are stored in common directory
+@@ -169,10 +178,86 @@
+       result.emplace_back(std::move(content_data));
+     }
+   }
+-
++  if (!xuid && title_id == kernel_state_->title_id()) {
++    for (const PackageFile& package_file : package_files_) {
++      if (package_file.content_type != content_type) {
++        continue;
++      }
++      XCONTENT_AGGREGATE_DATA content_data;
++      content_data.device_id = device_id;
++      content_data.content_type = content_type;
++      content_data.set_display_name(package_file.display_name);
++      content_data.set_file_name(package_file.file_name);
++      content_data.title_id = title_id;
++      content_data.xuid = 0;
++      result.emplace_back(std::move(content_data));
++    }
++  }
+   return result;
+ }
+ 
++size_t ContentManager::AddPackageFolder(const std::filesystem::path& folder) {
++  std::error_code ec;
++  size_t count = 0;
++  for (auto it = std::filesystem::recursive_directory_iterator(
++           folder, std::filesystem::directory_options::skip_permission_denied, ec);
++       !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
++    if (!it->is_regular_file(ec)) {
++      continue;
++    }
++    std::unique_ptr<rex::filesystem::StfsHeader> header =
++        rex::filesystem::StfsContainerDevice::ReadPackageHeader(it->path());
++    if (!header) {
++      continue;
++    }
++    PackageFile package_file;
++    package_file.path = it->path();
++    package_file.content_type = header->metadata.content_type;
++    package_file.display_name = header->metadata.display_name(XLanguage::kEnglish);
++    if (package_file.display_name.empty()) {
++      package_file.display_name = rex::path_to_utf16(it->path().filename());
++    }
++    // Unique within the 42 characters of XCONTENT_DATA (the host file name
++    // if it fits, otherwise its start and a hash of the whole path).
++    std::string file_name = rex::path_to_utf8(it->path().filename());
++    auto name_taken = [this, &file_name, &package_file]() {
++      return std::any_of(package_files_.cbegin(), package_files_.cend(),
++                         [&](const PackageFile& other) {
++                           return other.content_type == package_file.content_type &&
++                                  rex::string::utf8_equal_case(other.file_name, file_name);
++                         });
++    };
++    if (file_name.size() > 42 || name_taken()) {
++      file_name = fmt::format("{}_{:08X}", file_name.substr(0, 33),
++                              uint32_t(std::hash<std::string>{}(rex::path_to_utf8(it->path()))));
++    }
++    package_file.file_name = std::move(file_name);
++    // Packages for other titles (such as songs exported from earlier Rock
++    // Band games) are the running game's to accept or not, licenses
++    // included.
++    package_file.license_mask = 0xFFFFFFFF;
++    package_files_.push_back(std::move(package_file));
++    ++count;
++  }
++  return count;
++}
++
++const ContentManager::PackageFile* ContentManager::FindPackageFile(
++    const XCONTENT_AGGREGATE_DATA& data) const {
++  uint64_t xuid = data.xuid;
++  if (package_files_.empty() || (xuid != 0 && xuid != uint64_t(-1))) {
++    return nullptr;
++  }
++  std::string file_name = data.file_name();
++  for (const PackageFile& package_file : package_files_) {
++    if (package_file.content_type == data.content_type &&
++        rex::string::utf8_equal_case(package_file.file_name, file_name)) {
++      return &package_file;
++    }
++  }
++  return nullptr;
++}
++
+ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
+     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+   auto package_path = ResolvePackagePath(xuid, data);
+@@ -303,6 +388,9 @@
+   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
+       data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+   content_license = package->GetPackageLicense();
++  if (const PackageFile* package_file = FindPackageFile(data)) {
++    content_license = package_file->license_mask;
++  }
+ 
+   {
+     auto global_lock = global_critical_region_.Acquire();
+@@ -351,6 +439,10 @@
+ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                                              std::vector<uint8_t> buffer) {
+   auto global_lock = global_critical_region_.Acquire();
++  if (FindPackageFile(data)) {
++    // Package files are read-only.
++    return X_ERROR_ACCESS_DENIED;
++  }
+   auto package_path = ResolvePackagePath(xuid, data);
+   std::filesystem::create_directories(package_path);
+   if (std::filesystem::exists(package_path)) {
+@@ -366,6 +458,10 @@
+ 
+ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+   auto global_lock = global_critical_region_.Acquire();
++  if (FindPackageFile(data)) {
++    // Never delete the user's package files.
++    return X_ERROR_ACCESS_DENIED;
++  }
+ 
+   if (IsContentOpen(data)) {
+     // TODO(Gliniak): Get real error code for this case.
+@@ -407,6 +503,10 @@
+ 
+ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
+                                                  const XCONTENT_AGGREGATE_DATA& data) {
++  if (FindPackageFile(data)) {
++    // Never delete the user's package files.
++    return X_ERROR_ACCESS_DENIED;
++  }
+   // Unmount phase: tolerant of not-mounted state
+   ContentPackage* package = nullptr;
+   {
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -42,10 +42,13 @@
+ #include <rex/system/xsemaphore.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtimer.h>
++#include <rex/cvar.h>
+ 
+-namespace rex::system {
++REXCVAR_DEFINE_INT32(xam_deferred_overlapped_delay_ms, 100, "Kernel",
++                     "Delay before completing deferred asynchronous XAM operations (such as "
++                     "opening content), in milliseconds, like a console's latency");
+ 
+-constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
++namespace rex::system {
+ 
+ // This is a global object initialized with the XboxkrnlModule.
+ // It references the current kernel state object that all kernel methods should
+@@ -1227,9 +1230,9 @@
+         if (pre_callback) {
+           pre_callback();
+         }
+-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
+-                     kDeferredOverlappedDelayMillis);
+-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
++        int32_t delay_ms = std::max(REXCVAR_GET(xam_deferred_overlapped_delay_ms), int32_t(0));
++        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr, delay_ms);
++        rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+         uint32_t extended_error, length;
+         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
+         auto result = completion_callback(extended_error, length);

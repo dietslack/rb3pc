@@ -28,6 +28,7 @@
 #include "loading_screen.h"
 #include "mouse_menus.h"
 #include "rb3_ui.h"
+#include "custom_songs.h"
 #include "profile.h"
 #include "screenshot.h"
 #include "script_patches.h"
@@ -70,15 +71,16 @@ class Rb3pcApp : public rex::ReXApp {
     if (!rex::cvar::HasNonDefaultValue("gpu_allow_invalid_fetch_constants")) {
       rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
     }
-    // Render-to-texture results only exist in GPU memory unless they're read
-    // back. RB3 composites the band's skin and outfits on the GPU, then
-    // compresses them on the CPU from guest memory, every time a character
-    // changes, into the same memory as the last one. "some" only reads a
-    // destination back the first time, so later characters got the previous
-    // one's textures; "full" stalls on every resolve. "auto" (patch 0007)
-    // reads occasional resolves back immediately and per-frame ones delayed.
-    // "some" was this app's old default and got saved to rb3pc.toml, so
-    // migrate it.
+    // RB3 opens custom song packages one at a time when it first adds them
+    // to its song cache, each open completing asynchronously. The SDK waits
+    // 100 ms before completing each (console-like latency), so a first scan
+    // of 1,000 packages took 100 s just waiting. 1 ms keeps it asynchronous.
+    if (!rex::cvar::HasNonDefaultValue("xam_deferred_overlapped_delay_ms")) {
+      rex::cvar::SetFlagByName("xam_deferred_overlapped_delay_ms", "1");
+    }
+    // Character textures are GPU-composited then CPU-compressed into the same
+    // memory each time; "some" reads back only once (stale characters), "full"
+    // stalls. "auto" is patch 0007. Migrates the old saved "some".
     if (!rex::cvar::HasNonDefaultValue("readback_resolve") ||
         rex::cvar::GetFlagByName("readback_resolve") == "some") {
       rex::cvar::SetFlagByName("readback_resolve", "auto");
@@ -88,6 +90,7 @@ class Rb3pcApp : public rex::ReXApp {
     rb3pc::UnlinkOwnGuestMemory();
     SetGuestFrameStats(rb3pc::GuestFrameStats);  // F3 debug overlay
     rb3pc::ApplyProfileName(runtime()->kernel_state());
+    rb3pc::RegisterCustomSongs(runtime()->kernel_state());
     rb3pc::ApplyScriptPatchChecksums();
     if constexpr (rb3pc::exe::kDeluxe) rb3pc::CheckDeluxeCode();
 
