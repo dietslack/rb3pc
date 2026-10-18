@@ -28,9 +28,11 @@
 #include "display_options.h"
 #include "input_bindings.h"
 #include "instrument_input.h"
+#include "menu_pads.h"
 #include "mouse_cursor.h"
 #include "profile.h"
 #include "rb3_ui.h"
+#include "text_entry.h"
 
 REXCVAR_DEFINE_BOOL(show_launcher, true, "rb3pc",
                     "Show the settings screen (profile, display, controllers) before the game "
@@ -45,143 +47,6 @@ namespace {
 bool g_launcher_active = false;
 
 using Clock = std::chrono::steady_clock;
-
-// Menu actions, from any controller, the keyboard or the mouse.
-enum Action : uint32_t {
-  kUp = 1 << 0,
-  kDown = 1 << 1,
-  kLeft = 1 << 2,
-  kRight = 1 << 3,
-  kConfirm = 1 << 4,  // green fret / A / Enter
-  kBack = 1 << 5,     // red fret / B / Backspace
-  kStart = 1 << 6,    // Start / Escape-to-finish
-};
-
-// Every connected controller, read through its bindings profile (or SDL's
-// gamepad mapping), OR'd together. The runtime's input system doesn't exist
-// yet, so this talks to SDL directly.
-class MenuPads {
- public:
-  MenuPads() { initialized_ = SDL_InitSubSystem(SDL_INIT_GAMEPAD); }
-  // Shut down fully: the SDK's input driver only learns about controllers
-  // from the SDL_EVENT_GAMEPAD_ADDED events a fresh init sends.
-  ~MenuPads() {
-    for (auto& pad : pads_) SDL_CloseJoystick(pad.joystick);
-    if (initialized_) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
-  }
-
-  uint32_t Poll() {
-    if (!initialized_) return 0;
-    if (refresh_countdown_-- <= 0) {
-      Refresh();
-      refresh_countdown_ = 30;
-    }
-    SDL_UpdateJoysticks();
-    using namespace rex::input;
-    uint32_t actions = 0;
-    for (auto& pad : pads_) {
-      PadState state = Evaluate(pad.profile, pad.joystick);
-      uint16_t b = state.buttons;
-      if (b & X_INPUT_GAMEPAD_DPAD_UP) actions |= kUp;
-      if (b & X_INPUT_GAMEPAD_DPAD_DOWN) actions |= kDown;
-      if (b & X_INPUT_GAMEPAD_DPAD_LEFT) actions |= kLeft;
-      if (b & X_INPUT_GAMEPAD_DPAD_RIGHT) actions |= kRight;
-      if (b & X_INPUT_GAMEPAD_A) actions |= kConfirm;
-      if (b & X_INPUT_GAMEPAD_B) actions |= kBack;
-      if (b & X_INPUT_GAMEPAD_START) actions |= kStart;
-      // A gamepad's left stick moves too. Guitars report tilt and whammy on
-      // the right stick, so that one is left alone.
-      if (pad.instrument == Instrument::kGamepad) {
-        if (state.thumb_ly > 20000) actions |= kUp;
-        if (state.thumb_ly < -20000) actions |= kDown;
-        if (state.thumb_lx < -20000) actions |= kLeft;
-        if (state.thumb_lx > 20000) actions |= kRight;
-      }
-    }
-    return actions;
-  }
-
-  // Names in SDL's order, which is also the controller_type_N order.
-  std::vector<std::string> Names() const {
-    std::vector<std::string> names;
-    for (const auto& pad : pads_) names.push_back(pad.profile.name);
-    return names;
-  }
-
- private:
-  struct Pad {
-    SDL_JoystickID id;
-    SDL_Joystick* joystick;
-    Profile profile;
-    Instrument instrument;
-  };
-
-  void Refresh() {
-    int count = 0;
-    SDL_JoystickID* ids = SDL_GetJoysticks(&count);
-    std::vector<Pad> pads;
-    for (int i = 0; i < count; ++i) {
-      auto it = std::find_if(pads_.begin(), pads_.end(),
-                             [&](const Pad& pad) { return pad.id == ids[i]; });
-      if (it != pads_.end()) {
-        pads.push_back(std::move(*it));
-        pads_.erase(it);
-        continue;
-      }
-      SDL_Joystick* joystick = SDL_OpenJoystick(ids[i]);
-      if (!joystick) continue;
-      Pad pad{ids[i], joystick, DefaultProfile(ids[i]), Instrument::kGamepad};
-      std::string guid = pad.profile.guid;
-      if (auto profile = BindingStore::Get().Find(guid)) {
-        std::string name = pad.profile.name;
-        pad.profile = *profile;
-        if (pad.profile.name.empty()) pad.profile.name = name;
-      }
-      switch (SDL_GetJoystickTypeForID(ids[i])) {
-        case SDL_JOYSTICK_TYPE_GUITAR:
-          pad.instrument = Instrument::kGuitar;
-          break;
-        case SDL_JOYSTICK_TYPE_DRUM_KIT:
-          pad.instrument = Instrument::kDrums;
-          break;
-        default:
-          break;
-      }
-      pads.push_back(std::move(pad));
-    }
-    SDL_free(ids);
-    for (auto& gone : pads_) SDL_CloseJoystick(gone.joystick);
-    pads_ = std::move(pads);
-  }
-
-  bool initialized_ = false;
-  int refresh_countdown_ = 0;
-  std::vector<Pad> pads_;
-};
-
-// Turns held actions into presses, with key-repeat for movement.
-class Repeater {
- public:
-  uint32_t Update(uint32_t held) {
-    constexpr uint32_t kRepeating = kUp | kDown | kLeft | kRight;
-    auto now = Clock::now();
-    uint32_t pressed = held & ~held_;
-    for (int bit = 0; bit < 32; ++bit) {
-      uint32_t mask = 1u << bit;
-      if (pressed & mask) next_repeat_[bit] = now + std::chrono::milliseconds(380);
-      if ((held & held_ & kRepeating & mask) && now >= next_repeat_[bit]) {
-        pressed |= mask;
-        next_repeat_[bit] = now + std::chrono::milliseconds(90);
-      }
-    }
-    held_ = held;
-    return pressed;
-  }
-
- private:
-  uint32_t held_ = ~0u;  // ignore whatever is already held when the screen opens
-  std::array<Clock::time_point, 32> next_repeat_{};
-};
 
 constexpr const char* kControllerTypes[] = {"auto", "guitar", "drums", "gamepad", "none"};
 constexpr const char* kMouseCursorLabels[] = {"HIDE WHEN IDLE", "ALWAYS SHOW", "ALWAYS HIDE"};
@@ -311,6 +176,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
+    DrawNameEntry(io);
     if (hooks_.request_paint) hooks_.request_paint();
   }
 
@@ -647,6 +513,9 @@ class Launcher final : public rex::ui::ImGuiDialog {
     uint32_t pad_pressed = repeater_.Update(held);
     if (pad_pressed) NoteControllerPress();
     uint32_t pressed = pad_pressed;
+    // The profile name's text entry has the input while it's open (the pads
+    // are still polled, so a button held to close it isn't a press here).
+    if (name_entry_) return;
 
     auto key = [](ImGuiKey k) { return ImGui::IsKeyPressed(k, true); };
     if (key(ImGuiKey_UpArrow)) pressed |= kUp;
@@ -711,9 +580,12 @@ class Launcher final : public rex::ui::ImGuiDialog {
         case Item::kBack: LeaveSection(); return;
         case Item::kSetting:
           if (item.row == Row::kProfile) {
-            // Typed only: a controller's green doesn't start editing (Enter,
-            // Space or a click does).
-            if (!(pad_pressed & kConfirm)) StartEditing();
+            // Pads get the game's text entry; keyboard/mouse edit in place.
+            if (pad_pressed & kConfirm) {
+              OpenNameEntry();
+            } else {
+              StartEditing();
+            }
           } else if (item.row == Row::kDeluxeInstall) {
             PickDeluxeZip();
           } else if (item.row == Row::kSongsDefault) {
@@ -866,9 +738,28 @@ class Launcher final : public rex::ui::ImGuiDialog {
     return DeluxeInstalled() ? "" : "THE XBOX 360 RELEASE ZIP";
   }
 
-  // Profile name: typed on the keyboard only (typing on the row starts a new
-  // one; Enter, Space or a click edits the current one; Enter saves, Escape
-  // cancels).
+  // For controllers; the keyboard edits the row in place (StartEditing).
+  void OpenNameEntry() {
+    std::string name = SanitizeProfileName(rex::cvar::GetFlagByName("profile_name"));
+    if (name.empty()) name = ProfileName();
+    // The entry draws with this screen's renderer, which outlives it.
+    std::shared_ptr<Rb3UiRenderer> ui(std::shared_ptr<void>(), &ui_);
+    name_entry_ = CreateTextEntry(
+        ui, {"Profile name", "The name the game shows for player 1", name, kMaxProfileNameLength});
+  }
+
+  void DrawNameEntry(ImGuiIO& io) {
+    if (!name_entry_ || !name_entry_->Draw(io)) return;
+    if (!name_entry_->cancelled()) {
+      std::string name = SanitizeProfileName(name_entry_->text());
+      // The login name is the default, so don't pin it in the config.
+      rex::cvar::SetFlagByName("profile_name", "");
+      if (!name.empty() && name != ProfileName()) rex::cvar::SetFlagByName("profile_name", name);
+      Save();
+    }
+    name_entry_.reset();
+  }
+
   void StartEditing() {
     editing_ = true;
     edit_name_ = SanitizeProfileName(rex::cvar::GetFlagByName("profile_name"));
@@ -1167,7 +1058,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
       hints = {{nullptr, "STRUM: CHANGE"}, {"g", "SAVE"}, {"r", "SAVE"}, {nullptr, "START: PLAY"}};
     } else if (SelectedRow() == Row::kProfile) {
       hints = {{nullptr, "STRUM: MOVE"},
-               {nullptr, "TYPE ON THE KEYBOARD TO RENAME"},
+               {"g", "RENAME"},
+               {nullptr, "OR TYPE ON THE KEYBOARD"},
                {"r", "BACK"},
                {nullptr, "START: PLAY"}};
     } else if (InSection()) {
@@ -1219,6 +1111,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
   int selected_ = 0;  // index into Items()
   Section section_ = Section::kCount;  // the open category, or kCount at the top
   bool editing_ = false;
+  std::unique_ptr<rex::kernel::xam::KeyboardUi> name_entry_;  // open from a controller
   bool adjusting_ = false;  // a list setting is selected for changing
   int pending_ = 0;         // its choice until saved
   std::string edit_name_;

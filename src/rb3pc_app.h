@@ -30,6 +30,7 @@
 #include "rb3_ui.h"
 #include "custom_songs.h"
 #include "mouse_cursor.h"
+#include "text_entry.h"
 #include "profile.h"
 #include "screenshot.h"
 #include "script_patches.h"
@@ -124,6 +125,7 @@ class Rb3pcApp : public rex::ReXApp {
                           });
 
     mouse_cursor_ = rb3pc::CreateMouseCursorController(drawer, window());
+    rb3pc::InstallTextEntry([this] { return immediate_drawer(); }, game_data_root());
     fps_overlay_ = rb3pc::CreateFpsOverlay(drawer);
     pointer_overlay_ = rb3pc::CreatePointerOverlay(
         drawer, [this] { return immediate_drawer(); }, game_data_root());

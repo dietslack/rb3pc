@@ -17,8 +17,9 @@ contains no game files, and the build only works with files you provide.
 
 ## Known issues
 
-The mouse only controls player 1. Windows builds haven't been tried yet. Not
-every Rock Band 3 Deluxe feature has been checked.
+The mouse only controls player 1. Typing on a keyboard doesn't work in text
+boxes yet. Windows builds haven't been tried yet. Not every Rock Band 3 Deluxe
+feature has been checked.
 
 ## Credits
 
@@ -30,3 +31,4 @@ every Rock Band 3 Deluxe feature has been checked.
 | [Rock Band 3 Deluxe](https://github.com/hmxmilohax/rock-band-3-deluxe) | The mod rb3pc can run; its executable is recompiled as `rb3pc-dx` |
 | [RB3Enhanced](https://github.com/RBEnhanced/RB3Enhanced) | Reference for the script functions Deluxe expects (rb3pc has its own versions) and their Xbox 360 addresses |
 | [onyx](https://github.com/mtolly/onyx) (moggcrypt) | The decryption keys for the game's song audio files |
+| [Se7enSins forum post](https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/) | How the Xbox 360's on-screen keyboard function is called |

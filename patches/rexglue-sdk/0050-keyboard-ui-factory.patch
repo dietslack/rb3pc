@@ -1,0 +1,105 @@
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -20,6 +20,7 @@
+ 
+ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+                     "Don't display any UI, using defaults for prompts as needed");
++#include <rex/kernel/xam/keyboard_ui.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/hook.h>
+ #include <rex/types.h>
+@@ -343,6 +344,8 @@
+   return result;
+ }
+ 
++KeyboardUiFactory g_keyboard_ui_factory;
++
+ class KeyboardInputDialog : public XamDialog {
+  public:
+   KeyboardInputDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::string title,
+@@ -364,12 +367,25 @@
+     text_ = default_text;
+     text_buffer_.resize(max_length);
+     rex::string::copy_truncating(text_buffer_.data(), default_text_, text_buffer_.size());
++    if (g_keyboard_ui_factory) {
++      custom_ = g_keyboard_ui_factory(
++          {title_, description_, default_text_, max_length >= 2 ? max_length - 2 : 0});
++    }
+   }
+ 
+   const std::string& text() const { return text_; }
+   bool cancelled() const { return cancelled_; }
+ 
+   void OnDraw(ImGuiIO& io) override {
++    if (custom_) {
++      if (custom_->Draw(io)) {
++        cancelled_ = custom_->cancelled();
++        text_ = cancelled_ ? "" : custom_->text();
++        custom_.reset();
++        Close();
++      }
++      return;
++    }
+     bool first_draw = false;
+     // The popup's ID is this dialog's own, so two with the same title don't
+     // clash.
+@@ -422,8 +438,13 @@
+   std::vector<char> text_buffer_;
+   std::string text_ = "";
+   bool cancelled_ = true;
++  std::unique_ptr<KeyboardUi> custom_;
+ };
+ 
++void SetKeyboardUiFactory(KeyboardUiFactory factory) {
++  g_keyboard_ui_factory = std::move(factory);
++}
++
+ // https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/
+ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_text,
+                             mapped_wstring title, mapped_wstring description, mapped_wstring buffer,
+--- a/include/rex/kernel/xam/keyboard_ui.h
++++ b/include/rex/kernel/xam/keyboard_ui.h
+@@ -0,0 +1,43 @@
++/**
++ * @file        kernel/xam/keyboard_ui.h
++ * @brief       Replacing the on-screen keyboard (XamShowKeyboardUI) with the
++ *              app's own text entry
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <functional>
++#include <memory>
++#include <string>
++
++struct ImGuiIO;
++
++namespace rex::kernel::xam {
++
++struct KeyboardUiRequest {
++  std::string title;
++  std::string description;
++  std::string default_text;
++  size_t max_length = 0;  // characters, not counting the terminator
++};
++
++// One open keyboard, drawn by the app in place of the SDK's ImGui popup.
++// The title gets no input while it's open (see xeXamIsUIActive).
++class KeyboardUi {
++ public:
++  virtual ~KeyboardUi() = default;
++  // Every frame while open, on the UI thread, inside an ImGui frame. True
++  // when the player has finished (confirmed or cancelled).
++  virtual bool Draw(ImGuiIO& io) = 0;
++  virtual bool cancelled() const = 0;
++  virtual std::string text() const = 0;  // UTF-8
++};
++
++using KeyboardUiFactory = std::function<std::unique_ptr<KeyboardUi>(const KeyboardUiRequest&)>;
++
++// From now on XamShowKeyboardUI opens what `factory` makes (null: the SDK's
++// own popup again).
++void SetKeyboardUiFactory(KeyboardUiFactory factory);
++
++}  // namespace rex::kernel::xam
