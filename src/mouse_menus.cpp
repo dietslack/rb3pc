@@ -82,7 +82,7 @@ REXCVAR_DEFINE_STRING(debug_pointer_script, "", "rb3pc",
                       "Testing aid: pointer positions over time instead of the mouse, "
                       "\"58:0.15,0.5;64:0.15,0.37;66:a\" (seconds after launch: x,y in 0-1, or "
                       "a / b for a click, u / d for a wheel notch, p / r to press / release "
-                      "the left button, U D L R A S for d-pad / A / Start presses)")
+                      "the left button, U D L R A S K for d-pad / A / Start / Back presses)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DECLARE(bool, mnk_mode);
 
@@ -362,7 +362,10 @@ bool ScriptedPointer(float& x, float& y) {
           case 'S':
             rex::input::mnk::QueuePress(rex::input::X_INPUT_GAMEPAD_START);
             break;
-          default:  // a left click, as the click handler takes it
+          case 'K':
+            rex::input::mnk::QueuePress(rex::input::X_INPUT_GAMEPAD_BACK);
+            break;
+          default:  // left click
             if (REXCVAR_GET(mouse_menu_debug)) REXLOG_INFO("Pointer: scripted click, buttons {}", click);
             if (click) rex::input::mnk::QueuePress(click < 0 ? rex::input::X_INPUT_GAMEPAD_A : uint16_t(click));
             break;
@@ -1097,12 +1100,27 @@ void CollectGlyphRuns(const uint8_t* base, uint32_t comp, uint32_t text, uint32_
   }
 }
 
-// The help bar label under the pointer: its action (or kActionNone), the
-// label and the text line hit.
+// Hmx::Object::mDir: +0x1C of the object part pointed to by +0x30.
+uint32_t OwnerDir(const uint8_t* base, uint32_t comp) {
+  uint32_t object = Load32(base, comp + 0x30);
+  return object > comp && object < comp + 0x2000 ? Load32(base, object + 0x1C) : 0;
+}
+
+uint32_t FocusedComponent(const uint8_t* base);
+
 uint32_t HelpActionAt(const uint8_t* base, float px, float py, uint32_t& label_hit, LocalBox& line) {
   uint64_t best_order = 0;
   uint32_t action = kActionNone;
+  // A panel that isn't up keeps drawing its help bar, hidden (DX's song list
+  // filters, closed, behind the song list's), so where one of the help bars
+  // belongs to the panel with the focus, only those count.
+  uint32_t focused = FocusedComponent(base);
+  uint32_t focus_dir = focused ? OwnerDir(base, focused) : 0;
+  bool focus_has_help = focus_dir && std::any_of(g_help_bars.begin(), g_help_bars.end(), [&](const auto& h) {
+                          return OwnerDir(base, h.first) == focus_dir;
+                        });
   for (const auto& [help, drawn] : g_help_bars) {
+    if (focus_has_help && OwnerDir(base, help) != focus_dir) continue;
     uint32_t config = Load32(base, help + kHelpConfig), config_end = Load32(base, help + kHelpConfig + 4);
     uint32_t labels = Load32(base, help + kHelpLabels), labels_end = Load32(base, help + kHelpLabels + 4);
     if (config_end - config > kActionElementSize * 16 || labels_end - labels > 4 * 16) continue;
