@@ -1108,19 +1108,26 @@ uint32_t OwnerDir(const uint8_t* base, uint32_t comp) {
 
 uint32_t FocusedComponent(const uint8_t* base);
 
+// Covered panels keep drawing (DX's song list under FILTERS, help bar and
+// scrollbar included). If the focused panel has a help bar, any other panel
+// with one is hidden.
+bool InHiddenPanel(const uint8_t* base, uint32_t comp) {
+  uint32_t focused = FocusedComponent(base);
+  uint32_t focus_dir = focused ? OwnerDir(base, focused) : 0;
+  uint32_t dir = OwnerDir(base, comp);
+  if (!focus_dir || !dir || dir == focus_dir) return false;
+  auto has_help = [&](uint32_t d) {
+    return std::any_of(g_help_bars.begin(), g_help_bars.end(),
+                       [&](const auto& h) { return OwnerDir(base, h.first) == d; });
+  };
+  return has_help(focus_dir) && has_help(dir);
+}
+
 uint32_t HelpActionAt(const uint8_t* base, float px, float py, uint32_t& label_hit, LocalBox& line) {
   uint64_t best_order = 0;
   uint32_t action = kActionNone;
-  // A panel that isn't up keeps drawing its help bar, hidden (DX's song list
-  // filters, closed, behind the song list's), so where one of the help bars
-  // belongs to the panel with the focus, only those count.
-  uint32_t focused = FocusedComponent(base);
-  uint32_t focus_dir = focused ? OwnerDir(base, focused) : 0;
-  bool focus_has_help = focus_dir && std::any_of(g_help_bars.begin(), g_help_bars.end(), [&](const auto& h) {
-                          return OwnerDir(base, h.first) == focus_dir;
-                        });
   for (const auto& [help, drawn] : g_help_bars) {
-    if (focus_has_help && OwnerDir(base, help) != focus_dir) continue;
+    if (InHiddenPanel(base, help)) continue;
     uint32_t config = Load32(base, help + kHelpConfig), config_end = Load32(base, help + kHelpConfig + 4);
     uint32_t labels = Load32(base, help + kHelpLabels), labels_end = Load32(base, help + kHelpLabels + 4);
     if (config_end - config > kActionElementSize * 16 || labels_end - labels > 4 * 16) continue;
@@ -1182,6 +1189,10 @@ bool ReadScrollbar(const uint8_t* base, uint32_t bar, uint32_t cam, Scrollbar& o
 
 bool ScrollbarAt(const uint8_t* base, float px, float py, Scrollbar& bar, float& z) {
   for (const auto& [b, drawn] : g_scrollbars) {
+    if (InHiddenPanel(base, b)) {
+      if (g_log_hover) REXLOG_INFO("Pointer: scrollbar {:08X} is in a panel that isn't up", b);
+      continue;
+    }
     Scrollbar sb;
     Vec3 hit;
     if (!ReadScrollbar(base, b, drawn.cam, sb) || !PointerOnPlane(base, b, sb.cam, px, py, hit)) continue;
@@ -1765,9 +1776,11 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   }
   int first = int(Load32(base, target + kListState + kStateFirstShowing));
   int selected = int(Load32(base, target + kListState + kStateSelectedDisplay));
-  // Rows past the end of a short list are empty: nothing to select there.
+  // Skip empty rows and headings (DX FILTERS page): selecting one makes the
+  // game move on with the scroll sound, on every move.
   int last = NumShowing(ctx, base, target) - 1;
-  if (selected != g_target.item && first + g_target.item <= last) {
+  if (selected != g_target.item && first + g_target.item <= last &&
+      IsActive(ctx, base, target, first + g_target.item)) {
     SelectListItem(ctx, base, target, first + g_target.item, first);
     if (int(Load32(base, target + kListState + kStateFirstShowing)) != first) g_pinned_lists.insert(target);
   }
