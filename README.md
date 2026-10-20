@@ -3,8 +3,8 @@
 A PC port of Rock Band 3.
 
 The Xbox 360 version of the game is converted ahead of time into a regular
-PC program, then fixed up and extended so it plays well on a computer: windowed or
-fullscreen play, mouse support, and custom songs.
+PC program, then fixed up and extended so it plays well on a computer: any
+window size, mouse support, and custom songs.
 It can also run the popular [Rock Band 3 Deluxe](https://github.com/hmxmilohax/rock-band-3-deluxe)
 mod.
 
@@ -32,3 +32,4 @@ feature has been checked.
 | [RB3Enhanced](https://github.com/RBEnhanced/RB3Enhanced) | Reference for the script functions Deluxe expects (rb3pc has its own versions) and their Xbox 360 addresses |
 | [onyx](https://github.com/mtolly/onyx) (moggcrypt) | The decryption keys for the game's song audio files |
 | [Se7enSins forum post](https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/) | How the Xbox 360's on-screen keyboard function is called |
+| [Dear ImGui](https://github.com/ocornut/imgui) | The settings screen and settings windows (through ReXGlue) |

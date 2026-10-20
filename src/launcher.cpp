@@ -26,6 +26,7 @@
 #include "custom_songs.h"
 #include "deluxe.h"
 #include "display_options.h"
+#include "display_size.h"
 #include "input_bindings.h"
 #include "instrument_input.h"
 #include "menu_pads.h"
@@ -224,7 +225,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Section::kSongs:
         return songs_count_ == 1 ? "1 PACKAGE" : std::to_string(songs_count_) + " PACKAGES";
       case Section::kVideo: {
-        std::string scale = kScaleLabels[ScaleIndex()];  // "2x (2560x1440)"
+        std::string scale = ScaleLabel(WantedResolutionScale(hooks_.is_fullscreen()));  // "2x (...)"
         int limit = kLimits[LimitIndex()];
         return Value(Row::kDisplayMode) + ", " + Upper(scale.substr(0, scale.find(' '))) + ", " +
                (limit ? std::to_string(limit) + " FPS" : "UNCAPPED");
@@ -282,7 +283,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kShowLauncher:
         return 2;
       case Row::kResolution:
-        return kScaleCount;
+        return hooks_.is_fullscreen() ? kScaleCount + 1 : 0;
       case Row::kFrameLimit:
         return kLimitCount;
       case Row::kAudioBuffer:
@@ -318,7 +319,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kShowLauncher:
         return GetBoolFlag("show_launcher") ? 1 : 0;
       case Row::kResolution:
-        return ScaleIndex();
+        return FullscreenResolutionSetting();  // 0 = match the display
       case Row::kFrameLimit:
         return LimitIndex();
       case Row::kAudioBuffer:
@@ -361,7 +362,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
         rex::cvar::SetFlagByName("show_launcher", index ? "true" : "false");
         break;
       case Row::kResolution:
-        SetScaleIndex(index);
+        SetFullscreenResolutionSetting(index);
         break;
       case Row::kFrameLimit:
         SetLimitIndex(index);
@@ -487,7 +488,17 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kFpsCounter:
       case Row::kMouseKeyboard:
       case Row::kShowLauncher: return index ? "ON" : "OFF";
-      case Row::kResolution: return Upper(kScaleLabels[index]);
+      case Row::kResolution: {
+        if (!hooks_.is_fullscreen()) {
+          return "FOLLOWS WINDOW (" + Upper(ScaleLabel(WantedResolutionScale(false)).substr(0, 2)) + ")";
+        }
+        if (index == 0) {
+          uint32_t w = 0, h = 0;
+          OutputPixelSize(true, w, h);
+          return "MATCH DISPLAY (" + Upper(ScaleLabel(ScaleForOutput(w, h)).substr(0, 2)) + ")";
+        }
+        return Upper(kScaleLabels[index - 1]);
+      }
       case Row::kFrameLimit: return Upper(kLimitLabels[index]);
       case Row::kAudioBuffer: return Upper(kAudioQueueLabels[index]);
       case Row::kAudioDevice: return Upper(kAudioDeviceLabels[index]);

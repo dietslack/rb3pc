@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -31,6 +32,7 @@
 #include "custom_songs.h"
 #include "mouse_cursor.h"
 #include "text_entry.h"
+#include "display_size.h"
 #include "profile.h"
 #include "screenshot.h"
 #include "script_patches.h"
@@ -125,6 +127,7 @@ class Rb3pcApp : public rex::ReXApp {
                           });
 
     mouse_cursor_ = rb3pc::CreateMouseCursorController(drawer, window());
+    rb3pc::FitWindowToUsableArea();
     rb3pc::InstallTextEntry([this] { return immediate_drawer(); }, game_data_root());
     fps_overlay_ = rb3pc::CreateFpsOverlay(drawer);
     pointer_overlay_ = rb3pc::CreatePointerOverlay(
@@ -141,13 +144,15 @@ class Rb3pcApp : public rex::ReXApp {
                               display_dialog_ = rb3pc::CreateDisplayDialog(
                                   drawer, {[this] { return window()->IsFullscreen(); },
                                            [this](bool on) { SetFullscreen(on); },
-                                           ConfigPath()});
+                                           [this] { FollowResolution(); }, ConfigPath()});
                             }
                           });
   }
-  // std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;
-  // std::unique_ptr<rex::ui::AchievementNotificationDialog>
-  // CreateAchievementNotificationDialog() override;
+  void OnPostLaunchModule(rex::system::XThread*) override {
+    game_running_ = true;
+    app_context().CallInUIThread([this] { FollowResolution(); });
+  }
+  void OnWindowPixelSizeChanged(uint32_t, uint32_t) override { FollowResolution(); }
   void OnShutdown() override {
     screenshots_.Stop();
     bindings_dialog_.reset();
@@ -196,6 +201,7 @@ class Rb3pcApp : public rex::ReXApp {
 
  private:
   rb3pc::ScreenshotService screenshots_;
+  std::atomic<bool> game_running_{false};
   std::unique_ptr<rex::ui::ImGuiDialog> bindings_dialog_;
   std::unique_ptr<rex::ui::ImGuiDialog> display_dialog_;
   std::unique_ptr<rex::ui::ImGuiDialog> fps_overlay_;
@@ -209,12 +215,9 @@ class Rb3pcApp : public rex::ReXApp {
     return rex::filesystem::GetExecutableFolder() / "rb3pc.toml";
   }
 
-  // The game runs from an overlay of its folder with some scripts patched
-  // (see script_patches.h).
-  static rex::PathConfig WithScriptPatches(rex::PathConfig paths) {
-    // Last stop before the runtime (and its audio) starts, launcher or not.
-    // Deluxe on in rb3pc, or off in rb3pc-dx: the other executable runs this
-    // boot (src/deluxe.h). Only returns if it can't be started.
+  rex::PathConfig WithScriptPatches(rex::PathConfig paths) {
+    rb3pc::ApplyResolutionScale(window()->IsFullscreen());
+    // Deluxe setting mismatches this exe: execs the other one (deluxe.h).
     if (rb3pc::NeedsOtherExecutable()) {
       REXLOG_ERROR("Deluxe: {}", rb3pc::RunOtherExecutable());
     }
@@ -242,6 +245,14 @@ class Rb3pcApp : public rex::ReXApp {
     window()->SetFullscreen(on);
     rex::cvar::SetFlagByName("fullscreen", on ? "true" : "false");
     rex::cvar::SaveConfig(ConfigPath());
+    FollowResolution();
+  }
+
+  // UI thread.
+  void FollowResolution() {
+    if (!game_running_ || !window()) return;
+    rb3pc::FollowResolutionScale(runtime() ? runtime()->graphics_system() : nullptr,
+                                 window()->IsFullscreen());
   }
 
   static std::filesystem::path FindGameDataRoot() {

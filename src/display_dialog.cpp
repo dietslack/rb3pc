@@ -10,6 +10,7 @@
 #include <rex/ui/imgui_dialog.h>
 
 #include "display_options.h"
+#include "display_size.h"
 #include "exe.h"
 #include "frame_stats.h"
 #include "launcher.h"
@@ -90,10 +91,26 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
     }
 
     ImGui::Separator();
-    int scale_index = ScaleIndex();
-    if (ImGui::Combo("Internal resolution", &scale_index, kScaleLabels, kScaleCount)) {
-      SetScaleIndex(scale_index);
-      Save(hooks_.config_path);
+    if (!fullscreen) {
+      // Windowed: it follows the window.
+      std::string label = "Follows the window: " + ScaleLabel(WantedResolutionScale(false));
+      ImGui::BeginDisabled();
+      int none = 0;
+      const char* items[] = {label.c_str()};
+      ImGui::Combo("Internal resolution", &none, items, 1);
+      ImGui::EndDisabled();
+    } else {
+      uint32_t w = 0, h = 0;
+      OutputPixelSize(true, w, h);
+      std::string match = "Match the display: " + ScaleLabel(ScaleForOutput(w, h));
+      const char* items[kScaleCount + 1] = {match.c_str()};
+      for (int i = 0; i < kScaleCount; ++i) items[i + 1] = kScaleLabels[i];
+      int index = FullscreenResolutionSetting();
+      if (ImGui::Combo("Internal resolution", &index, items, kScaleCount + 1)) {
+        SetFullscreenResolutionSetting(index);
+        Save(hooks_.config_path);
+        hooks_.resolution_setting_changed();
+      }
     }
 
     int limit_index = LimitIndex();
@@ -112,7 +129,7 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
     }
     ImGui::TextDisabled("Shown in-game. Empty uses your login name. Saves are kept.");
 
-    bool restart = GetInt("resolution_scale") != start_scale_ ||
+    bool restart = (!ResolutionScaleLive() && WantedResolutionScale(fullscreen) != start_scale_) ||
                    GetInt("video_mode_refresh_rate") != start_refresh_ ||
                    GetBool("vsync") != start_vsync_;
     if (restart) {

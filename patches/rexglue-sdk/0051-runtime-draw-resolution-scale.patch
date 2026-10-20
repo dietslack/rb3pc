@@ -1,0 +1,340 @@
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -307,6 +307,12 @@
+     uint32_t vertex_index_max;
+     float tessellation_factor_range_min;
+     float tessellation_factor_range_max;
++
++    // The draw resolution scale, read by the shaders at run time rather than
++    // built into them, so one translation (and pipeline) serves every scale.
++    uint32_t draw_resolution_scale[2];
++    float draw_resolution_scale_float[2];
++    float draw_resolution_scale_reciprocal[2];
+   };
+ 
+   enum ConstantBuffer : uint32_t {
+@@ -659,6 +665,12 @@
+   spv::Id EndianSwap128Uint4(spv::Id value, spv::Id endian);
+ 
+   spv::Id LoadUint32FromSharedMemory(spv::Id address_dwords_int);
++
++  // The draw resolution scale along X (0) or Y (1), from the system
++  // constants: as uint, float or 1 / scale.
++  spv::Id LoadDrawResolutionScale(uint32_t axis);
++  spv::Id LoadDrawResolutionScaleFloat(uint32_t axis);
++  spv::Id LoadDrawResolutionScaleReciprocal(uint32_t axis);
+   // If `replace_mask` is provided, the bits specified in the mask will be
+   // replaced with those from the value via OpAtomicAnd/Or.
+   // Bits of `value` not in `replace_mask` will be ignored.
+@@ -879,6 +891,9 @@
+     kSystemConstantEdramRTKeepMask,
+     kSystemConstantEdramRTClamp,
+     kSystemConstantEdramBlendConstant,
++    kSystemConstantDrawResolutionScale,
++    kSystemConstantDrawResolutionScaleFloat,
++    kSystemConstantDrawResolutionScaleReciprocal,
+   };
+   spv::Id uniform_system_constants_;
+   spv::Id uniform_float_constants_;
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -309,6 +309,11 @@
+       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
+       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
+       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
++      {"draw_resolution_scale", offsetof(SystemConstants, draw_resolution_scale), type_uint2_},
++      {"draw_resolution_scale_float", offsetof(SystemConstants, draw_resolution_scale_float),
++       type_float2_},
++      {"draw_resolution_scale_reciprocal",
++       offsetof(SystemConstants, draw_resolution_scale_reciprocal), type_float2_},
+   };
+   id_vector_temp_.clear();
+   id_vector_temp_.reserve(rex::countof(system_constants));
+@@ -2898,8 +2903,8 @@
+   // TODO(Triang3l): More conditions - alpha to coverage (if RT 0 is written,
+   // and there's no early depth / stencil), depth writing in the fragment shader
+   // (per-sample if supported).
+-  bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
+-                                     (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
++  // Whether the draw is resolution-scaled is only known at run time.
++  bool memexport_resolution_scaled = current_shader().memexport_eM_written();
+   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
+       float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+@@ -3096,9 +3101,9 @@
+   }
+ 
+   if (current_shader().memexport_eM_written()) {
+-    // Make sure memexport is done only once for a guest pixel.
+-    uint32_t resolution_scaled_axes =
+-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
++    // Make sure memexport is done only once for a guest pixel (at 1x, every
++    // host pixel is the guest pixel's center).
++    uint32_t resolution_scaled_axes = 0b11;
+     if (resolution_scaled_axes) {
+       assert_true(input_fragment_coordinates_ != spv::NoResult);
+       spv::Id memexport_allowed = spv::NoResult;
+@@ -3112,14 +3117,14 @@
+             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                         id_vector_temp_),
+             spv::NoPrecision);
++        spv::Id scale = LoadDrawResolutionScale(i);
+         spv::Id position_mod = builder_->createBinOp(
+             spv::OpUMod, type_uint_,
+-            builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position),
+-            builder_->makeUintConstant(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_));
+-        spv::Id position_is_center =
+-            builder_->createBinOp(spv::OpIEqual, type_bool_, position_mod,
+-                                  builder_->makeUintConstant(i ? (draw_resolution_scale_y_ >> 1)
+-                                                               : (draw_resolution_scale_x_ >> 1)));
++            builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position), scale);
++        spv::Id position_is_center = builder_->createBinOp(
++            spv::OpIEqual, type_bool_, position_mod,
++            builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, scale,
++                                  builder_->makeUintConstant(1)));
+         memexport_allowed = memexport_allowed != spv::NoResult
+                                 ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
+                                                         memexport_allowed, position_is_center)
+@@ -3210,11 +3215,8 @@
+             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                         id_vector_temp_),
+             spv::NoPrecision));
+-    if (draw_resolution_scale_x_ > 1) {
+-      param_gen_x = builder_->createNoContractionBinOp(
+-          spv::OpFMul, type_float_, param_gen_x,
+-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+-    }
++    param_gen_x = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, param_gen_x,
++                                                     LoadDrawResolutionScaleReciprocal(0));
+     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                    GLSLstd450FAbs, param_gen_x);
+     if (!modification.pixel.param_gen_point) {
+@@ -3246,11 +3248,8 @@
+             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                         id_vector_temp_),
+             spv::NoPrecision));
+-    if (draw_resolution_scale_y_ > 1) {
+-      param_gen_y = builder_->createNoContractionBinOp(
+-          spv::OpFMul, type_float_, param_gen_y,
+-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+-    }
++    param_gen_y = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, param_gen_y,
++                                                     LoadDrawResolutionScaleReciprocal(1));
+     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                    GLSLstd450FAbs, param_gen_y);
+     if (modification.pixel.param_gen_point) {
+@@ -4051,6 +4050,37 @@
+   return EndianSwap32Uint(value, endian);
+ }
+ 
++spv::Id SpirvShaderTranslator::LoadDrawResolutionScale(uint32_t axis) {
++  id_vector_temp_.clear();
++  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantDrawResolutionScale));
++  id_vector_temp_.push_back(builder_->makeIntConstant(int(axis)));
++  return builder_->createLoad(
++      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                  id_vector_temp_),
++      spv::NoPrecision);
++}
++
++spv::Id SpirvShaderTranslator::LoadDrawResolutionScaleFloat(uint32_t axis) {
++  id_vector_temp_.clear();
++  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantDrawResolutionScaleFloat));
++  id_vector_temp_.push_back(builder_->makeIntConstant(int(axis)));
++  return builder_->createLoad(
++      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                  id_vector_temp_),
++      spv::NoPrecision);
++}
++
++spv::Id SpirvShaderTranslator::LoadDrawResolutionScaleReciprocal(uint32_t axis) {
++  id_vector_temp_.clear();
++  id_vector_temp_.push_back(
++      builder_->makeIntConstant(kSystemConstantDrawResolutionScaleReciprocal));
++  id_vector_temp_.push_back(builder_->makeIntConstant(int(axis)));
++  return builder_->createLoad(
++      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                  id_vector_temp_),
++      spv::NoPrecision);
++}
++
+ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords_int) {
+   spv::StorageClass storage_class = features_.spirv_version >= spv::Spv_1_3
+                                         ? spv::StorageClassStorageBuffer
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -974,8 +974,9 @@
+       coordinates[coordinate_component_index] = coordinates_operand;
+     }
+     spv::Id texture_resolution_scaled = spv::NoResult;
+-    uint32_t revert_resolution_scale_axes =
+-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
++    // Which textures are resolution-scaled, and by how much, is only known at
++    // run time (at 1x none are).
++    uint32_t revert_resolution_scale_axes = 0b11;
+     spv::Id const_texture_resolution_scale[] = {spv::NoResult, spv::NoResult};
+     spv::Id const_texture_resolution_scale_reciprocal[] = {spv::NoResult, spv::NoResult};
+     if (revert_resolution_scale_axes) {
+@@ -990,17 +991,9 @@
+           builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, textures_resolution_scaled,
+                                 builder_->makeUintConstant(UINT32_C(1) << fetch_constant_index)),
+           const_uint_0_);
+-      if (revert_resolution_scale_axes & 0b001) {
+-        const_texture_resolution_scale[0] =
+-            builder_->makeFloatConstant(float(draw_resolution_scale_x_));
+-        const_texture_resolution_scale_reciprocal[0] =
+-            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_));
+-      }
+-      if (revert_resolution_scale_axes & 0b010) {
+-        const_texture_resolution_scale[1] =
+-            builder_->makeFloatConstant(float(draw_resolution_scale_y_));
+-        const_texture_resolution_scale_reciprocal[1] =
+-            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_));
++      for (uint32_t i = 0; i < 2; ++i) {
++        const_texture_resolution_scale[i] = LoadDrawResolutionScaleFloat(i);
++        const_texture_resolution_scale_reciprocal[i] = LoadDrawResolutionScaleReciprocal(i);
+       }
+     }
+ 
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -903,10 +903,14 @@
+       fsi_color_targets_written =
+           builder_->createLoad(var_main_fsi_color_written_, spv::NoPrecision);
+       fsi_const_int_1 = builder_->makeIntConstant(1);
+-      uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+-      uint32_t tile_height = xenos::kEdramTileHeightSamples * draw_resolution_scale_y_;
+-      fsi_const_edram_size_dwords =
+-          builder_->makeUintConstant(tile_width * tile_height * xenos::kEdramTileCount);
++      // Tile width x height x tile count, the scale coming from the system
++      // constants.
++      fsi_const_edram_size_dwords = builder_->createBinOp(
++          spv::OpIMul, type_uint_,
++          builder_->createBinOp(spv::OpIMul, type_uint_, LoadDrawResolutionScale(0),
++                                LoadDrawResolutionScale(1)),
++          builder_->makeUintConstant(xenos::kEdramTileWidthSamples *
++                                     xenos::kEdramTileHeightSamples * xenos::kEdramTileCount));
+       for (uint32_t i = 0; i < 4; ++i) {
+         fsi_samples_covered[i] = builder_->createBinOp(
+             spv::OpINotEqual, type_bool_,
+@@ -1553,10 +1557,15 @@
+   // Get 40 x 16 x resolution scale 32bpp half-tile or 40x16 64bpp tile index.
+   // Working with 40x16-sample portions for 64bpp and for swapping for depth -
+   // dividing by 40, not by 80.
+-  uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+-  spv::Id const_tile_half_width = builder_->makeUintConstant(tile_width >> 1);
+-  uint32_t tile_height = xenos::kEdramTileHeightSamples * draw_resolution_scale_y_;
+-  spv::Id const_tile_height = builder_->makeUintConstant(tile_height);
++  // The tile size at the run-time draw resolution scale.
++  spv::Id const_tile_width =
++      builder_->createBinOp(spv::OpIMul, type_uint_, LoadDrawResolutionScale(0),
++                            builder_->makeUintConstant(xenos::kEdramTileWidthSamples));
++  spv::Id const_tile_half_width = builder_->createBinOp(
++      spv::OpShiftRightLogical, type_uint_, const_tile_width, builder_->makeUintConstant(1));
++  spv::Id const_tile_height =
++      builder_->createBinOp(spv::OpIMul, type_uint_, LoadDrawResolutionScale(1),
++                            builder_->makeUintConstant(xenos::kEdramTileHeightSamples));
+   spv::Id tile_half_index[2], tile_half_sample_coordinates[2];
+   for (uint32_t i = 0; i < 2; ++i) {
+     spv::Id sample_x_or_y = sample_coordinates[i];
+@@ -1569,7 +1578,6 @@
+ 
+   // Convert the Y sample 0 position within the half-tile or tile to the dword
+   // offset of the row within a 80x16 32bpp tile or a 40x16 64bpp half-tile.
+-  spv::Id const_tile_width = builder_->makeUintConstant(tile_width);
+   spv::Id row_offset_in_tile_at_32bpp = builder_->createBinOp(
+       spv::OpIMul, type_uint_, tile_half_sample_coordinates[1], const_tile_width);
+ 
+@@ -1586,8 +1594,8 @@
+                            spv::NoPrecision),
+       tile_half_index[1]);
+ 
+-  uint32_t tile_size = tile_width * tile_height;
+-  spv::Id const_tile_size = builder_->makeUintConstant(tile_size);
++  spv::Id const_tile_size =
++      builder_->createBinOp(spv::OpIMul, type_uint_, const_tile_width, const_tile_height);
+ 
+   // Get the dword offset of the sample 0 in the first half-tile in the tile
+   // within a 32bpp surface.
+@@ -1627,7 +1635,8 @@
+               spv::OpIAdd, type_uint_, offset_in_first_tile_half_at_32bpp,
+               builder_->createTriOp(spv::OpSelect, type_uint_, is_second_tile_half, const_uint_0_,
+                                     const_tile_half_width))),
+-      builder_->makeUintConstant(tile_size * xenos::kEdramTileCount));
++      builder_->createBinOp(spv::OpIMul, type_uint_, const_tile_size,
++                            builder_->makeUintConstant(xenos::kEdramTileCount)));
+ 
+   if (current_shader().writes_color_targets()) {
+     // Get the offset of the sample 0 within a 32bpp surface, with samples
+@@ -1659,16 +1668,22 @@
+     return sample_0_address;
+   }
+   spv::Id sample_offset;
+-  uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
++  // The tile width at the run-time draw resolution scale.
++  spv::Id tile_width = builder_->createUnaryOp(
++      spv::OpBitcast, type_int_,
++      builder_->createBinOp(spv::OpIMul, type_uint_, LoadDrawResolutionScale(0),
++                            builder_->makeUintConstant(xenos::kEdramTileWidthSamples)));
+   if (sample_index == 1) {
+-    sample_offset = builder_->makeIntConstant(tile_width);
++    sample_offset = tile_width;
+   } else {
+-    spv::Id sample_offset_32bpp =
+-        builder_->makeIntConstant(tile_width * (sample_index & 1) + (sample_index >> 1));
++    spv::Id row = (sample_index & 1) ? tile_width : const_int_0_;
++    spv::Id sample_offset_32bpp = builder_->createBinOp(
++        spv::OpIAdd, type_int_, row, builder_->makeIntConstant(int(sample_index >> 1)));
+     if (is_64bpp != spv::NoResult) {
+       sample_offset = builder_->createTriOp(
+           spv::OpSelect, type_int_, is_64bpp,
+-          builder_->makeIntConstant(tile_width * (sample_index & 1) + 2 * (sample_index >> 1)),
++          builder_->createBinOp(spv::OpIAdd, type_int_, row,
++                                builder_->makeIntConstant(int(2 * (sample_index >> 1)))),
+           sample_offset_32bpp);
+     } else {
+       sample_offset = sample_offset_32bpp;
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -6549,6 +6549,17 @@
+   dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
+   system_constants_.textures_resolution_scaled = textures_resolution_scaled;
+ 
++  // The draw resolution scale, which the shaders read at run time.
++  for (uint32_t i = 0; i < 2; ++i) {
++    uint32_t scale = std::max(i ? render_target_cache_->draw_resolution_scale_y()
++                                : render_target_cache_->draw_resolution_scale_x(),
++                              uint32_t(1));
++    dirty |= system_constants_.draw_resolution_scale[i] != scale;
++    system_constants_.draw_resolution_scale[i] = scale;
++    system_constants_.draw_resolution_scale_float[i] = float(scale);
++    system_constants_.draw_resolution_scale_reciprocal[i] = 1.0f / float(scale);
++  }
++
+   // Texture host swizzle in the shader.
+   if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+     uint32_t textures_remaining = used_texture_mask;
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -4305,8 +4305,6 @@
+     key_source.push_back(device_properties.vendorID);
+     key_source.push_back(device_properties.deviceID);
+     key_source.push_back(device_properties.driverVersion);
+-    key_source.push_back((uint64_t(render_target_cache_.draw_resolution_scale_x()) << 32) |
+-                         render_target_cache_.draw_resolution_scale_y());
+     for (const PipelineStoredDescription& entry : stored) {
+       key_source.push_back(entry.description_hash);
+     }
+@@ -4492,8 +4490,10 @@
+                    device_properties.driverVersion,
+                    PipelineDescription::kVersion,
+                    SpirvShaderTranslator::Modification::kVersion,
+-                   render_target_cache_.draw_resolution_scale_x(),
+-                   render_target_cache_.draw_resolution_scale_y(),
++                   // 1: the draw resolution scale is a run-time constant
++                   // (one cache for every scale).
++                   1u,
++                   0u,
+                    uint32_t(render_target_cache_.msaa_2x_attachments_supported()),
+                    uint32_t(render_target_cache_.msaa_2x_no_attachments_supported()),
+                    // 2: independent sets and dynamic cull mode (patch 0018).

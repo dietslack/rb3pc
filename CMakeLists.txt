@@ -44,6 +44,7 @@ set(RB3PC_SOURCES
     src/custom_songs.cpp
     src/mouse_cursor.cpp
     src/text_entry.cpp
+    src/display_size.cpp
     src/script_patches.cpp
     src/deluxe.cpp
     src/mouse_menus.cpp

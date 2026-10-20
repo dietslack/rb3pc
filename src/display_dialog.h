@@ -16,6 +16,7 @@ namespace rb3pc {
 struct DisplayHooks {
   std::function<bool()> is_fullscreen;
   std::function<void(bool)> set_fullscreen;
+  std::function<void()> resolution_setting_changed;
   std::filesystem::path config_path;  // where settings are saved
 };
 
