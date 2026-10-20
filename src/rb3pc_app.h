@@ -93,7 +93,6 @@ class Rb3pcApp : public rex::ReXApp {
     rb3pc::ApplyProfileName(runtime()->kernel_state());
     rb3pc::RegisterCustomSongs(runtime()->kernel_state());
     rb3pc::ApplyScriptPatchChecksums();
-    rb3pc::ApplyWideView();
     if constexpr (rb3pc::exe::kDeluxe) rb3pc::CheckDeluxeCode();
 
     // Title (save) icon for the window and a .desktop launcher.

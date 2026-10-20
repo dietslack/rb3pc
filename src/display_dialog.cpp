@@ -60,7 +60,7 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
   DisplayDialog(rex::ui::ImGuiDrawer* drawer, DisplayHooks hooks)
       : ImGuiDialog(drawer),
         hooks_(std::move(hooks)),
-        start_scale_(GetInt("resolution_scale")),
+        start_scale_(CurrentResolutionScale()),
         start_refresh_(GetInt("video_mode_refresh_rate")),
         start_vsync_(GetBool("vsync")),
         start_profile_(ProfileName()) {
@@ -102,11 +102,11 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
     } else {
       uint32_t w = 0, h = 0;
       OutputPixelSize(true, w, h);
-      std::string match = "Match the display: " + ScaleLabel(ScaleForOutput(w, h));
+      std::string match = "Match the display: " + ScaleLabel(ScaleForOutput(true, w, h));
       const char* items[kScaleCount + 1] = {match.c_str()};
       std::string labels[kScaleCount];
       for (int i = 0; i < kScaleCount; ++i) {
-        labels[i] = ScaleLabel(kScales[i]);
+        labels[i] = ScaleLabel({kScales[i], kScales[i]});
         items[i + 1] = labels[i].c_str();
       }
       int index = FullscreenResolutionSetting();
@@ -117,18 +117,27 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
       }
     }
 
-    bool wide_view = GetBool("wide_view");
-    if (ImGui::Checkbox("Wide view: fit the scene to the window's shape", &wide_view)) {
-      rex::cvar::SetFlagByName("wide_view", wide_view ? "true" : "false");
-      Save(hooks_.config_path);
+    if (!fullscreen) {
+      // Windowed: it follows the window.
+      std::string label = "Follows the window: " + AspectLabel(ViewShape(false));
+      ImGui::BeginDisabled();
+      int none = 0;
+      const char* items[] = {label.c_str()};
+      ImGui::Combo("Aspect ratio", &none, items, 1);
+      ImGui::EndDisabled();
+    } else {
+      std::string match = "Match the display: " + AspectLabel(ViewShape(true));
+      const char* aspect_items[kAspectChoiceCount];
+      for (int i = 0; i < kAspectChoiceCount; ++i) aspect_items[i] = kAspectChoices[i].label;
+      if (AspectRatioSetting() == 0) aspect_items[0] = match.c_str();
+      int aspect_index = AspectRatioSetting();
+      if (ImGui::Combo("Aspect ratio", &aspect_index, aspect_items, kAspectChoiceCount)) {
+        SetAspectRatioSetting(aspect_index);
+        Save(hooks_.config_path);
+        hooks_.resolution_setting_changed();
+      }
     }
-    GuestMode running = CurrentGuestMode(), wanted = GuestModeFor(fullscreen);
-    ImGui::TextDisabled("The scene is drawn %s (set when the game starts).",
-                        AspectLabel(running).c_str());
-    if (wanted.width != running.width) {
-      ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Restart the game to fit the new shape (%s).",
-                         AspectLabel(wanted).c_str());
-    }
+    ImGui::TextDisabled("More or less of the scene shows; nothing is stretched.");
 
     int limit_index = LimitIndex();
     if (ImGui::Combo("Frame-rate limit", &limit_index, kLimitLabels, kLimitCount)) {
@@ -162,7 +171,7 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
 
  private:
   DisplayHooks hooks_;
-  int start_scale_;
+  Scale start_scale_;
   int start_refresh_;
   bool start_vsync_;
   std::string start_profile_;

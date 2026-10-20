@@ -1,0 +1,59 @@
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -80,6 +80,16 @@
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+   bool RequestDrawResolutionScale(uint32_t scale_x, uint32_t scale_y) override;
++  void SetGuestDisplayAspect(uint32_t width, uint32_t height) override {
++    guest_display_aspect_.store(uint64_t(width) << 32 | height, std::memory_order_relaxed);
++  }
++  // The display aspect set with SetGuestDisplayAspect, false if none.
++  bool GetGuestDisplayAspect(uint32_t& width, uint32_t& height) const {
++    uint64_t aspect = guest_display_aspect_.load(std::memory_order_relaxed);
++    width = uint32_t(aspect >> 32);
++    height = uint32_t(aspect);
++    return width && height;
++  }
+ 
+   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                                bool blocking) override;
+@@ -126,6 +136,7 @@
+   std::unique_ptr<CommandProcessor> command_processor_;
+ 
+   bool paused_ = false;
++  std::atomic<uint64_t> guest_display_aspect_{0};
+ 
+  private:
+   std::unique_ptr<::rex::ui::Presenter> presenter_;
+--- a/include/rex/system/interfaces/graphics.h
++++ b/include/rex/system/interfaces/graphics.h
+@@ -88,6 +88,15 @@
+     return false;
+   }
+ 
++  // The shape the guest's picture is shown in (stretched to it), instead of
++  // the video mode's, for a title drawing an anamorphic picture of that
++  // shape into its usual frame buffer. 0 x 0 goes back to the video mode's.
++  // Any thread.
++  virtual void SetGuestDisplayAspect(uint32_t width, uint32_t height) {
++    (void)width;
++    (void)height;
++  }
++
+   // One-shot convenience for callers that don't care about the split.
+   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
+                  ui::WindowedAppContext* app_context, bool with_presentation) {
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2753,6 +2753,11 @@
+   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
++  uint32_t aspect_width, aspect_height;
++  if (graphics_system_->GetGuestDisplayAspect(aspect_width, aspect_height)) {
++    display_width = aspect_width;
++    display_height = aspect_height;
++  }
+ 
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
