@@ -80,6 +80,7 @@ enum class Row {
   kSongsAdd,
   kDisplayMode,
   kResolution,
+  kWideView,
   kFrameLimit,
   kFpsCounter,
   kAudioBuffer,
@@ -112,7 +113,8 @@ std::vector<Row> SectionRows(Section section, size_t extra_songs_folders) {
       return rows;
     }
     case Section::kVideo:
-      return {Row::kDisplayMode, Row::kResolution, Row::kFrameLimit, Row::kFpsCounter};
+      return {Row::kDisplayMode, Row::kResolution, Row::kWideView, Row::kFrameLimit,
+              Row::kFpsCounter};
     case Section::kAudio: return {Row::kAudioBuffer, Row::kAudioDevice};
     case Section::kControllers:
       return {Row::kController1, Row::kController2, Row::kController3, Row::kController4,
@@ -228,6 +230,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
         std::string scale = ScaleLabel(WantedResolutionScale(hooks_.is_fullscreen()));  // "2x (...)"
         int limit = kLimits[LimitIndex()];
         return Value(Row::kDisplayMode) + ", " + Upper(scale.substr(0, scale.find(' '))) + ", " +
+               AspectLabel(GuestModeFor(hooks_.is_fullscreen())) + ", " +
                (limit ? std::to_string(limit) + " FPS" : "UNCAPPED");
       }
       case Section::kAudio: {
@@ -279,6 +282,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kQuickStart:
       case Row::kMouseKeyboard:
       case Row::kDisplayMode:
+      case Row::kWideView:
       case Row::kFpsCounter:
       case Row::kShowLauncher:
         return 2;
@@ -310,6 +314,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
         return GetBoolFlag("deluxe_rb3e_functions") ? 1 : 0;
       case Row::kDisplayMode:
         return hooks_.is_fullscreen() ? 1 : 0;
+      case Row::kWideView:
+        return GetBoolFlag("wide_view") ? 1 : 0;
       case Row::kFpsCounter:
         return GetBoolFlag("show_fps") ? 1 : 0;
       case Row::kQuickStart:
@@ -348,6 +354,9 @@ class Launcher final : public rex::ui::ImGuiDialog {
         break;
       case Row::kDisplayMode:
         hooks_.set_fullscreen(index == 1);
+        break;
+      case Row::kWideView:
+        rex::cvar::SetFlagByName("wide_view", index ? "true" : "false");
         break;
       case Row::kFpsCounter:
         rex::cvar::SetFlagByName("show_fps", index ? "true" : "false");
@@ -449,6 +458,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kFrameLimit: return "FRAME RATE LIMIT";
       case Row::kAudioBuffer: return "AUDIO BUFFER";
       case Row::kAudioDevice: return "AUDIO DEVICE BUFFER";
+      case Row::kWideView: return "WIDE VIEW";
       case Row::kFpsCounter: return "FPS COUNTER";
       case Row::kQuickStart: return "QUICK START (SKIP INTRO)";
       case Row::kController1: return "CONTROLLER 1";
@@ -484,6 +494,9 @@ class Launcher final : public rex::ui::ImGuiDialog {
       }
       case Row::kSongsAdd: return songs_status_.empty() ? "CHOOSE FOLDER..." : songs_status_;
       case Row::kDisplayMode: return index ? "FULLSCREEN" : "WINDOWED";
+      case Row::kWideView:
+        // The shape the scene will be drawn in.
+        return index ? "ON (" + AspectLabel(GuestModeFor(hooks_.is_fullscreen())) + ")" : "OFF (16:9)";
       case Row::kQuickStart:
       case Row::kFpsCounter:
       case Row::kMouseKeyboard:
@@ -497,7 +510,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
           OutputPixelSize(true, w, h);
           return "MATCH DISPLAY (" + Upper(ScaleLabel(ScaleForOutput(w, h)).substr(0, 2)) + ")";
         }
-        return Upper(kScaleLabels[index - 1]);
+        return Upper(ScaleLabel(kScales[index - 1]));
       }
       case Row::kFrameLimit: return Upper(kLimitLabels[index]);
       case Row::kAudioBuffer: return Upper(kAudioQueueLabels[index]);
@@ -890,7 +903,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
   }
 
   bool IsCheckbox(Row row) const {
-    return (row == Row::kFpsCounter || row == Row::kQuickStart || row == Row::kShowLauncher ||
+    return (row == Row::kFpsCounter || row == Row::kWideView || row == Row::kQuickStart || row == Row::kShowLauncher ||
             row == Row::kDeluxe || row == Row::kDeluxeRb3e || row == Row::kMouseKeyboard) &&
            ChoiceCount(row);
   }

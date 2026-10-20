@@ -104,13 +104,30 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
       OutputPixelSize(true, w, h);
       std::string match = "Match the display: " + ScaleLabel(ScaleForOutput(w, h));
       const char* items[kScaleCount + 1] = {match.c_str()};
-      for (int i = 0; i < kScaleCount; ++i) items[i + 1] = kScaleLabels[i];
+      std::string labels[kScaleCount];
+      for (int i = 0; i < kScaleCount; ++i) {
+        labels[i] = ScaleLabel(kScales[i]);
+        items[i + 1] = labels[i].c_str();
+      }
       int index = FullscreenResolutionSetting();
       if (ImGui::Combo("Internal resolution", &index, items, kScaleCount + 1)) {
         SetFullscreenResolutionSetting(index);
         Save(hooks_.config_path);
         hooks_.resolution_setting_changed();
       }
+    }
+
+    bool wide_view = GetBool("wide_view");
+    if (ImGui::Checkbox("Wide view: fit the scene to the window's shape", &wide_view)) {
+      rex::cvar::SetFlagByName("wide_view", wide_view ? "true" : "false");
+      Save(hooks_.config_path);
+    }
+    GuestMode running = CurrentGuestMode(), wanted = GuestModeFor(fullscreen);
+    ImGui::TextDisabled("The scene is drawn %s (set when the game starts).",
+                        AspectLabel(running).c_str());
+    if (wanted.width != running.width) {
+      ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Restart the game to fit the new shape (%s).",
+                         AspectLabel(wanted).c_str());
     }
 
     int limit_index = LimitIndex();

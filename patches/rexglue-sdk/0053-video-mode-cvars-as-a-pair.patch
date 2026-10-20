@@ -1,0 +1,29 @@
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -39,9 +39,16 @@
+ // Display gamma power (used with gamma type 3)
+ constexpr double kDisplayGammaPower = 2.22222233;
+ 
++// The video mode cvars are a pair: with either set, both are used (one may be
++// set to its default value, which doesn't count as set by itself).
++bool VideoModeConfigured() {
++  return rex::cvar::HasNonDefaultValue("video_mode_width") ||
++         rex::cvar::HasNonDefaultValue("video_mode_height");
++}
++
+ uint32_t GetConfiguredVideoModeWidth() {
+   int32_t configured_width = REXCVAR_GET(video_mode_width);
+-  if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
++  if (!VideoModeConfigured()) {
+     if (rex::cvar::HasNonDefaultValue("window_width") && REXCVAR_GET(window_width) > 0) {
+       configured_width = REXCVAR_GET(window_width);
+     } else {
+@@ -58,7 +65,7 @@
+ 
+ uint32_t GetConfiguredVideoModeHeight() {
+   int32_t configured_height = REXCVAR_GET(video_mode_height);
+-  if (!rex::cvar::HasNonDefaultValue("video_mode_height")) {
++  if (!VideoModeConfigured()) {
+     if (rex::cvar::HasNonDefaultValue("window_height") && REXCVAR_GET(window_height) > 0) {
+       configured_height = REXCVAR_GET(window_height);
+     } else {
