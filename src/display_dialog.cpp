@@ -92,11 +92,10 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
 
     ImGui::Separator();
     if (!fullscreen) {
-      // Windowed: it follows the window.
-      std::string label = "Follows the window: " + ScaleLabel(WantedResolutionScale(false));
+      // Windowed: it follows the window, nothing to show.
       ImGui::BeginDisabled();
       int none = 0;
-      const char* items[] = {label.c_str()};
+      const char* items[] = {""};
       ImGui::Combo("Internal resolution", &none, items, 1);
       ImGui::EndDisabled();
     } else {
@@ -118,11 +117,10 @@ class DisplayDialog final : public rex::ui::ImGuiDialog {
     }
 
     if (!fullscreen) {
-      // Windowed: it follows the window.
-      std::string label = "Follows the window: " + AspectLabel(ViewShape(false));
+      // Windowed: it follows the window, nothing to show.
       ImGui::BeginDisabled();
       int none = 0;
-      const char* items[] = {label.c_str()};
+      const char* items[] = {""};
       ImGui::Combo("Aspect ratio", &none, items, 1);
       ImGui::EndDisabled();
     } else {

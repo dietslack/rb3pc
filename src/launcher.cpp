@@ -229,8 +229,9 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Section::kVideo: {
         int limit = kLimits[LimitIndex()];
         return Value(Row::kDisplayMode) + ", " +
-               ScaleShortLabel(WantedResolutionScale(hooks_.is_fullscreen())) + ", " +
-               AspectLabel(ViewShape(hooks_.is_fullscreen())) + ", " +
+               (hooks_.is_fullscreen() ? ScaleShortLabel(WantedResolutionScale(true)) + ", " +
+                                             AspectLabel(ViewShape(true)) + ", "
+                                       : std::string()) +
                (limit ? std::to_string(limit) + " FPS" : "UNCAPPED");
       }
       case Section::kAudio: {
@@ -497,8 +498,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kSongsAdd: return songs_status_.empty() ? "CHOOSE FOLDER..." : songs_status_;
       case Row::kDisplayMode: return index ? "FULLSCREEN" : "WINDOWED";
       case Row::kAspectRatio:
-        // The shape the scene will be drawn in.
-        if (!hooks_.is_fullscreen()) return "FOLLOWS WINDOW (" + AspectLabel(ViewShape(false)) + ")";
+        if (!hooks_.is_fullscreen()) return "";
         if (index == 0) return "MATCH DISPLAY (" + AspectLabel(ViewShape(true)) + ")";
         return Upper(kAspectChoices[index].label);
       case Row::kQuickStart:
@@ -506,9 +506,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kMouseKeyboard:
       case Row::kShowLauncher: return index ? "ON" : "OFF";
       case Row::kResolution: {
-        if (!hooks_.is_fullscreen()) {
-          return "FOLLOWS WINDOW (" + ScaleShortLabel(WantedResolutionScale(false)) + ")";
-        }
+        if (!hooks_.is_fullscreen()) return "";
         if (index == 0) {
           uint32_t w = 0, h = 0;
           OutputPixelSize(true, w, h);
@@ -989,7 +987,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
         continue;
       }
       // Windowed, the internal resolution and aspect ratio follow the window:
-      // grayed out, showing what they follow.
+      // grayed out, with no value.
       bool locked = (row == Row::kResolution || row == Row::kAspectRatio) && !ChoiceCount(row);
       label(Label(row), text, l.menu_x + pad, text_y, locked ? kUiMuted : kUiText);
 
