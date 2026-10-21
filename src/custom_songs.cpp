@@ -5,6 +5,7 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_manager.h>
@@ -100,3 +101,46 @@ void RegisterCustomSongs(rex::system::KernelState* kernel_state) {
 }
 
 }  // namespace rb3pc
+
+// max_song_count: 3000 in RB3, 8000 in Deluxe, 32000 in Deluxe PS3 high-mem.
+// The real limit is the main heap, so it's grown by what high-mem would add.
+constexpr uint32_t kMaxSongCount = 32000;
+constexpr uint32_t kMainHeapExtra = 128u << 20;
+
+// BandSongMgr::Init (r3): mMaxSongCount at +0x16C.
+#ifdef RB3PC_DX
+#define CS_SONG_MGR_INIT sub_825796C0
+#define CS_SONG_MGR_INIT_ORIG __imp__sub_825796C0
+#else
+#define CS_SONG_MGR_INIT sub_82562040
+#define CS_SONG_MGR_INIT_ORIG __imp__sub_82562040
+#endif
+REX_EXTERN(CS_SONG_MGR_INIT_ORIG);
+REX_HOOK_RAW(CS_SONG_MGR_INIT) {
+  uint32_t mgr = ctx.r3.u32;
+  CS_SONG_MGR_INIT_ORIG(ctx, base);
+  uint8_t* max = base + mgr + 0x16C;
+  uint32_t configured = uint32_t(max[0]) << 24 | uint32_t(max[1]) << 16 | uint32_t(max[2]) << 8 | max[3];
+  if (configured < kMaxSongCount) {
+    max[0] = uint8_t(kMaxSongCount >> 24), max[1] = uint8_t(kMaxSongCount >> 16);
+    max[2] = uint8_t(kMaxSongCount >> 8), max[3] = uint8_t(kMaxSongCount);
+    REXLOG_INFO("Custom songs: song limit raised from {} to {}", configured, kMaxSongCount);
+  }
+}
+
+// Creates heap r3 (in the order mem.dta lists them; 0 is main) of r4 bytes.
+#ifdef RB3PC_DX
+#define CS_HEAP_CREATE sub_827BC2D0
+#define CS_HEAP_CREATE_ORIG __imp__sub_827BC2D0
+#else
+#define CS_HEAP_CREATE sub_82797670
+#define CS_HEAP_CREATE_ORIG __imp__sub_82797670
+#endif
+REX_EXTERN(CS_HEAP_CREATE_ORIG);
+REX_HOOK_RAW(CS_HEAP_CREATE) {
+  if (ctx.r3.u32 == 0) {
+    REXLOG_INFO("Custom songs: main heap {} MB, made {} MB", ctx.r4.u32 >> 20, (ctx.r4.u32 + kMainHeapExtra) >> 20);
+    ctx.r4.u64 = ctx.r4.u32 + kMainHeapExtra;
+  }
+  CS_HEAP_CREATE_ORIG(ctx, base);
+}
