@@ -84,6 +84,11 @@ Shape ViewShape(bool fullscreen) {
   return {width, height};
 }
 
+double CurrentViewAspect() {
+  double ratio = view_ratio.load(std::memory_order_relaxed);
+  return ratio > 0 ? 1.0 / ratio : 16.0 / 9.0;
+}
+
 std::string AspectLabel(Shape shape) {
   double aspect = double(shape.width) / shape.height;
   static constexpr struct {

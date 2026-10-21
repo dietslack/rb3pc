@@ -34,6 +34,8 @@ int AspectRatioSetting();
 void SetAspectRatioSetting(int index);
 // "16:9", "21:9", "4:3", or "2.10:1".
 std::string AspectLabel(Shape shape);
+// Width / height of the shape the game draws now. Any thread.
+double CurrentViewAspect();
 
 struct Scale {
   int x = 1, y = 1;

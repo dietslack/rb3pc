@@ -58,6 +58,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <string_view>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -73,6 +74,7 @@
 #include <rex/ppc/func.h>
 #include <rex/ui/presenter.h>
 
+#include "display_size.h"
 #include "exe.h"
 #include "rb3_assets.h"
 #include "rb3_ui.h"
@@ -224,6 +226,10 @@ float LoadF(const uint8_t* base, uint32_t addr) {
 void StoreF(uint8_t* base, uint32_t addr, float f) {
   uint32_t v;
   std::memcpy(&v, &f, 4);
+  v = __builtin_bswap32(v);
+  std::memcpy(base + addr, &v, 4);
+}
+void Store32(uint8_t* base, uint32_t addr, uint32_t v) {
   v = __builtin_bswap32(v);
   std::memcpy(base + addr, &v, 4);
 }
@@ -1789,8 +1795,59 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
 
 }  // namespace
 
-// Every component polls through here; the pointer is updated once per frame
-// or so, on the game thread, where the game's functions can be called.
+// The main menu's buttons, labels and help (the panel holding
+// mb_playnow.btn: its submenus, and the message below them with its NEXT
+// MESSAGE help, expand_message_area.ihp) sit at the 16:9 picture's left
+// edge; on a wider screen (wide view) they move with the screen's left edge
+// instead.
+// +0x30 of a component is its object (name at +0x18, ObjectDir at +0x1C);
+// its local transform is at +0x40, the world one at +0x80 (4 rows of 16
+// bytes, the position last). Both positions are shifted, so whatever the
+// game recomputes from (the text is placed from the world transform worked
+// out from the local one) and the pointer agree; the shift is put back on
+// whenever the game sets a new local position.
+uint32_t g_main_menu_dir = 0;
+constexpr uint32_t kCompLocalXfm = 0x40;
+void ShiftMainMenuItem(uint8_t* base, uint32_t comp) {
+  uint32_t object = Load32(base, comp + 0x30);
+  if (object <= comp || object >= comp + 0x400) return;
+  uint32_t dir = Load32(base, object + 0x1C);
+  if (dir < 0x40000000 || dir >= 0x90000000) return;
+  if (dir != g_main_menu_dir) {
+    if (ObjectName(base, object) != "mb_playnow.btn") return;
+    g_main_menu_dir = dir;
+  }
+  struct Shifted {
+    float local, written_local, world_shift;
+  };
+  static std::unordered_map<uint32_t, Shifted> shifted;
+  uint32_t local_x = comp + kCompLocalXfm + 48, world_x = comp + kCompXfm + 48;
+  float local = LoadF(base, local_x);
+  auto it = shifted.find(comp);
+  bool known = it != shifted.end() && it->second.written_local == local;
+  float original_local = known ? it->second.local : local;
+  float world = LoadF(base, world_x) - (known ? it->second.world_shift : 0);
+  double aspect = rb3pc::CurrentViewAspect();
+  uint32_t cam = Load32(base, kCurrentCam);
+  float sx, sy, depth;
+  Vec3 pos = LoadVec(base, world_x);
+  pos.x = world;
+  float shift = 0;
+  if (aspect > 16.0 / 9.0 + 1e-3 && cam && Project(base, cam, pos, sx, sy, depth)) {
+    // From the 16:9 picture's left edge to the screen's, at the item.
+    float left_16x9 = float(0.5 - 0.5 * (16.0 / 9.0) / aspect);
+    shift = Unproject(base, cam, 0, sy, depth).x - Unproject(base, cam, left_16x9, sy, depth).x;
+  }
+  // Along the parent's x (the menu isn't rotated): its scale, from the
+  // local and world first rows.
+  float local_scale = LoadF(base, comp + kCompLocalXfm), world_scale = LoadF(base, comp + kCompXfm);
+  float local_shift = std::fabs(world_scale) > 1e-6f ? shift * local_scale / world_scale : 0;
+  StoreF(base, local_x, original_local + local_shift);
+  StoreF(base, world_x, world + shift);
+  shifted[comp] = {original_local, original_local + local_shift, shift};
+}
+
+// Game-thread tick, throttled to ~once per frame.
 REX_HOOK_RAW(MM_COMPONENT_POLL) {
   MM_COMPONENT_POLL_ORIG(ctx, base);
   static Clock::time_point last;
@@ -1810,6 +1867,7 @@ REX_HOOK_RAW(MM_SET_FOCUS_COMPONENT) {
 }
 
 REX_HOOK_RAW(MM_BANDBUTTON_DRAW) {
+  ShiftMainMenuItem(base, ctx.r3.u32);
   NoteDrawn(ctx.r3.u32, base);
   MM_BANDBUTTON_DRAW_ORIG(ctx, base);
 }
@@ -1830,6 +1888,7 @@ REX_HOOK_RAW(MM_LABEL_DRAW) {
       object > label && object < label + 0x400 && ObjectName(base, object) == "pad_num.lbl") {
     return;
   }
+  ShiftMainMenuItem(base, label);
   NoteDrawn(label, base);
   MM_LABEL_DRAW_ORIG(ctx, base);
 }
@@ -1871,14 +1930,48 @@ REX_HOOK_RAW(MM_SLIDER_DRAW) {
 uint32_t g_review_drawing = 0;
 int g_review_dim_from = 0, g_review_dim_to = 0;
 
-// While a review preview draws, its picks are DxMeshes (one per pick, at
-// x = -90 + 45 * i in the display's space, each with its own material):
-// those to dim are drawn with their material's colour (RndMat +0x2C, RGB
-// floats, multiplying the texture) darkened, then it's put back.
+// Overshell bottom bar (overshell.milo connect_controller meshes) stretched
+// about screen centre on wide views. Mesh name's const char* is at -0x20.
+constexpr float kBarWidthIn16x9 = 1.13f;  // of the 16:9 picture's width
+bool IsOvershellBar(const uint8_t* base, uint32_t mesh) {
+  static std::unordered_map<uint32_t, bool> known;
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto [it, added] = known.try_emplace(mesh, false);
+  if (added) {
+    uint32_t name = Load32(base, mesh - 0x20);
+    if ((name >= 0x40000000 && name < 0x50000000) || (name >= 0x82000000 && name < 0x83000000)) {
+      std::string_view s(reinterpret_cast<const char*>(base + name), strnlen(reinterpret_cast<const char*>(base + name), 64));
+      it->second = s == "connect_controller.mesh" || s == "connect_controller02.mesh" ||
+                   s == "connect_controller_refract.mesh";
+    }
+  }
+  return it->second;
+}
+void DrawOvershellBarStretched(PPCContext& ctx, uint8_t* base, uint32_t mesh) {
+  float stretch = float(rb3pc::CurrentViewAspect() / (16.0 / 9.0)) / kBarWidthIn16x9 * 1.04f;
+  uint32_t cam = Load32(base, kCurrentCam);
+  float sx, sy, depth;
+  Vec3 origin = LoadVec(base, mesh + kCompXfm + 48);
+  if (stretch <= 1 || !cam || !Project(base, cam, origin, sx, sy, depth)) {
+    return MM_DXMESH_DRAW_ORIG(ctx, base);
+  }
+  float centre = Unproject(base, cam, 0.5f, sy, depth).x;
+  uint32_t xfm = mesh + kCompXfm;
+  uint8_t saved[64];
+  std::memcpy(saved, base + xfm, sizeof(saved));
+  for (uint32_t row = 0; row < 3; ++row) StoreF(base, xfm + row * 16, LoadF(base, xfm + row * 16) * stretch);
+  StoreF(base, xfm + 48, centre + (origin.x - centre) * stretch);
+  MM_DXMESH_DRAW_ORIG(ctx, base);
+  std::memcpy(base + xfm, saved, sizeof(saved));
+}
+
+// Review picks are one DxMesh each; dim them with RndMat colour (+0x2C, RGB floats).
 constexpr uint32_t kMeshMat = 0xF8, kMatColor = 0x2C;
 constexpr float kReviewDimmed = 0.65f;
 REX_HOOK_RAW(MM_DXMESH_DRAW) {
   uint32_t mesh = ctx.r3.u32;
+  if (IsOvershellBar(base, mesh)) return DrawOvershellBarStretched(ctx, base, mesh);
   if (g_list_drawing && !g_slider_drawing) {
     auto scale = [&](uint32_t xfm) {
       Vec3 a = LoadVec(base, xfm);
@@ -1934,6 +2027,7 @@ REX_HOOK_RAW(MM_SCROLLBAR_DRAW) {
   MM_SCROLLBAR_DRAW_ORIG(ctx, base);
 }
 REX_HOOK_RAW(MM_HELP_DRAW) {
+  ShiftMainMenuItem(base, ctx.r3.u32);
   if (ctx.r3.u32) g_help_bars[ctx.r3.u32] = {Load32(base, kCurrentCam), Clock::now(), ++g_draw_count};
   MM_HELP_DRAW_ORIG(ctx, base);
 }
