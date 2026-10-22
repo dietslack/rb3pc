@@ -1795,28 +1795,28 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
 
 }  // namespace
 
-// The main menu's buttons, labels and help (the panel holding
-// mb_playnow.btn: its submenus, and the message below them with its NEXT
-// MESSAGE help, expand_message_area.ihp) sit at the 16:9 picture's left
-// edge; on a wider screen (wide view) they move with the screen's left edge
-// instead.
-// +0x30 of a component is its object (name at +0x18, ObjectDir at +0x1C);
-// its local transform is at +0x40, the world one at +0x80 (4 rows of 16
-// bytes, the position last). Both positions are shifted, so whatever the
-// game recomputes from (the text is placed from the world transform worked
-// out from the local one) and the pointer agree; the shift is put back on
-// whenever the game sets a new local position.
-uint32_t g_main_menu_dir = 0;
-constexpr uint32_t kCompLocalXfm = 0x40;
-void ShiftMainMenuItem(uint8_t* base, uint32_t comp) {
-  uint32_t object = Load32(base, comp + 0x30);
-  if (object <= comp || object >= comp + 0x400) return;
-  uint32_t dir = Load32(base, object + 0x1C);
-  if (dir < 0x40000000 || dir >= 0x90000000) return;
-  if (dir != g_main_menu_dir) {
-    if (ObjectName(base, object) != "mb_playnow.btn") return;
-    g_main_menu_dir = dir;
+// World-x offset from the 16:9 edge to the screen edge on wider views.
+// top_right_only: 0 unless in the 16:9 top-right corner.
+float EdgeShift(const uint8_t* base, Vec3 pos, bool right, bool top_right_only = false) {
+  double aspect = rb3pc::CurrentViewAspect();
+  uint32_t cam = Load32(base, kCurrentCam);
+  float sx, sy, depth;
+  if (aspect <= 16.0 / 9.0 + 1e-3 || !cam || !Project(base, cam, pos, sx, sy, depth)) return 0;
+  float width_16x9 = float((16.0 / 9.0) / aspect);
+  float edge_16x9 = 0.5f + (right ? 0.5f : -0.5f) * width_16x9;
+  // Right-aligned text has its origin on the edge.
+  if (top_right_only &&
+      !(sy < 0.3f && sx > edge_16x9 - 0.4f * width_16x9 && sx < edge_16x9 + 0.02f * width_16x9)) {
+    return 0;
   }
+  return Unproject(base, cam, right ? 1.f : 0.f, sy, depth).x - Unproject(base, cam, edge_16x9, sy, depth).x;
+}
+
+// Component local xfm +0x40, world +0x80. Both are shifted so the game's
+// recompute and the pointer agree; reapplied when the game writes a new
+// local position.
+constexpr uint32_t kCompLocalXfm = 0x40;
+float ShiftWithEdge(uint8_t* base, uint32_t comp, bool right, bool top_right_only = false) {
   struct Shifted {
     float local, written_local, world_shift;
   };
@@ -1827,6 +1827,95 @@ void ShiftMainMenuItem(uint8_t* base, uint32_t comp) {
   bool known = it != shifted.end() && it->second.written_local == local;
   float original_local = known ? it->second.local : local;
   float world = LoadF(base, world_x) - (known ? it->second.world_shift : 0);
+  Vec3 pos = LoadVec(base, world_x);
+  pos.x = world;
+  float shift = EdgeShift(base, pos, right, top_right_only);
+  // Parent x scale from the first rows (menus aren't rotated).
+  float local_scale = LoadF(base, comp + kCompLocalXfm), world_scale = LoadF(base, comp + kCompXfm);
+  float local_shift = std::fabs(world_scale) > 1e-6f ? shift * local_scale / world_scale : 0;
+  StoreF(base, local_x, original_local + local_shift);
+  StoreF(base, world_x, world + shift);
+  shifted[comp] = {original_local, original_local + local_shift, shift};
+  return shift;
+}
+
+// Main menu panel (holds mb_playnow.btn and expand_message_area.ihp) follows
+// the left edge.
+uint32_t g_main_menu_dir = 0;
+bool ShiftMainMenuItem(uint8_t* base, uint32_t comp) {
+  uint32_t object = Load32(base, comp + 0x30);
+  if (object <= comp || object >= comp + 0x400) return false;
+  uint32_t dir = Load32(base, object + 0x1C);
+  if (dir < 0x40000000 || dir >= 0x90000000) return false;
+  if (dir != g_main_menu_dir) {
+    if (ObjectName(base, object) != "mb_playnow.btn") return false;
+    g_main_menu_dir = dir;
+  }
+  ShiftWithEdge(base, comp, false);
+  return true;
+}
+
+// A label's RndText (+0x144) and glyph meshes only recompute world xfms on
+// relayout, not when the label moves, so redo it while drawing a shifted
+// label. RndTransformable (component/mesh + 0x24): parent +0x10, local xfm
+// +0x1C, world +0x5C.
+void UpdateWorldPos(uint8_t* base, uint32_t trans) {
+  uint32_t parent = Load32(base, trans + 0x10);
+  if (parent < 0x40000000 || parent >= 0x90000000) return;
+  Vec3 local = LoadVec(base, trans + 0x1C + 48);
+  uint32_t m = parent + 0x5C;
+  for (int j = 0; j < 3; ++j) {
+    float v = local.x * LoadF(base, m + 4 * j) + local.y * LoadF(base, m + 16 + 4 * j) +
+              local.z * LoadF(base, m + 32 + 4 * j) + LoadF(base, m + 48 + 4 * j);
+    StoreF(base, trans + 0x5C + 48 + 4 * j, v);
+  }
+}
+uint32_t g_label_text_following = 0;
+void FollowLabelText(uint8_t* base, uint32_t label, bool own) {
+  uint32_t text = Load32(base, label + 0x144);
+  if (text < 0x40000000 || text >= 0x50000000) return;
+  if (own) UpdateWorldPos(base, label + 0x24);
+  UpdateWorldPos(base, text + 0x24);
+  g_label_text_following = text + 0x24;
+}
+
+// DX's now-playing lines under the band info (line0-3.lbl, no transform
+// parent) follow the right edge. Their text keeps its own world xfm, so it's
+// drawn offset by g_label_text_shift.
+float g_label_text_shift = 0;
+bool ShiftNowPlayingLine(uint8_t* base, uint32_t label, uint32_t object) {
+  if constexpr (!rb3pc::exe::kDeluxe) return false;
+  static std::unordered_map<uint32_t, bool> is_line;
+  auto [it, added] = is_line.try_emplace(object, false);
+  if (added) {
+    std::string name = ObjectName(base, object);
+    it->second = name.size() == 9 && name.starts_with("line") && name[4] >= '0' && name[4] <= '3' &&
+                 name.ends_with(".lbl");
+  }
+  if (!it->second || Load32(base, label + 0x34) != 0) return false;
+  g_label_text_shift = ShiftWithEdge(base, label, true, true);
+  return true;
+}
+
+// Band info (panel holding gamertag.lbl) follows the right edge: shift the
+// panel's transform (labels recompute from it each frame); its meshes, its
+// sliders' meshes and the parentless fan meter (meter_display) are drawn
+// offset instead.
+uint32_t g_band_info_trans = 0, g_band_info_dir = 0;
+float g_band_info_shift = 0;
+bool g_band_info_slider_drawing = false;
+int g_label_drawing = 0;
+void ShiftBandInfo(uint8_t* base, uint32_t trans) {
+  struct Shifted {
+    float local, written_local, world_shift;
+  };
+  static Shifted shifted{};
+  static uint32_t shifted_trans = 0;
+  uint32_t local_x = trans + 0x1C + 48, world_x = trans + 0x5C + 48;
+  float local = LoadF(base, local_x);
+  bool known = shifted_trans == trans && shifted.written_local == local;
+  float original_local = known ? shifted.local : local;
+  float world = LoadF(base, world_x) - (known ? shifted.world_shift : 0);
   double aspect = rb3pc::CurrentViewAspect();
   uint32_t cam = Load32(base, kCurrentCam);
   float sx, sy, depth;
@@ -1834,17 +1923,188 @@ void ShiftMainMenuItem(uint8_t* base, uint32_t comp) {
   pos.x = world;
   float shift = 0;
   if (aspect > 16.0 / 9.0 + 1e-3 && cam && Project(base, cam, pos, sx, sy, depth)) {
-    // From the 16:9 picture's left edge to the screen's, at the item.
-    float left_16x9 = float(0.5 - 0.5 * (16.0 / 9.0) / aspect);
-    shift = Unproject(base, cam, 0, sy, depth).x - Unproject(base, cam, left_16x9, sy, depth).x;
+    float right_16x9 = float(0.5 + 0.5 * (16.0 / 9.0) / aspect);
+    shift = Unproject(base, cam, 1, sy, depth).x - Unproject(base, cam, right_16x9, sy, depth).x;
   }
-  // Along the parent's x (the menu isn't rotated): its scale, from the
-  // local and world first rows.
-  float local_scale = LoadF(base, comp + kCompLocalXfm), world_scale = LoadF(base, comp + kCompXfm);
+  float local_scale = LoadF(base, trans + 0x1C), world_scale = LoadF(base, trans + 0x5C);
   float local_shift = std::fabs(world_scale) > 1e-6f ? shift * local_scale / world_scale : 0;
   StoreF(base, local_x, original_local + local_shift);
   StoreF(base, world_x, world + shift);
-  shifted[comp] = {original_local, original_local + local_shift, shift};
+  shifted = {original_local, original_local + local_shift, shift};
+  shifted_trans = trans;
+  g_band_info_shift = shift;
+}
+bool InBandInfo(const uint8_t* base, uint32_t drawable) {
+  if (g_band_info_slider_drawing) return true;
+  if (g_label_drawing) return false;
+  if (!g_band_info_trans) return false;
+  uint32_t trans = Load32(base, drawable + 0x34), root = 0;
+  for (int depth = 0; depth < 12 && trans >= 0x40000000 && trans < 0x90000000; ++depth) {
+    if (trans == g_band_info_trans) return true;
+    root = trans;
+    trans = Load32(base, trans + 0x10);
+  }
+  if (!root) return false;
+  // Fan meter: root RndTransformable is 0x24 into its object.
+  static std::unordered_map<uint32_t, bool> is_meter;
+  auto [it, added] = is_meter.try_emplace(root, false);
+  if (added) {
+    uint32_t comp = root - 0x24, object = Load32(base, comp + 0x30);
+    it->second = object > comp && object < comp + 0x400 && ObjectName(base, object) == "meter_display";
+  }
+  if (!it->second) return false;
+  uint32_t cam = Load32(base, kCurrentCam);
+  float sx, sy, depth;
+  if (!cam || !Project(base, cam, LoadVec(base, drawable + kCompXfm + 48), sx, sy, depth)) return false;
+  double aspect = rb3pc::CurrentViewAspect();
+  float right_16x9 = float(0.5 + 0.5 * (16.0 / 9.0) / aspect);
+  float width_16x9 = float((16.0 / 9.0) / aspect);
+  return sy < 0.25f && sx > right_16x9 - 0.4f * width_16x9 && sx < right_16x9;
+}
+void NoteBandInfoLabel(uint8_t* base, uint32_t label, uint32_t object) {
+  static std::unordered_map<uint32_t, bool> is_gamertag;
+  auto [it, added] = is_gamertag.try_emplace(object, false);
+  if (added) it->second = ObjectName(base, object) == "gamertag.lbl";
+  uint32_t trans = Load32(base, label + 0x34);
+  if (it->second && trans >= 0x40000000 && trans < 0x90000000) {
+    g_band_info_trans = trans;
+    g_band_info_dir = Load32(base, object + 0x1C);
+    ShiftBandInfo(base, trans);
+  }
+}
+bool IsBandInfoComponent(const uint8_t* base, uint32_t comp) {
+  uint32_t object = Load32(base, comp + 0x30);
+  return g_band_info_dir && object > comp && object < comp + 0x400 &&
+         Load32(base, object + 0x1C) == g_band_info_dir;
+}
+
+// Song list spread on wide views: the left half of the 16:9 picture follows
+// the left edge, the right half the right edge, and meshes spanning the
+// middle stretch (text column and art column edges mapped to their new
+// spots). Screen-wide backgrounds are left alone.
+//
+// Parent +0x34, local xfm +0x40, world +0x80. Lists set rows' world xfms;
+// others derive from the parent at draw time, so both are patched for the
+// draw and restored.
+Clock::time_point g_song_list_time;
+uint32_t g_song_list_cam = 0;
+constexpr float kSpreadSplit = 0.53f;      // in the 16:9 picture: the counts are right of it, titles left
+constexpr float kSpreadArtColumn = 0.70f;   // the art column's left edge, in the 16:9 picture
+constexpr float kSpreadTextColumn = 0.07f;  // where the list's text starts
+// Unspread positions computed at draw time, for the next frame (the stored
+// world position is stale or unset before the draw).
+std::unordered_map<uint32_t, Vec3> g_spread_drawn_at;
+void NoteSongListDrawn(const uint8_t* base, uint32_t list) {
+  if (!IsSongList(base, list)) return;
+  auto now = Clock::now();
+  if (now - g_song_list_time > std::chrono::seconds(1)) g_spread_drawn_at.clear();
+  g_song_list_time = now;
+  g_song_list_cam = Load32(base, kCurrentCam);
+}
+struct SpreadSaved {
+  uint32_t object = 0, parent = 0;
+  float k = 1, c = 0, written_x = 0;
+  uint8_t local[64], world[64], parent_world[64];
+};
+
+// Undo with EndSpread. Only meshes stretch.
+bool BeginSpread(uint8_t* base, uint32_t object, bool mesh, SpreadSaved& saved) {
+  double aspect = rb3pc::CurrentViewAspect();
+  if (aspect <= 16.0 / 9.0 + 1e-3 || !g_song_list_cam) return false;
+  uint32_t cam = Load32(base, kCurrentCam);
+  if (cam != g_song_list_cam || Clock::now() - g_song_list_time > std::chrono::milliseconds(200)) return false;
+  float width_16x9 = float((16.0 / 9.0) / aspect), edge = 0.5f - 0.5f * width_16x9;
+  float split = edge + kSpreadSplit * width_16x9, art = edge + kSpreadArtColumn * width_16x9;
+  float text_column = edge + kSpreadTextColumn * width_16x9;
+  uint32_t local = object + 0x40, world = object + kCompXfm, parent = Load32(base, object + 0x34);
+  bool has_parent = parent >= 0x40000000 && parent < 0x90000000;
+  Vec3 row[4];
+  for (int i = 0; i < 4; ++i) row[i] = LoadVec(base, world + 16 * i);
+  auto to_world = [&](Vec3 v) {
+    return Vec3{v.x * row[0].x + v.y * row[1].x + v.z * row[2].x + row[3].x,
+                v.x * row[0].y + v.y * row[1].y + v.z * row[2].y + row[3].y,
+                v.x * row[0].z + v.y * row[1].z + v.z * row[2].z + row[3].z};
+  };
+  // An unset world position (at the origin, or a mesh with only x set) is
+  // rebuilt from the local chain up to the nearest parent that has one.
+  Vec3 at_pos = row[3];
+  uint32_t placed_by = 0;
+  if (has_parent) {
+    Vec3 pos = LoadVec(base, local + 48);
+    uint32_t trans = parent;
+    for (int depth = 0; depth < 8 && trans >= 0x40000000 && trans < 0x90000000; ++depth) {
+      Vec3 x = LoadVec(base, trans + 0x5C);
+      if (x.x * x.x + x.y * x.y + x.z * x.z > 1e-6f) break;
+      pos = Transform(base, trans + 0x1C, pos);
+      trans = Load32(base, trans + 0x10);
+    }
+    if (trans >= 0x40000000 && trans < 0x90000000) {
+      Vec3 fresh = Transform(base, trans + 0x5C, pos);
+      float wx, wy, fx, fy, d;
+      bool at_origin = Project(base, cam, at_pos, wx, wy, d) && Project(base, cam, fresh, fx, fy, d) &&
+                       std::fabs(wx - 0.5f) + std::fabs(wy - 0.5f) < 0.01f &&
+                       std::fabs(fx - wx) + std::fabs(fy - wy) > 0.05f;
+      if (at_origin || (mesh && at_pos.y == 0 && at_pos.z == 0)) {
+        at_pos = fresh;
+        placed_by = trans + 0x5C;
+      }
+    }
+  }
+  if (auto drawn = g_spread_drawn_at.find(object); drawn != g_spread_drawn_at.end()) at_pos = drawn->second;
+  Vec3 center = mesh ? to_world(LoadVec(base, object + kMeshSphere)) : row[3];
+  center = {center.x - row[3].x + at_pos.x, center.y - row[3].y + at_pos.y, center.z - row[3].z + at_pos.z};
+  float radius = mesh ? LoadF(base, object + kMeshRadius) *
+                            std::sqrt(row[0].x * row[0].x + row[0].y * row[0].y + row[0].z * row[0].z)
+                      : 0;
+  float sx, sy, depth, left, right, unused;
+  if (!Project(base, cam, center, sx, sy, depth)) return false;
+  auto at = [&](float screen_x) { return Unproject(base, cam, screen_x, sy, depth).x; };
+  float k = 1, c;  // world x -> k x + c
+  if (radius > 0 && Project(base, cam, {center.x - radius, center.y, center.z}, left, unused, unused) &&
+      Project(base, cam, {center.x + radius, center.y, center.z}, right, unused, unused) && left < split &&
+      right > split) {
+    if (right - left > 1.2f) return false;
+    float u1 = at(text_column), u2 = at(art);
+    k = (at(art + edge) - at(text_column - edge)) / (u2 - u1);
+    c = at(text_column - edge) - k * u1;
+  } else {
+    // By origin: a mesh's bounds can be well off it.
+    if (!Project(base, cam, at_pos, sx, sy, depth)) return false;
+    c = at(sx < split ? sx - edge : sx + edge) - at(sx);
+  }
+  saved.object = object;
+  std::memcpy(saved.local, base + local, 64);
+  std::memcpy(saved.world, base + world, 64);
+  for (int i = 0; i < 3; ++i) {
+    StoreVec(base, world + 16 * i, {row[i].x * k, row[i].y, row[i].z});
+    StoreF(base, local + 16 * i, LoadF(base, local + 16 * i) * k);  // the parents aren't rotated
+  }
+  StoreVec(base, world + 48, {row[3].x * k + c, row[3].y, row[3].z});
+  saved.k = k, saved.c = c, saved.written_x = row[3].x * k + c;
+  if (placed_by && mesh) {
+    // Drawn from that parent's transform: move it instead.
+    saved.parent = placed_by;
+    std::memcpy(saved.parent_world, base + saved.parent, 64);
+    Vec3 p = LoadVec(base, saved.parent + 48);
+    StoreF(base, saved.parent + 48, p.x * k + c);
+  }
+  if (has_parent) {
+    Vec3 fresh = Transform(base, parent + 0x5C, LoadVec(base, local + 48));
+    Vec3 a = ToLocal(base, parent - 0x24, fresh), b = ToLocal(base, parent - 0x24, {fresh.x * k + c, fresh.y, fresh.z});
+    Vec3 l = LoadVec(base, local + 48);
+    StoreVec(base, local + 48, {l.x + b.x - a.x, l.y + b.y - a.y, l.z + b.z - a.z});
+  }
+  return true;
+}
+void EndSpread(uint8_t* base, const SpreadSaved& saved) {
+  if (!saved.object) return;
+  Vec3 drawn = LoadVec(base, saved.object + kCompXfm + 48);
+  if (saved.k == 1 && drawn.x != saved.written_x) {
+    g_spread_drawn_at[saved.object] = {drawn.x - saved.c, drawn.y, drawn.z};
+  }
+  std::memcpy(base + saved.object + 0x40, saved.local, 64);
+  std::memcpy(base + saved.object + kCompXfm, saved.world, 64);
+  if (saved.parent) std::memcpy(base + saved.parent, saved.parent_world, 64);
 }
 
 // Game-thread tick, throttled to ~once per frame.
@@ -1881,19 +2141,45 @@ REX_HOOK_RAW(MM_BANDLIST_DRAW) {
 }
 REX_HOOK_RAW(MM_LABEL_DRAW) {
   uint32_t label = ctx.r3.u32;
-  // The overshell's controller ring (pad_num.lbl: the Xbox ring-of-light
-  // quadrant of the player's controller, a buttons-font glyph): there's no
-  // ring of light here, so it isn't drawn.
-  if (uint32_t object = Load32(base, label + 0x30);
-      object > label && object < label + 0x400 && ObjectName(base, object) == "pad_num.lbl") {
-    return;
+  // Hide the overshell's ring-of-light quadrant (pad_num.lbl).
+  uint32_t object = Load32(base, label + 0x30);
+  bool has_object = object > label && object < label + 0x400;
+  if (has_object && ObjectName(base, object) == "pad_num.lbl") return;
+  if (has_object) NoteBandInfoLabel(base, label, object);
+  if (!has_object || !ShiftNowPlayingLine(base, label, object)) {
+    if (ShiftMainMenuItem(base, label)) {
+      FollowLabelText(base, label, false);
+    } else if (IsBandInfoComponent(base, label)) {
+      FollowLabelText(base, label, true);
+    }
   }
-  ShiftMainMenuItem(base, label);
   NoteDrawn(label, base);
-  MM_LABEL_DRAW_ORIG(ctx, base);
+  ++g_label_drawing;
+  uint32_t text = Load32(base, label + 0x144), text_x = text + kCompXfm + 48;
+  if (SpreadSaved saved; BeginSpread(base, label, false, saved)) {
+    bool has_text = text >= 0x40000000 && text < 0x50000000;
+    float tx = has_text ? LoadF(base, text_x) : 0;
+    if (has_text) UpdateWorldPos(base, text + 0x24);
+    MM_LABEL_DRAW_ORIG(ctx, base);
+    if (has_text) StoreF(base, text_x, tx);
+    EndSpread(base, saved);
+  } else if (g_label_text_shift != 0 && text >= 0x40000000 && text < 0x50000000) {
+    float x = LoadF(base, text_x);
+    StoreF(base, text_x, x + g_label_text_shift);
+    g_label_text_shift = 0;
+    g_label_text_following = text + 0x24;  // a line with a button in it draws its glyphs' meshes
+    MM_LABEL_DRAW_ORIG(ctx, base);
+    StoreF(base, text_x, x);
+  } else {
+    g_label_text_shift = 0;
+    MM_LABEL_DRAW_ORIG(ctx, base);
+  }
+  g_label_text_following = 0;
+  --g_label_drawing;
 }
 REX_HOOK_RAW(MM_UILIST_DRAW) {
   uint32_t list = ctx.r3.u32, outer = g_list_drawing;
+  NoteSongListDrawn(base, list);
   NoteDrawn(list, base);
   g_list_drawing = list;
   MM_UILIST_DRAW_ORIG(ctx, base);
@@ -1905,7 +2191,9 @@ REX_HOOK_RAW(MM_SLIDER_DRAW) {
   NoteDrawn(slider, base);
   g_slider_meshes.clear();
   g_slider_drawing = slider;
+  g_band_info_slider_drawing = IsBandInfoComponent(base, slider);
   MM_SLIDER_DRAW_ORIG(ctx, base);
+  g_band_info_slider_drawing = false;
   g_slider_drawing = 0;
   const SliderMesh* knob = nullptr;
   for (const auto& m : g_slider_meshes) {
@@ -1969,9 +2257,31 @@ void DrawOvershellBarStretched(PPCContext& ctx, uint8_t* base, uint32_t mesh) {
 // Review picks are one DxMesh each; dim them with RndMat colour (+0x2C, RGB floats).
 constexpr uint32_t kMeshMat = 0xF8, kMatColor = 0x2C;
 constexpr float kReviewDimmed = 0.65f;
+
+void DrawMesh(PPCContext& ctx, uint8_t* base);
 REX_HOOK_RAW(MM_DXMESH_DRAW) {
   uint32_t mesh = ctx.r3.u32;
+  SpreadSaved saved;
+  if (g_label_drawing || IsOvershellBar(base, mesh) || !BeginSpread(base, mesh, true, saved)) {
+    return DrawMesh(ctx, base);
+  }
+  DrawMesh(ctx, base);
+  EndSpread(base, saved);
+}
+void DrawMesh(PPCContext& ctx, uint8_t* base) {
+  uint32_t mesh = ctx.r3.u32;
   if (IsOvershellBar(base, mesh)) return DrawOvershellBarStretched(ctx, base, mesh);
+  if (g_label_text_following && Load32(base, mesh + 0x34) == g_label_text_following) {
+    UpdateWorldPos(base, mesh + 0x24);
+  }
+  if (g_band_info_shift != 0 && InBandInfo(base, mesh)) {
+    uint32_t pos_x = mesh + kCompXfm + 48;
+    float x = LoadF(base, pos_x);
+    StoreF(base, pos_x, x + g_band_info_shift);
+    MM_DXMESH_DRAW_ORIG(ctx, base);
+    StoreF(base, pos_x, x);
+    return;
+  }
   if (g_list_drawing && !g_slider_drawing) {
     auto scale = [&](uint32_t xfm) {
       Vec3 a = LoadVec(base, xfm);
