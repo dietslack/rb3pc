@@ -29,6 +29,7 @@ set(RB3PC_SOURCES
     src/xekeys.cpp
     src/shm_cleanup.cpp
     src/input_bindings.cpp
+    src/midi_input.cpp
     src/bindings_dialog.cpp
     src/boot_speed.cpp
     src/frame_stats.cpp
@@ -69,6 +70,15 @@ rexglue_setup_target(rb3pc)
 # zlib: inflating .milo archives for the loading screen's game assets.
 find_package(ZLIB REQUIRED)
 target_link_libraries(rb3pc PRIVATE ZLIB::ZLIB)
+
+# MIDI instruments (src/midi_input.cpp): the ALSA sequencer, or WinMM.
+if(WIN32)
+    set(RB3PC_MIDI_LIBS winmm)
+else()
+    find_package(ALSA REQUIRED)
+    set(RB3PC_MIDI_LIBS ALSA::ALSA)
+endif()
+target_link_libraries(rb3pc PRIVATE ${RB3PC_MIDI_LIBS})
 
 # Ship the SDK's shared libraries (runtime, Xenos GPU plugin, Tracy) next to
 # the executable. The GPU plugin is only searched for there.
@@ -169,7 +179,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/game/rb3dx/default.xex")
     add_dependencies(rb3pc-dx rb3pc_dx_codegen)
     target_include_directories(rb3pc-dx PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src ${RB3PC_DX_GENERATED_DIR})
-    target_link_libraries(rb3pc-dx PRIVATE rex::runtime ZLIB::ZLIB)
+    target_link_libraries(rb3pc-dx PRIVATE rex::runtime ZLIB::ZLIB ${RB3PC_MIDI_LIBS})
     rexglue_configure_target(rb3pc-dx)
     set_target_properties(rb3pc-dx PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 endif()

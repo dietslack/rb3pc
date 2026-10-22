@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <SDL3/SDL.h>
@@ -20,6 +21,7 @@
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
 
+#include "midi_input.h"
 #include "mouse_cursor.h"
 
 
@@ -61,6 +63,10 @@ using rex::input::X_INPUT_STATE;
 // XInput subtypes RB3's controller classifier (0x8251EB20) recognizes.
 constexpr uint8_t kSubTypeGuitar = 0x06;    // -> strat_xbox (flags 0)
 constexpr uint8_t kSubTypeDrumKit = 0x08;   // -> hx_drums_xbox_rb2 (flags bit 0)
+
+// MIDI device id = base + index in MidiInput::Devices().
+constexpr uint64_t kMidiDeviceIdBase = 0x4D49444900000000ull;  // "MIDI"
+bool IsMidiDevice(DeviceId id) { return (uint64_t(id) & ~0xFFFFull) == kMidiDeviceIdBase; }
 
 std::string ControllerTypeSetting(size_t index) {
   switch (index) {
@@ -198,10 +204,33 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
         out.erase(out.begin() + std::ptrdiff_t(first + i));
       }
     }
+    auto midi = MidiInput::Get().Devices();
+    midi_keys_.resize(midi.size());
+    for (size_t i = 0; i < midi.size(); ++i) {
+      midi_keys_[i] = midi[i].key;
+      if (!midi[i].connected || MidiInput::Get().Profile(midi[i].key).type == MidiType::kNone) continue;
+      DeviceInfo info;
+      info.id = DeviceId(kMidiDeviceIdBase + i);
+      info.name = "MIDI: " + midi[i].name;
+      info.guid = "midi:" + midi[i].key;
+      out.push_back(std::move(info));
+    }
   }
 
   X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags,
                                  X_INPUT_CAPABILITIES* out_caps) override {
+    if (IsMidiDevice(id)) {
+      *out_caps = {};
+      out_caps->type = 0x01;  // XINPUT_DEVTYPE_GAMEPAD
+      out_caps->sub_type = kSubTypeDrumKit;
+      out_caps->flags = 1;
+      out_caps->gamepad.buttons = 0xF3FF;
+      out_caps->gamepad.thumb_lx = static_cast<int16_t>(0xFFFFu);
+      out_caps->gamepad.thumb_ly = static_cast<int16_t>(0xFFFFu);
+      out_caps->gamepad.thumb_rx = static_cast<int16_t>(0xFFFFu);
+      out_caps->gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
+      return X_ERROR_SUCCESS;
+    }
     X_RESULT result = sdl_->GetDeviceCapabilities(id, flags, out_caps);
     if (result != X_ERROR_SUCCESS) {
       return result;
@@ -222,6 +251,7 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
   }
 
   X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override {
+    if (IsMidiDevice(id)) return GetMidiState(id, out_state);
     X_RESULT result = sdl_->GetDeviceState(id, out_state);
     if (result != X_ERROR_SUCCESS) {
       return result;
@@ -287,15 +317,47 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
   }
 
   X_RESULT SetDeviceVibration(DeviceId id, rex::input::X_INPUT_VIBRATION* vibration) override {
+    if (IsMidiDevice(id)) return X_ERROR_SUCCESS;
     return sdl_->SetDeviceVibration(id, vibration);
   }
 
   X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
                               rex::input::X_INPUT_KEYSTROKE* out_keystroke) override {
+    if (IsMidiDevice(id)) return X_ERROR_EMPTY;
     return sdl_->GetDeviceKeystroke(id, flags, out_keystroke);
   }
 
  private:
+  X_RESULT GetMidiState(DeviceId id, X_INPUT_STATE* out_state) {
+    size_t index = size_t(uint64_t(id) - kMidiDeviceIdBase);
+    std::string key;
+    {
+      std::lock_guard lock(mutex_);
+      if (index >= midi_keys_.size()) return X_ERROR_DEVICE_NOT_CONNECTED;
+      key = midi_keys_[index];
+    }
+    bool changed = false;
+    PadState pad = MidiInput::Get().PollDrums(key, changed);
+    *out_state = {};
+    {
+      std::lock_guard lock(mutex_);
+      if (changed) ++midi_packets_[index];
+      out_state->packet_number = midi_packets_[index];
+    }
+    auto& out = out_state->gamepad;
+    out.buttons = pad.buttons;
+    out.thumb_lx = pad.thumb_lx;
+    out.thumb_ly = pad.thumb_ly;
+    out.thumb_rx = pad.thumb_rx;
+    out.thumb_ry = pad.thumb_ry;
+    if (changed && pad.buttons) NoteControllerPress();
+    if (REXCVAR_GET(instrument_input_log) && changed) {
+      REXLOG_INFO("Instruments: MIDI {} buttons={:04X} lx={} ly={} rx={} ry={}", key, pad.buttons,
+                  pad.thumb_lx, pad.thumb_ly, pad.thumb_rx, pad.thumb_ry);
+    }
+    return X_ERROR_SUCCESS;
+  }
+
   struct Device {
     DeviceId id;
     size_t index;
@@ -371,6 +433,8 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
   std::unique_ptr<rex::input::sdl::SDLInputDriver> sdl_;
   std::mutex mutex_;
   std::vector<Device> devices_;
+  std::vector<std::string> midi_keys_;  // by MIDI device index
+  std::unordered_map<size_t, uint32_t> midi_packets_;
 };
 
 }  // namespace
@@ -438,6 +502,7 @@ std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
       auto sdl_driver = std::make_unique<rex::input::sdl::SDLInputDriver>(nullptr, 0);
       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
         input->AddDriver(std::make_unique<InstrumentInputDriver>(std::move(sdl_driver)));
+        MidiInput::Get().Start();
       }
     }
     auto mnk_driver = std::make_unique<rex::input::mnk::MnkInputDriver>(nullptr, 0);

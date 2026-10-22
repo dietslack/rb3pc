@@ -4,7 +4,7 @@ A PC port of Rock Band 3.
 
 The Xbox 360 version of the game is converted ahead of time into a regular
 PC program, then fixed up and extended so it plays well on a computer: any
-window size, mouse support, and custom songs.
+window size, mouse support, MIDI drum kits, and custom songs.
 It can also run the popular [Rock Band 3 Deluxe](https://github.com/hmxmilohax/rock-band-3-deluxe)
 mod.
 
@@ -17,9 +17,9 @@ contains no game files, and the build only works with files you provide.
 
 ## Known issues
 
-The mouse only controls player 1. Typing on a keyboard doesn't work in text
-boxes yet. Windows builds haven't been tried yet. Not every Rock Band 3 Deluxe
-feature has been checked.
+Keys and pro guitar aren't supported yet. The mouse only controls player 1.
+Typing on a keyboard doesn't work in text boxes yet. Windows builds haven't
+been tried yet. Not every Rock Band 3 Deluxe feature has been checked.
 
 ## Credits
 
@@ -33,3 +33,4 @@ feature has been checked.
 | [onyx](https://github.com/mtolly/onyx) (moggcrypt) | The decryption keys for the game's song audio files |
 | [Se7enSins forum post](https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/) | How the Xbox 360's on-screen keyboard function is called |
 | [Dear ImGui](https://github.com/ocornut/imgui) | The settings screen and settings windows (through ReXGlue) |
+| [ALSA](https://www.alsa-project.org) | MIDI input on Linux |

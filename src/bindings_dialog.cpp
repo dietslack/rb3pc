@@ -1,5 +1,6 @@
 #include "bindings_dialog.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iterator>
 #include <optional>
@@ -11,6 +12,7 @@
 
 #include "input_bindings.h"
 #include "instrument_input.h"
+#include "midi_input.h"
 
 namespace rb3pc {
 
@@ -33,26 +35,41 @@ class BindingsDialog final : public rex::ui::ImGuiDialog {
     }
 
     auto controllers = ConnectedControllers();
-    if (controllers.empty()) {
-      ImGui::TextUnformatted("No controllers connected.");
+    std::vector<MidiDevice> midi;
+    for (auto& device : MidiInput::Get().Devices()) {
+      if (device.connected) midi.push_back(device);
+    }
+    if (controllers.empty() && midi.empty()) {
+      ImGui::TextUnformatted("No controllers or MIDI instruments connected.");
       ImGui::End();
       return;
     }
-    if (selected_ >= controllers.size()) selected_ = 0;
+    if (selected_ >= controllers.size() + midi.size()) selected_ = 0;
 
-    // Controller picker.
-    auto label = [](const ControllerInfo& c) {
+    // Controller picker: controllers, then MIDI instruments.
+    auto label = [&](size_t i) {
+      if (i >= controllers.size()) {
+        const MidiDevice& m = midi[i - controllers.size()];
+        return "MIDI: " + m.name + " (" + MidiTypeLabel(MidiInput::Get().Profile(m.key).type) + ")";
+      }
+      const ControllerInfo& c = controllers[i];
       return std::to_string(c.index + 1) + ": " + c.name + " (" + InstrumentName(c.instrument) +
              ")";
     };
-    if (ImGui::BeginCombo("Controller", label(controllers[selected_]).c_str())) {
-      for (size_t i = 0; i < controllers.size(); ++i) {
-        if (ImGui::Selectable(label(controllers[i]).c_str(), i == selected_)) {
+    if (ImGui::BeginCombo("Controller", label(selected_).c_str())) {
+      for (size_t i = 0; i < controllers.size() + midi.size(); ++i) {
+        if (ImGui::Selectable(label(i).c_str(), i == selected_)) {
           selected_ = i;
           capture_.reset();
+          midi_capture_.reset();
         }
       }
       ImGui::EndCombo();
+    }
+    if (selected_ >= controllers.size()) {
+      DrawMidi(midi[selected_ - controllers.size()]);
+      ImGui::End();
+      return;
     }
     const ControllerInfo& controller = controllers[selected_];
 
@@ -102,6 +119,99 @@ class BindingsDialog final : public rex::ui::ImGuiDialog {
   }
 
  private:
+  // A MIDI instrument: its type, and which notes hit each input.
+  void DrawMidi(const MidiDevice& device) {
+    MidiProfile profile = MidiInput::Get().Profile(device.key);
+    int type = profile.type == MidiType::kNone ? 1 : 0;
+    const char* types[] = {MidiTypeLabel(MidiType::kProDrums), MidiTypeLabel(MidiType::kNone)};
+    if (ImGui::Combo("Instrument type", &type, types, 2)) {
+      profile.type = type == 1 ? MidiType::kNone : MidiType::kProDrums;
+      MidiInput::Get().SaveProfile(profile);
+    }
+    ImGui::TextDisabled(profile.type == MidiType::kNone
+                            ? "Hidden from the game."
+                            : "RB3 sees: a Rock Band 3 pro drum kit, in the next free player slot.");
+    ImGui::Separator();
+
+    auto last = MidiInput::Get().LastHit(device.key);
+    // Pending "hit to bind".
+    if (midi_capture_ && midi_capture_key_ == device.key) {
+      if (last && last->serial != midi_capture_serial_) {
+        auto& notes = profile.notes[size_t(*midi_capture_)];
+        if (!midi_capture_add_) notes.clear();
+        if (std::find(notes.begin(), notes.end(), last->note) == notes.end()) notes.push_back(last->note);
+        MidiInput::Get().SaveProfile(profile);
+        midi_capture_.reset();
+      } else if (std::chrono::steady_clock::now() - capture_start_ > kCaptureTimeout) {
+        midi_capture_.reset();
+      }
+    }
+
+    if (last) {
+      ImGui::Text("Last hit: note %s, velocity %d, channel %d",
+                  DescribeNotes({last->note}).c_str(), last->velocity, last->channel + 1);
+    } else {
+      ImGui::TextDisabled("Hit a pad to see what it sends.");
+    }
+    ImGui::TextDisabled("Bind: hit the pad to use (replaces). Add: another note for the same input.");
+    auto hit = MidiInput::Get().RecentlyHit(device.key);
+    if (ImGui::BeginTable("midi", 4,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                              ImGuiTableFlags_SizingStretchProp)) {
+      ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+      ImGui::TableSetupColumn("Notes", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+      ImGui::TableSetupColumn("Live", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+      ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+      ImGui::TableHeadersRow();
+      for (size_t i = 0; i < kDrumInputCount; ++i) {
+        auto input = DrumInput(i);
+        ImGui::PushID(int(i));
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(DrumInputLabel(input));
+        ImGui::TableNextColumn();
+        bool capturing = midi_capture_ && midi_capture_key_ == device.key && *midi_capture_ == input;
+        if (capturing) {
+          ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Hit a pad...");
+        } else {
+          ImGui::TextWrapped("%s", DescribeNotes(profile.notes[i]).c_str());
+        }
+        ImGui::TableNextColumn();
+        if (hit[i]) {
+          ImGui::TextColored(ImVec4(0.3f, 1, 0.4f, 1), "hit");
+        } else {
+          ImGui::TextDisabled("-");
+        }
+        ImGui::TableNextColumn();
+        if (capturing) {
+          if (ImGui::SmallButton("Cancel")) midi_capture_.reset();
+        } else {
+          auto start = [&](bool add) {
+            midi_capture_ = input;
+            midi_capture_add_ = add;
+            midi_capture_key_ = device.key;
+            midi_capture_serial_ = last ? last->serial : 0;
+            capture_start_ = std::chrono::steady_clock::now();
+          };
+          if (ImGui::SmallButton("Bind")) start(false);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Add")) start(true);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Clear")) {
+            profile.notes[i].clear();
+            MidiInput::Get().SaveProfile(profile);
+          }
+        }
+        ImGui::PopID();
+      }
+      ImGui::EndTable();
+    }
+    if (ImGui::Button("Reset to General MIDI defaults")) {
+      MidiInput::Get().ResetProfile(device.key);
+      midi_capture_.reset();
+    }
+  }
+
   void DrawProfile(Profile profile, const ControllerInfo& controller, SDL_Joystick* joystick) {
     if (capture_ && capture_guid_ == controller.guid) {
       if (auto source = capture_->Poll(joystick)) {
@@ -208,6 +318,10 @@ class BindingsDialog final : public rex::ui::ImGuiDialog {
   }
 
   size_t selected_ = 0;
+  std::optional<DrumInput> midi_capture_;
+  bool midi_capture_add_ = false;
+  std::string midi_capture_key_;
+  uint64_t midi_capture_serial_ = 0;
   std::optional<Capture> capture_;
   std::string capture_guid_;
   Output capture_output_ = Output::kA;

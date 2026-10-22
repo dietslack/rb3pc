@@ -23,6 +23,7 @@
 #include "frame_stats.h"
 #include "shader_warmup.h"
 #include "instrument_input.h"
+#include "midi_input.h"
 #include "deluxe.h"
 #include "exe.h"
 #include "launcher.h"
@@ -155,6 +156,7 @@ class Rb3pcApp : public rex::ReXApp {
   void OnWindowPixelSizeChanged(uint32_t, uint32_t) override { FollowResolution(); }
   void OnShutdown() override {
     screenshots_.Stop();
+    rb3pc::MidiInput::Get().Stop();
     bindings_dialog_.reset();
     display_dialog_.reset();
     fps_overlay_.reset();
@@ -191,8 +193,7 @@ class Rb3pcApp : public rex::ReXApp {
   void OnConfigurePaths(rex::PathConfig& paths) override {
     rb3pc::RemoveOrphanedGuestMemory();
     rb3pc::BindingStore::Get().SetDirectory(rex::filesystem::GetExecutableFolder() / "bindings");
-    // Without --game_data_root, look for the game files from the executable's
-    // folder upwards, so double-clicking rb3pc from the build tree works.
+    rb3pc::MidiInput::Get().SetBindingsDirectory(rex::filesystem::GetExecutableFolder() / "bindings");
     if (paths.game_data_root.empty()) {
       paths.game_data_root = FindGameDataRoot();
     }
