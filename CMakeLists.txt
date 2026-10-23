@@ -30,6 +30,7 @@ set(RB3PC_SOURCES
     src/shm_cleanup.cpp
     src/input_bindings.cpp
     src/mic_input.cpp
+    src/net_random.cpp
     src/midi_input.cpp
     src/bindings_dialog.cpp
     src/boot_speed.cpp
