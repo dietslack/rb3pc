@@ -24,5 +24,8 @@ CMakeUserPresets.json
 /*.7z
 /*.iso
 
+# Python bytecode
+__pycache__/
+
 # Local notes, not published
 /docs/

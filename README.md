@@ -22,7 +22,7 @@ menu acts as player 1. Typing on a keyboard doesn't work in text boxes yet.
 Windows builds haven't been tried yet. Not every Rock Band 3 Deluxe feature
 has been checked.
 
-## Credits
+## Sources and credits
 
 | Project | Used for |
 |---------|----------|
@@ -35,4 +35,13 @@ has been checked.
 | [Se7enSins forum post](https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/) | How the Xbox 360's on-screen keyboard function is called |
 | [SDL](https://github.com/libsdl-org/SDL) | Windows, controllers, sound and microphones (through ReXGlue) |
 | [Dear ImGui](https://github.com/ocornut/imgui) | The settings screen and settings windows (through ReXGlue) |
+| [zlib](https://zlib.net) | Unpacking the game's compressed files and the Deluxe download, checksums, screenshots |
 | [ALSA](https://www.alsa-project.org) | MIDI input on Linux |
+
+Rock Band is a trademark of Harmonix Music Systems. This project isn't
+affiliated with or endorsed by Harmonix.
+
+## License
+
+MIT, see [LICENSE](LICENSE). This covers the code in this repository only,
+not the game or anything generated from it.
