@@ -40,4 +40,8 @@ std::vector<ControllerInfo> ConnectedControllers();
 // Sets controller_type_<index + 1> ("auto", "gamepad", "guitar", "drums").
 void SetControllerType(size_t index, const std::string& type);
 
+// Briefly presses `buttons` on player `player`'s controllers (0-3, the game's
+// pad number). Player 1 also gets it from MnK, which shares that slot.
+void PressOnPlayer(int player, uint16_t buttons);
+
 }  // namespace rb3pc

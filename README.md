@@ -17,9 +17,10 @@ contains no game files, and the build only works with files you provide.
 
 ## Known issues
 
-Keys and pro guitar aren't supported yet. The mouse only controls player 1.
-Typing on a keyboard doesn't work in text boxes yet. Windows builds haven't
-been tried yet. Not every Rock Band 3 Deluxe feature has been checked.
+Keys and pro guitar aren't supported yet. Clicking inside another player's
+menu acts as player 1. Typing on a keyboard doesn't work in text boxes yet.
+Windows builds haven't been tried yet. Not every Rock Band 3 Deluxe feature
+has been checked.
 
 ## Credits
 

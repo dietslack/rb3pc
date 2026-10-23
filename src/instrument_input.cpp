@@ -68,6 +68,31 @@ constexpr uint8_t kSubTypeDrumKit = 0x08;   // -> hx_drums_xbox_rb2 (flags bit 0
 constexpr uint64_t kMidiDeviceIdBase = 0x4D49444900000000ull;  // "MIDI"
 bool IsMidiDevice(DeviceId id) { return (uint64_t(id) & ~0xFFFFull) == kMidiDeviceIdBase; }
 
+std::mutex g_player_mutex;
+std::array<std::vector<DeviceId>, rex::input::kMaxGuestUsers> g_player_devices;
+struct PlayerPress {
+  int player = -1;
+  uint16_t buttons = 0;
+  std::chrono::steady_clock::time_point at{};
+  uint32_t serial = 0;  // presses sent, for the packet number
+};
+PlayerPress g_player_press;
+
+// Games ignore a state whose packet number didn't change, so each press bumps
+// it twice: on press and on release.
+uint16_t PressedOnDevice(DeviceId id, uint32_t& packets) {
+  constexpr auto kHold = std::chrono::milliseconds(60);
+  std::lock_guard lock(g_player_mutex);
+  packets = 0;
+  const PlayerPress& press = g_player_press;
+  if (press.player < 0) return 0;
+  const auto& ids = g_player_devices[size_t(press.player)];
+  if (std::find(ids.begin(), ids.end(), id) == ids.end()) return 0;
+  bool held = std::chrono::steady_clock::now() - press.at < kHold;
+  packets = press.serial * 2 - (held ? 1 : 0);
+  return held ? press.buttons : 0;
+}
+
 std::string ControllerTypeSetting(size_t index) {
   switch (index) {
     case 0: return REXCVAR_GET(controller_type_1);
@@ -281,6 +306,11 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
         out.thumb_ry = pad.thumb_ry;
       }
     }
+    {
+      uint32_t packets = 0;
+      out_state->gamepad.buttons = uint16_t(out_state->gamepad.buttons) | PressedOnDevice(id, packets);
+      out_state->packet_number = uint32_t(out_state->packet_number) + packets;
+    }
     if (IsFirstController(id)) {
       // SDK doesn't advance packet_number while unfocused.
       static uint16_t last_scripted = 0;
@@ -344,12 +374,14 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
       if (changed) ++midi_packets_[index];
       out_state->packet_number = midi_packets_[index];
     }
+    uint32_t packets = 0;
     auto& out = out_state->gamepad;
-    out.buttons = pad.buttons;
+    out.buttons = pad.buttons | PressedOnDevice(id, packets);
     out.thumb_lx = pad.thumb_lx;
     out.thumb_ly = pad.thumb_ly;
     out.thumb_rx = pad.thumb_rx;
     out.thumb_ry = pad.thumb_ry;
+    out_state->packet_number = uint32_t(out_state->packet_number) + packets;
     if (changed && pad.buttons) NoteControllerPress();
     if (REXCVAR_GET(instrument_input_log) && changed) {
       REXLOG_INFO("Instruments: MIDI {} buttons={:04X} lx={} ly={} rx={} ry={}", key, pad.buttons,
@@ -494,6 +526,41 @@ void ApplyMouseKeyboardDefaults() {
   }
 }
 
+void PressOnPlayer(int player, uint16_t buttons) {
+  if (player <= 0) {  // the keyboard and mouse are player 1
+    rex::input::mnk::QueuePress(buttons);
+    return;
+  }
+  if (player >= int(rex::input::kMaxGuestUsers)) return;
+  std::lock_guard lock(g_player_mutex);
+  g_player_press.player = player;
+  g_player_press.buttons = buttons;
+  g_player_press.at = std::chrono::steady_clock::now();
+  ++g_player_press.serial;
+}
+
+// SDK's SlotAssignment, plus logging and a copy for PressOnPlayer.
+class LoggedAssignment final : public rex::input::DeviceAssignment {
+ public:
+  void OnDevicesChanged(const std::vector<DeviceInfo>& devices) override {
+    slots_.OnDevicesChanged(devices);
+    for (const auto& device : devices) {
+      REXLOG_INFO("Input: {} -> player {}", device.name,
+                  device.synthetic ? 1 : int(device.ordinal) + 1);
+    }
+    std::lock_guard lock(g_player_mutex);
+    for (uint32_t user = 0; user < g_player_devices.size(); ++user) {
+      slots_.DevicesForUser(user, g_player_devices[user]);
+    }
+  }
+  void DevicesForUser(uint32_t user_index, std::vector<DeviceId>& out) const override {
+    slots_.DevicesForUser(user_index, out);
+  }
+
+ private:
+  rex::input::SlotAssignment slots_;
+};
+
 std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
   auto input = std::make_unique<rex::input::InputSystem>(nullptr);
 
@@ -513,7 +580,7 @@ std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
 
   uint8_t nop_index = tool_mode ? 0 : 1;
   input->AddDriver(std::make_unique<rex::input::nop::NopInputDriver>(nullptr, nop_index));
-  input->SetDeviceAssignment(std::make_unique<rex::input::SlotAssignment>());
+  input->SetDeviceAssignment(std::make_unique<LoggedAssignment>());
   return input;
 }
 

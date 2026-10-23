@@ -76,6 +76,7 @@
 
 #include "display_size.h"
 #include "exe.h"
+#include "instrument_input.h"
 #include "rb3_assets.h"
 #include "rb3_ui.h"
 
@@ -107,6 +108,7 @@ REXCVAR_DECLARE(bool, mnk_mode);
 #define MM_DXMESH_DRAW sub_82738E38
 #define MM_CONTROLLER_TYPE sub_82525C40
 #define MM_USER_FROM_PAD sub_82524AF8
+#define MM_USER_FROM_SLOT sub_82682B60
 #define MM_SLIDER_DRAW sub_8280A260
 #define MM_COMPONENT_POLL_ORIG __imp__sub_827FFAA8
 #define MM_BANDBUTTON_DRAW_ORIG __imp__sub_823446B0
@@ -142,6 +144,7 @@ REXCVAR_DECLARE(bool, mnk_mode);
 #define MM_DXMESH_DRAW sub_82713E08
 #define MM_CONTROLLER_TYPE sub_82512708
 #define MM_USER_FROM_PAD sub_82511618
+#define MM_USER_FROM_SLOT sub_82664DD0
 #define MM_SLIDER_DRAW sub_827E4C98
 #define MM_COMPONENT_POLL_ORIG __imp__sub_827DA580
 #define MM_BANDBUTTON_DRAW_ORIG __imp__sub_82331C40
@@ -178,6 +181,7 @@ REX_EXTERN(MM_REVIEW_DRAW_ORIG);         // ReviewDisplay::DrawShowing
 REX_EXTERN(MM_DXMESH_DRAW_ORIG);         // DxMesh::DrawShowing
 REX_EXTERN(MM_CONTROLLER_TYPE);          // JoypadControllerTypePadNum(int pad) -> Symbol (r3 = result)
 REX_EXTERN(MM_USER_FROM_PAD);            // JoypadGetUserFromPadNum(int pad) -> LocalUser*
+REX_EXTERN(MM_USER_FROM_SLOT);           // BandUserMgr::GetUserFromSlot(int slot) -> BandUser*
 REX_EXTERN(MM_SLIDER_DRAW_ORIG);         // UISlider::DrawShowing
 
 namespace {
@@ -301,6 +305,8 @@ std::atomic<int> g_wheel_notches{0};
 // Buttons a left click presses, set on the game thread for the input
 // thread's click handler: -1 plain A, 0 nothing.
 std::atomic<int> g_click_buttons{-1};
+// Pad the click presses on (an overshell tab targets its slot's player).
+std::atomic<int> g_click_player{0};
 
 const auto g_launch = Clock::now();
 
@@ -373,7 +379,9 @@ bool ScriptedPointer(float& x, float& y) {
             break;
           default:  // left click
             if (REXCVAR_GET(mouse_menu_debug)) REXLOG_INFO("Pointer: scripted click, buttons {}", click);
-            if (click) rex::input::mnk::QueuePress(click < 0 ? rex::input::X_INPUT_GAMEPAD_A : uint16_t(click));
+            if (click) {
+              rb3pc::PressOnPlayer(g_click_player, click < 0 ? rex::input::X_INPUT_GAMEPAD_A : uint16_t(click));
+            }
             break;
         }
       }
@@ -1287,14 +1295,14 @@ bool ScreenRect(const uint8_t* base, uint32_t comp, uint32_t cam, LocalBox box, 
   return true;
 }
 
-// Player 1's overshell tab (bottom left: name, instrument, "MENU" with the
-// Start icon): the labels of the leftmost OvershellDir (vtable 0x8202CFC4,
-// one per player slot; the keyboard and mouse are player 1) drawn in the
-// bottom strip, where the tab sits while the overshell is closed. A click on
-// it presses Start, which opens the overshell. Its highlight goes on the
-// MENU row (the labels below the name, right of the instrument icon).
+// Overshell tabs: OvershellDir labels (one dir per slot) in the bottom strip
+// while closed. A click presses Start for that slot's player
+// (BandUserMgr::GetUserFromSlot matched with JoypadGetUserFromPadNum); an empty
+// slot's JOIN tab goes to player 1 (mnk).
 constexpr uint32_t kOvershellDirVtable = rb3pc::exe::kDeluxe ? 0x8202DBFC : 0x8202CFC4;
 constexpr float kOvershellStrip = 0.86f;  // the closed tab is below this
+constexpr uint32_t kBandUserMgr = rb3pc::exe::kDeluxe ? 0x82E023B8 : 0x82DD0C58;  // TheBandUserMgr
+constexpr uint32_t kBandUserToLocalUser = 0x94;  // LocalBandUser: its LocalUser past its BandUser
 
 bool OvershellOpen(const uint8_t* base) {
   uint32_t focused = FocusedComponent(base);
@@ -1304,7 +1312,29 @@ bool OvershellOpen(const uint8_t* base) {
   return dir >= 0x40000000 && dir < 0x50000000 && Load32(base, dir) == kOvershellDirVtable;
 }
 
-bool OvershellTabAt(const uint8_t* base, float px, float py, Highlight& highlight) {
+// -1 if the slot is empty.
+int SlotPad(PPCContext& ctx, uint8_t* base, int slot) {
+  uint32_t mgr = Load32(base, kBandUserMgr);
+  if (mgr < 0x40000000 || mgr >= 0x50000000) return -1;
+  PPCContext saved = ctx;
+  ctx.r1.u64 = (ctx.r1.u32 - 0x200) & ~0xFu;
+  uint32_t sp = ctx.r1.u32;
+  ctx.r3.u64 = mgr;
+  ctx.r4.u64 = uint32_t(slot);
+  MM_USER_FROM_SLOT(ctx, base);
+  uint32_t user = ctx.r3.u32;
+  int pad = -1;
+  for (int p = 0; user && p < 4 && pad < 0; ++p) {
+    ctx.r1.u64 = sp;
+    ctx.r3.u64 = uint32_t(p);
+    MM_USER_FROM_PAD(ctx, base);
+    if (ctx.r3.u32 && ctx.r3.u32 == user + kBandUserToLocalUser) pad = p;
+  }
+  ctx = saved;
+  return pad;
+}
+
+bool OvershellTabAt(PPCContext& ctx, uint8_t* base, float px, float py, Highlight& highlight, int& player) {
   struct Label {
     uint32_t comp, dir, cam;
     Highlight rect;
@@ -1325,28 +1355,46 @@ bool OvershellTabAt(const uint8_t* base, float px, float py, Highlight& highligh
     labels.push_back({comp, dir, drawn.cam, std::move(rect)});
   }
   if (labels.empty()) return false;
-  // Player 1's slot: the leftmost.
-  uint32_t dir = std::min_element(labels.begin(), labels.end(), [](const Label& a, const Label& b) {
-                   return a.rect.x0 < b.rect.x0;
-                 })->dir;
-  float x0 = 2, y0 = 2, x1 = -1, y1 = -1;
+  struct Tab {
+    uint32_t dir;
+    float x0 = 2, y0 = 2, x1 = -1, y1 = -1;
+  };
+  std::vector<Tab> tabs;
   for (const auto& l : labels) {
-    if (l.dir != dir) continue;
-    x0 = std::min(x0, l.rect.x0), y0 = std::min(y0, l.rect.y0);
-    x1 = std::max(x1, l.rect.x1), y1 = std::max(y1, l.rect.y1);
+    auto tab = std::find_if(tabs.begin(), tabs.end(), [&](const Tab& t) { return t.dir == l.dir; });
+    if (tab == tabs.end()) tab = tabs.insert(tabs.end(), Tab{l.dir});
+    tab->x0 = std::min(tab->x0, l.rect.x0), tab->y0 = std::min(tab->y0, l.rect.y0);
+    tab->x1 = std::max(tab->x1, l.rect.x1), tab->y1 = std::max(tab->y1, l.rect.y1);
   }
-  float pad = (y1 - y0) * 0.15f;
-  if (px < x0 - pad || px > x1 + pad || py < y0 - pad || py > y1 + pad) return false;
-  // Not while this overshell is open (its menu has the focus): its rows are
-  // its own to click.
+  std::sort(tabs.begin(), tabs.end(), [](const Tab& a, const Tab& b) { return a.x0 < b.x0; });
+  int slot = -1;
+  for (int i = 0; i < int(tabs.size()) && slot < 0; ++i) {
+    const Tab& t = tabs[size_t(i)];
+    float pad = (t.y1 - t.y0) * 0.15f;
+    if (px >= t.x0 - pad && px <= t.x1 + pad && py >= t.y0 - pad && py <= t.y1 + pad) slot = i;
+  }
+  if (slot < 0) return false;
+  const Tab& tab = tabs[size_t(slot)];
+  // Not while this overshell is open.
   uint32_t focused = FocusedComponent(base);
   uint32_t object = focused ? Load32(base, focused + 0x30) : 0;
-  if (object > focused && object < focused + 0x400 && Load32(base, object + 0x1C) == dir) return false;
-  // The MENU row: below the middle of the tab, right of its first quarter.
+  if (object > focused && object < focused + 0x400 && Load32(base, object + 0x1C) == tab.dir) return false;
+  player = SlotPad(ctx, base, slot);
+  if (player < 0) {
+    // Leftmost empty slot joins mnk, if not already in one.
+    for (int other = 0; other < int(tabs.size()); ++other) {
+      if (other != slot && SlotPad(ctx, base, other) == 0) return false;
+    }
+    for (int left = 0; left < slot; ++left) {
+      if (SlotPad(ctx, base, left) < 0) return false;
+    }
+    player = 0;
+  }
+  // Highlight the MENU row: lower half, right of the first quarter.
   highlight = {2, 2, -1, -1, HighlightStyle::kButton, {}};
   for (const auto& l : labels) {
-    if (l.dir != dir || (l.rect.y0 + l.rect.y1) * 0.5f < (y0 + y1) * 0.5f ||
-        (l.rect.x0 + l.rect.x1) * 0.5f < x0 + (x1 - x0) * 0.25f) {
+    if (l.dir != tab.dir || (l.rect.y0 + l.rect.y1) * 0.5f < (tab.y0 + tab.y1) * 0.5f ||
+        (l.rect.x0 + l.rect.x1) * 0.5f < tab.x0 + (tab.x1 - tab.x0) * 0.25f) {
       continue;
     }
     highlight.x0 = std::min(highlight.x0, l.rect.x0), highlight.y0 = std::min(highlight.y0, l.rect.y0);
@@ -1445,6 +1493,11 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
     rex::input::mnk::SetClickHandler([](int mouse_button, uint16_t& buttons) {
       int click = g_click_buttons;
       if (mouse_button != 0 || click < 0) return false;
+      if (int player = g_click_player; player > 0) {
+        if (click) rb3pc::PressOnPlayer(player, uint16_t(click));
+        buttons = 0;
+        return true;
+      }
       buttons = uint16_t(click);
       return true;
     });
@@ -1515,6 +1568,7 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   int item = on_list ? ListItemAt(base, comp, local) : -1;
   g_pointer_on_list = on_list;
   int click = -1;
+  int player = 0;
   std::vector<Highlight> highlights;
   uint32_t label = 0;
   LocalBox line{};
@@ -1591,10 +1645,11 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
              }()) {
     click = 0;
     comp = 0;
-  } else if (Highlight tab; OvershellTabAt(base, px, py, tab)) {
+  } else if (Highlight tab; OvershellTabAt(ctx, base, px, py, tab, player)) {
     click = rex::input::X_INPUT_GAMEPAD_START;
     if (debug) {
-      REXLOG_INFO("Pointer: over the overshell tab, highlight {:.3f},{:.3f}-{:.3f},{:.3f}", tab.x0, tab.y0, tab.x1, tab.y1);
+      REXLOG_INFO("Pointer: over the overshell tab of pad {}, highlight {:.3f},{:.3f}-{:.3f},{:.3f}", player, tab.x0,
+                  tab.y0, tab.x1, tab.y1);
       for (const auto& run : tab.runs) REXLOG_INFO("Pointer:   glyphs of {}: {}", run.font, run.quads.size());
     }
     if (tab.x1 > tab.x0) highlights.push_back(std::move(tab));
@@ -1664,6 +1719,7 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
     click = selected ? -1 : 0;
     item = -1;
   }
+  g_click_player = player;
   g_click_buttons = click;
   {
     std::lock_guard lock(g_highlight_mutex);
