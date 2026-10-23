@@ -79,13 +79,25 @@ class MenuPads {
     return names;
   }
 
- private:
   struct Pad {
     SDL_JoystickID id;
     SDL_Joystick* joystick;
     Profile profile;
-    Instrument instrument;
+    Instrument instrument;  // from SDL's device type
   };
+  const std::vector<Pad>& Pads() const { return pads_; }
+
+  void ReloadProfiles() {
+    for (auto& pad : pads_) {
+      Profile profile = DefaultProfile(pad.id);
+      std::string name = profile.name;
+      if (auto saved = BindingStore::Get().Find(profile.guid)) profile = *saved;
+      if (profile.name.empty()) profile.name = name;
+      pad.profile = std::move(profile);
+    }
+  }
+
+ private:
 
   void Refresh() {
     int count = 0;

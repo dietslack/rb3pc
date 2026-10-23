@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -28,8 +29,10 @@
 #include "display_options.h"
 #include "display_size.h"
 #include "input_bindings.h"
+#include "mic_input.h"
 #include "instrument_input.h"
 #include "menu_pads.h"
+#include "midi_input.h"
 #include "mouse_cursor.h"
 #include "profile.h"
 #include "rb3_ui.h"
@@ -40,6 +43,11 @@ REXCVAR_DEFINE_BOOL(show_launcher, true, "rb3pc",
                     "starts");
 
 REXCVAR_DECLARE(std::string, debug_input_script);
+REXCVAR_DEFINE_STRING(debug_launcher_script, "", "rb3pc",
+                      "Testing aid: menu actions on this screen at set times, e.g. "
+                      "\"3:down,4:confirm\" (seconds after it opens; up down left right confirm "
+                      "back start)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rb3pc {
 
@@ -90,6 +98,7 @@ enum class Row {
   kController2,
   kController3,
   kController4,
+  kBindControllers,
   kMouseKeyboard,
   kMouseCursor,
   kShowLauncher,
@@ -118,7 +127,7 @@ std::vector<Row> SectionRows(Section section, size_t extra_songs_folders) {
     case Section::kAudio: return {Row::kAudioBuffer, Row::kAudioDevice};
     case Section::kControllers:
       return {Row::kController1, Row::kController2, Row::kController3, Row::kController4,
-              Row::kMouseKeyboard, Row::kMouseCursor};
+              Row::kBindControllers, Row::kMouseKeyboard, Row::kMouseCursor};
     case Section::kGame: return {Row::kProfile, Row::kQuickStart, Row::kShowLauncher};
     default: return {};
   }
@@ -137,13 +146,31 @@ const char* SectionLabel(Section section) {
 }
 
 struct Item {
-  enum Kind { kPlay, kSection, kSetting, kBack, kQuit } kind;
+  // kDevice and kBind*: the BIND CONTROLLERS screens.
+  enum Kind { kPlay, kSection, kSetting, kBack, kQuit, kDevice, kBindType, kBindMic, kBindInput, kBindReset } kind;
   Section section = Section::kCount;
   Row row = Row::kCount;
+  int index = 0;  // kDevice: which device; kBindMic: which microphone; kBindInput: which input
 };
 
-// Rows that fit between the logo and the help bar (a category's header, its
-// settings and BACK at most).
+enum class BindScreen { kNone, kDevices, kDevice };
+
+struct BindDevice {
+  bool midi = false;
+  size_t slot = 0;          // a controller's place in SDL's order (controller_type_N)
+  std::string key;          // "sdl:<SDL id>" or "midi:<MidiDevice::key>"
+  std::string name;
+};
+
+// Strips the prefix every PS3 instrument's name has.
+std::string ShortPadName(std::string name) {
+  constexpr std::string_view kLicensed = "Licensed by Sony Computer Entertainment ";
+  if (name.starts_with(kLicensed)) name.erase(0, kLicensed.size());
+  if (name.starts_with("America ")) name.erase(0, 8);
+  return name;
+}
+
+// Between the logo and the help bar.
 constexpr int kMaxVisibleRows = 9;
 
 class Launcher final : public rex::ui::ImGuiDialog {
@@ -155,6 +182,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
         ui_(std::move(immediate_drawer), std::move(game_root)),
         hooks_(std::move(hooks)) {
     g_launcher_active = true;
+    MidiInput::Get().Start();  // MIDI instruments show up here too
   }
   ~Launcher() override { g_launcher_active = false; }
 
@@ -193,6 +221,21 @@ class Launcher final : public rex::ui::ImGuiDialog {
       items.push_back({Item::kPlay});
       for (int s = 0; s < int(Section::kCount); ++s) items.push_back({Item::kSection, Section(s)});
       items.push_back({Item::kQuit});
+    } else if (bind_ == BindScreen::kDevices) {
+      auto devices = BindDevices();
+      for (int i = 0; i < int(devices.size()); ++i) items.push_back({Item::kDevice, section_, Row::kCount, i});
+      items.push_back({Item::kBack});
+    } else if (bind_ == BindScreen::kDevice) {
+      items.push_back({Item::kBindType, section_});
+      if (auto device = CurrentDevice(); device && !BindTypeIsNone(*device)) {
+        if (HasMics(*device)) {
+          for (int i = 0; i < kMicCount; ++i) items.push_back({Item::kBindMic, section_, Row::kCount, i});
+        }
+        int inputs = device->midi ? int(kDrumInputCount) : int(kOutputCount);
+        for (int i = 0; i < inputs; ++i) items.push_back({Item::kBindInput, section_, Row::kCount, i});
+        items.push_back({Item::kBindReset, section_});
+      }
+      items.push_back({Item::kBack});
     } else {
       for (Row row : SectionRows(section_, songs_folders_.size())) items.push_back({Item::kSetting, section_, row});
       items.push_back({Item::kBack});
@@ -212,11 +255,30 @@ class Launcher final : public rex::ui::ImGuiDialog {
 
   void EnterSection(Section section) {
     section_ = section;
+    bind_ = BindScreen::kNone;
     selected_ = 0;
+    scroll_ = 0;
   }
 
   void LeaveSection() {
     if (!InSection()) return;
+    StopCapture();
+    scroll_ = 0;
+    if (bind_ == BindScreen::kDevice) {
+      bind_ = BindScreen::kDevices;
+      auto devices = BindDevices();
+      selected_ = 0;
+      for (int i = 0; i < int(devices.size()); ++i) {
+        if (devices[i].key == bind_key_) selected_ = i;
+      }
+      return;
+    }
+    if (bind_ == BindScreen::kDevices) {
+      bind_ = BindScreen::kNone;
+      auto rows = SectionRows(section_, songs_folders_.size());
+      selected_ = int(std::find(rows.begin(), rows.end(), Row::kBindControllers) - rows.begin());
+      return;
+    }
     selected_ = 1 + int(section_);  // back on the category's own line
     section_ = Section::kCount;
   }
@@ -243,7 +305,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
         return std::to_string(int((samples + device) / 48.0 + 0.5)) + " MS";
       }
       case Section::kControllers: {
-        size_t n = pads_.Names().size();
+        size_t n = BindDevices().size();
         return n == 1 ? "1 CONNECTED" : std::to_string(n) + " CONNECTED";
       }
       case Section::kGame: return Value(Row::kProfile);
@@ -303,7 +365,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kController2:
       case Row::kController3:
       case Row::kController4:
-        return int(std::size(kControllerTypes));
+        return MidiInPort(row) ? 2 : int(std::size(kControllerTypes));
       default:
         return 0;
     }
@@ -341,6 +403,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kController2:
       case Row::kController3:
       case Row::kController4:
+        if (auto midi = MidiInPort(row)) return BindTypeIsNone(*midi) ? 1 : 0;
         return ControllerIndex(int(row) - int(Row::kController1));
       default:
         return 0;
@@ -392,6 +455,12 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kController2:
       case Row::kController3:
       case Row::kController4:
+        if (auto midi = MidiInPort(row)) {
+          MidiProfile profile = MidiInput::Get().Profile(MidiKey(*midi));
+          profile.type = index ? MidiType::kNone : MidiType::kProDrums;
+          MidiInput::Get().SaveProfile(profile);
+          return;
+        }
         rex::cvar::SetFlagByName(ControllerCvar(int(row) - int(Row::kController1)).c_str(),
                                  kControllerTypes[index]);
         break;
@@ -468,6 +537,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kController2: return "CONTROLLER 2";
       case Row::kController3: return "CONTROLLER 3";
       case Row::kController4: return "CONTROLLER 4";
+      case Row::kBindControllers: return "BIND CONTROLLERS";
       case Row::kMouseKeyboard: return "MOUSE & KEYBOARD IN MENUS";
       case Row::kMouseCursor: return "MOUSE CURSOR";
       case Row::kShowLauncher: return "SHOW THIS SCREEN AT STARTUP";
@@ -521,7 +591,9 @@ class Launcher final : public rex::ui::ImGuiDialog {
       case Row::kController1:
       case Row::kController2:
       case Row::kController3:
-      case Row::kController4: return kControllerTypeLabels[index];
+      case Row::kController4:
+        if (MidiInPort(row)) return index ? kControllerTypeLabels[std::size(kControllerTypes) - 1] : "PRO DRUMS";
+        return kControllerTypeLabels[index];
       default: return "";
     }
   }
@@ -538,9 +610,18 @@ class Launcher final : public rex::ui::ImGuiDialog {
     uint32_t held = pads_.Poll();
     uint32_t pad_pressed = repeater_.Update(held);
     if (pad_pressed) NoteControllerPress();
-    uint32_t pressed = pad_pressed;
-    // The profile name's text entry has the input while it's open (the pads
-    // are still polled, so a button held to close it isn't a press here).
+    uint32_t pressed = pad_pressed | ScriptedActions();
+    if (bind_ == BindScreen::kDevice && !CurrentDevice()) LeaveSection();
+    if (capturing_) {
+      // Pads are being captured, so only keyboard/mouse can cancel.
+      PollCapture();
+      if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
+          ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        StopCapture();
+      }
+      return;
+    }
+    // Pads still polled above, so the button that closes it doesn't leak through.
     if (name_entry_) return;
 
     auto key = [](ImGuiKey k) { return ImGui::IsKeyPressed(k, true); };
@@ -589,10 +670,27 @@ class Launcher final : public rex::ui::ImGuiDialog {
     int count = int(Items().size());
     if (pressed & kUp) selected_ = (selected_ + count - 1) % count;
     if (pressed & kDown) selected_ = (selected_ + 1) % count;
+    if (InSection() && io.MouseWheel != 0) {
+      selected_ = std::clamp(selected_ + (io.MouseWheel < 0 ? 1 : -1), 0, count - 1);
+    }
+    KeepSelectionVisible();
     Item item = Selected();
     if (item.kind == Item::kSetting) {
       if (pressed & kLeft) Cycle(item.row, -1);
       if (pressed & kRight) Cycle(item.row, +1);
+    }
+    if (item.kind == Item::kBindType) {
+      if (pressed & kLeft) CycleBindType(-1);
+      if (pressed & kRight) CycleBindType(+1);
+    }
+    if (item.kind == Item::kBindMic) {
+      if (pressed & kLeft) CycleMic(item.index, -1);
+      if (pressed & kRight) CycleMic(item.index, +1);
+    }
+    if (item.kind == Item::kBindInput) {
+      auto device = CurrentDevice();
+      if (pressed & kLeft) ClearBinding(item.index);
+      if ((pressed & kRight) && device && device->midi) StartCapture(item.index, true);
     }
     if (pressed & kBack) {
       LeaveSection();
@@ -604,6 +702,20 @@ class Launcher final : public rex::ui::ImGuiDialog {
         case Item::kQuit: Finish(hooks_.quit); return;
         case Item::kSection: EnterSection(item.section); return;
         case Item::kBack: LeaveSection(); return;
+        case Item::kDevice: {
+          auto devices = BindDevices();
+          if (item.index < int(devices.size())) {
+            bind_key_ = devices[size_t(item.index)].key;
+            bind_ = BindScreen::kDevice;
+            selected_ = 0;
+            scroll_ = 0;
+          }
+          return;
+        }
+        case Item::kBindType: CycleBindType(+1); return;
+        case Item::kBindMic: CycleMic(item.index, +1); return;
+        case Item::kBindInput: StartCapture(item.index, false); return;
+        case Item::kBindReset: ResetBindings(); return;
         case Item::kSetting:
           if (item.row == Row::kProfile) {
             // Pads get the game's text entry; keyboard/mouse edit in place.
@@ -620,6 +732,10 @@ class Launcher final : public rex::ui::ImGuiDialog {
             RemoveSongsFolder(item.row);
           } else if (item.row == Row::kSongsAdd) {
             PickSongsFolder();
+          } else if (item.row == Row::kBindControllers) {
+            bind_ = BindScreen::kDevices;
+            selected_ = 0;
+            scroll_ = 0;
           } else if (IsListChoice(item.row)) {
             StartAdjusting(item.row);
           } else {
@@ -629,6 +745,269 @@ class Launcher final : public rex::ui::ImGuiDialog {
       }
     }
     if (pressed & kStart) Play();
+  }
+
+  // debug_launcher_script: the actions due since the last frame.
+  uint32_t ScriptedActions() {
+    static const auto start = Clock::now();
+    static const std::vector<std::pair<double, uint32_t>> script = [] {
+      static const std::pair<const char*, uint32_t> kActions[] = {
+          {"up", kUp},       {"down", kDown}, {"left", kLeft},   {"right", kRight},
+          {"confirm", kConfirm}, {"back", kBack}, {"start", kStart}};
+      std::vector<std::pair<double, uint32_t>> out;
+      std::string text = REXCVAR_GET(debug_launcher_script);
+      size_t pos = 0;
+      while (pos < text.size()) {
+        size_t comma = text.find(',', pos);
+        std::string item = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? text.size() : comma + 1;
+        size_t colon = item.find(':');
+        if (colon == std::string::npos) continue;
+        for (const auto& [name, action] : kActions) {
+          if (item.substr(colon + 1) == name) out.push_back({std::atof(item.substr(0, colon).c_str()), action});
+        }
+      }
+      return out;
+    }();
+    double now = std::chrono::duration<double>(Clock::now() - start).count();
+    uint32_t actions = 0;
+    for (const auto& [at, action] : script) {
+      if (at > script_done_ && at <= now) actions |= action;
+    }
+    script_done_ = now;
+    return actions;
+  }
+  double script_done_ = 0;
+
+  std::vector<BindDevice> BindDevices() const {
+    std::vector<BindDevice> devices;
+    const auto& pads = pads_.Pads();
+    for (size_t i = 0; i < pads.size(); ++i) {
+      devices.push_back({false, i, "sdl:" + std::to_string(pads[i].id), ShortPadName(pads[i].profile.name)});
+    }
+    for (const auto& midi : MidiInput::Get().Devices()) {
+      if (midi.connected) devices.push_back({true, 0, "midi:" + midi.key, "MIDI: " + midi.name});
+    }
+    return devices;
+  }
+
+  // MIDI instruments follow the controllers, in player slot order.
+  std::optional<BindDevice> MidiInPort(Row row) const {
+    size_t slot = size_t(int(row) - int(Row::kController1));
+    auto devices = BindDevices();
+    if (slot >= devices.size() || !devices[slot].midi) return std::nullopt;
+    return devices[slot];
+  }
+
+  std::optional<BindDevice> CurrentDevice() const {
+    for (auto& device : BindDevices()) {
+      if (device.key == bind_key_) return device;
+    }
+    return std::nullopt;
+  }
+
+  static std::string MidiKey(const BindDevice& device) { return device.key.substr(5); }
+
+  const MenuPads::Pad* PadOf(const BindDevice& device) const {
+    if (device.midi || device.slot >= pads_.Pads().size()) return nullptr;
+    return &pads_.Pads()[device.slot];
+  }
+
+  Instrument PadInstrument(const BindDevice& device) const {
+    std::string type = device.slot < 4 ? rex::cvar::GetFlagByName(ControllerCvar(int(device.slot)).c_str())
+                                       : std::string("auto");
+    if (type == "guitar") return Instrument::kGuitar;
+    if (type == "drums") return Instrument::kDrums;
+    if (type == "auto") {
+      if (const MenuPads::Pad* pad = PadOf(device)) return pad->instrument;
+    }
+    return Instrument::kGamepad;
+  }
+
+  bool BindTypeIsNone(const BindDevice& device) const {
+    if (device.midi) return MidiInput::Get().Profile(MidiKey(device)).type == MidiType::kNone;
+    return device.slot < 4 && ControllerIndex(int(device.slot)) == int(std::size(kControllerTypes)) - 1;
+  }
+
+  std::string BindTypeLabel(const BindDevice& device) const {
+    if (device.midi) return Upper(MidiTypeLabel(MidiInput::Get().Profile(MidiKey(device)).type));
+    return kControllerTypeLabels[device.slot < 4 ? ControllerIndex(int(device.slot)) : 0];
+  }
+
+  void CycleBindType(int delta) {
+    auto device = CurrentDevice();
+    if (!device) return;
+    if (device->midi) {
+      MidiProfile profile = MidiInput::Get().Profile(MidiKey(*device));
+      profile.type = profile.type == MidiType::kNone ? MidiType::kProDrums : MidiType::kNone;
+      MidiInput::Get().SaveProfile(profile);
+    } else if (device->slot < 4) {
+      int count = int(std::size(kControllerTypes));
+      int index = (ControllerIndex(int(device->slot)) + delta + count) % count;
+      rex::cvar::SetFlagByName(ControllerCvar(int(device->slot)).c_str(), kControllerTypes[index]);
+      Save();
+    }
+  }
+
+  Profile PadProfile(const MenuPads::Pad& pad) const {
+    Profile profile = DefaultProfile(pad.id);
+    if (auto saved = BindingStore::Get().Find(profile.guid)) {
+      std::string name = profile.name;
+      profile = *saved;
+      if (profile.name.empty()) profile.name = name;
+    }
+    return profile;
+  }
+
+  // `add` keeps a MIDI input's other notes.
+  void StartCapture(int input, bool add) {
+    auto device = CurrentDevice();
+    if (!device) return;
+    capture_input_ = input;
+    capture_add_ = add;
+    capture_start_ = Clock::now();
+    if (device->midi) {
+      auto last = MidiInput::Get().LastHit(MidiKey(*device));
+      capture_serial_ = last ? last->serial : 0;
+    } else if (const MenuPads::Pad* pad = PadOf(*device)) {
+      sdl_capture_.emplace(pad->joystick, Output(input), PadInstrument(*device));
+    } else {
+      return;
+    }
+    capturing_ = true;
+  }
+
+  void StopCapture() {
+    capturing_ = false;
+    sdl_capture_.reset();
+  }
+
+  void PollCapture() {
+    auto device = CurrentDevice();
+    if (!device || Clock::now() - capture_start_ > std::chrono::seconds(10)) {
+      StopCapture();
+      return;
+    }
+    if (device->midi) {
+      auto last = MidiInput::Get().LastHit(MidiKey(*device));
+      if (!last || last->serial == capture_serial_) return;
+      MidiProfile profile = MidiInput::Get().Profile(MidiKey(*device));
+      auto& notes = profile.notes[size_t(capture_input_)];
+      if (!capture_add_) notes.clear();
+      if (std::find(notes.begin(), notes.end(), last->note) == notes.end()) notes.push_back(last->note);
+      MidiInput::Get().SaveProfile(profile);
+      StopCapture();
+      return;
+    }
+    const MenuPads::Pad* pad = PadOf(*device);
+    if (!pad || !sdl_capture_) {
+      StopCapture();
+      return;
+    }
+    if (auto source = sdl_capture_->Poll(pad->joystick)) {
+      Profile profile = PadProfile(*pad);
+      profile.sources[size_t(capture_input_)] = *source;
+      BindingStore::Get().Save(profile);
+      pads_.ReloadProfiles();
+      StopCapture();
+    }
+  }
+
+  void ClearBinding(int input) {
+    auto device = CurrentDevice();
+    if (!device) return;
+    if (device->midi) {
+      MidiProfile profile = MidiInput::Get().Profile(MidiKey(*device));
+      profile.notes[size_t(input)].clear();
+      MidiInput::Get().SaveProfile(profile);
+    } else if (const MenuPads::Pad* pad = PadOf(*device)) {
+      Profile profile = PadProfile(*pad);
+      profile.sources[size_t(input)] = {};
+      BindingStore::Get().Save(profile);
+      pads_.ReloadProfiles();
+    }
+  }
+
+  // Back to the General MIDI map (keeping the type), or SDL's own mapping.
+  void ResetBindings() {
+    auto device = CurrentDevice();
+    if (!device) return;
+    if (device->midi) {
+      MidiProfile old = MidiInput::Get().Profile(MidiKey(*device));
+      MidiProfile profile = DefaultMidiProfile(old.key, old.name);
+      profile.type = old.type;
+      MidiInput::Get().SaveProfile(profile);
+    } else if (const MenuPads::Pad* pad = PadOf(*device)) {
+      BindingStore::Get().Remove(pad->profile.guid);
+      pads_.ReloadProfiles();
+    }
+  }
+
+  // Mics are global (the game doesn't tie them to controllers); shown under
+  // any gamepad / vocals controller.
+  bool HasMics(const BindDevice& device) const {
+    return !device.midi && PadInstrument(device) == Instrument::kGamepad;
+  }
+
+  // Skips devices another mic has.
+  void CycleMic(int mic, int delta) {
+    std::vector<std::string> choices = {""};
+    for (const std::string& name : MicDeviceNames()) {
+      bool taken = false;
+      for (int other = 0; other < kMicCount; ++other) taken |= other != mic && MicSetting(other) == name;
+      if (!taken) choices.push_back(name);
+    }
+    int count = int(choices.size());
+    int at = int(std::find(choices.begin(), choices.end(), MicSetting(mic)) - choices.begin());
+    at = at >= count ? 0 : (at + delta + count) % count;
+    SetMicSetting(mic, choices[size_t(at)]);
+    Save();
+  }
+
+  static std::string MicValue(int mic) {
+    std::string device = MicSetting(mic);
+    if (device.empty()) return "NONE";
+    return Upper(device) + (MicOpen(mic) ? "" : " (UNPLUGGED)");
+  }
+
+  std::string BindInputLabel(const BindDevice& device, int input) const {
+    if (device.midi) return Upper(DrumInputLabel(DrumInput(input)));
+    return Upper(OutputLabel(Output(input), PadInstrument(device)));
+  }
+
+  std::string BindInputValue(const BindDevice& device, int input) const {
+    if (capturing_ && capture_input_ == input) return device.midi ? "HIT A PAD..." : "PRESS A CONTROL...";
+    if (device.midi) {
+      MidiProfile profile = MidiInput::Get().Profile(MidiKey(device));
+      const auto& notes = profile.notes[size_t(input)];
+      if (notes.empty()) return "-";
+      std::string text = DescribeNotes({notes[0]});
+      for (size_t i = 1; i < notes.size(); ++i) text += ", " + std::to_string(notes[i]);
+      return Upper(text);
+    }
+    if (const MenuPads::Pad* pad = PadOf(device)) return Upper(pad->profile.sources[size_t(input)].Describe());
+    return "";
+  }
+
+  // Being played now: a MIDI input hit a moment ago, a controller's button held.
+  bool BindInputLive(const BindDevice& device, int input) const {
+    if (device.midi) return MidiInput::Get().RecentlyHit(MidiKey(device))[size_t(input)];
+    const MenuPads::Pad* pad = PadOf(device);
+    if (!pad || IsAnalog(Output(input))) return false;
+    return Evaluate(pad->profile, pad->joystick).buttons & OutputButton(Output(input));
+  }
+
+  int VisibleItems() const { return kMaxVisibleRows - 1; }
+  void KeepSelectionVisible() {
+    int count = int(Items().size());
+    selected_ = std::clamp(selected_, 0, std::max(count - 1, 0));
+    if (!InSection()) {
+      scroll_ = 0;
+      return;
+    }
+    if (selected_ < scroll_) scroll_ = selected_;
+    if (selected_ >= scroll_ + VisibleItems()) scroll_ = selected_ - VisibleItems() + 1;
+    scroll_ = std::clamp(scroll_, 0, std::max(count - VisibleItems(), 0));
   }
 
   void PickDeluxeZip() {
@@ -873,7 +1252,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
   }
 
   float MenuTop(const Layout& l) const {
-    int count = int(Items().size()) + (InSection() ? 1 : 0);  // + the header
+    int items = int(Items().size());
+    int count = InSection() ? std::min(items, VisibleItems()) + 1 : items;  // + the header
     float height = count * l.row_h + 2 * 16.0f * l.scale;
     return l.top + std::max(0.0f, (l.bottom - l.top - height) * 0.5f);
   }
@@ -882,8 +1262,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
     float gap = 16.0f * l.scale;
     float top = MenuTop(l);
     if (InSection()) {
-      // Below the category's header, BACK set apart.
-      float y = top + (index + 1) * l.row_h + gap;
+      // Below the category's header, BACK set apart; scrolled in long lists.
+      float y = top + (index - scroll_ + 1) * l.row_h + gap;
       if (index == int(Items().size()) - 1) y += gap;
       return y;
     }
@@ -898,10 +1278,15 @@ class Launcher final : public rex::ui::ImGuiDialog {
     Layout l = ComputeLayout(ImGui::GetIO().DisplaySize);
     if (mouse.x < l.menu_x || mouse.x > l.menu_x + l.menu_w) return -1;
     for (int i = 0; i < int(Items().size()); ++i) {
+      if (!RowVisible(i)) continue;
       float y = RowY(l, i);
       if (mouse.y >= y && mouse.y < y + l.row_h) return i;
     }
     return -1;
+  }
+
+  bool RowVisible(int index) const {
+    return !InSection() || (index >= scroll_ && index < scroll_ + VisibleItems());
   }
 
   bool IsCheckbox(Row row) const {
@@ -927,9 +1312,13 @@ class Launcher final : public rex::ui::ImGuiDialog {
 
     std::vector<std::string> pad_names = pads_.Names();
     float pad = 14.0f * l.scale;
+    KeepSelectionVisible();
+    std::optional<BindDevice> bind_device = bind_ == BindScreen::kDevice ? CurrentDevice() : std::nullopt;
     if (InSection()) {
-      // The category's name, as a header.
-      std::string title = SectionLabel(section_);
+      std::string title = bind_ == BindScreen::kDevices ? "BIND CONTROLLERS"
+                          : bind_device                 ? Upper(bind_device->name)
+                                                        : SectionLabel(section_);
+      if (title.size() > 34) title = title.substr(0, 33) + "...";
       float size = l.text * 1.3f;
       float w = ui_.TextWidth(UiFont::kHub, title, size);
       ui_.DrawTextShadowed(draw, UiFont::kHub, title, size, l.cx - w * 0.5f,
@@ -937,6 +1326,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
     }
     std::vector<Item> items = Items();
     for (int i = 0; i < int(items.size()); ++i) {
+      if (!RowVisible(i)) continue;
       const Item& item = items[i];
       Row row = item.row;
       float y = RowY(l, i);
@@ -986,8 +1376,43 @@ class Launcher final : public rex::ui::ImGuiDialog {
         }
         continue;
       }
-      // Windowed, the internal resolution and aspect ratio follow the window:
-      // grayed out, with no value.
+      if (item.kind == Item::kDevice || item.kind == Item::kBindType || item.kind == Item::kBindMic ||
+          item.kind == Item::kBindInput || item.kind == Item::kBindReset) {
+        // Fitted between value_x and the right edge.
+        auto fit = [&](std::string s, float max_w) {
+          while (s.size() > 4 && ui_.TextWidth(UiFont::kHub, s, text) > max_w) s = s.substr(0, s.size() - 4) + "...";
+          return s;
+        };
+        float value_w = l.menu_x + l.menu_w - pad - l.value_x;
+        if (item.kind == Item::kDevice) {
+          auto devices = BindDevices();
+          if (item.index >= int(devices.size())) continue;
+          const BindDevice& device = devices[size_t(item.index)];
+          label(fit(Upper(device.name), l.value_x - l.menu_x - pad * 2), text, l.menu_x + pad, text_y, kUiText);
+          label(BindTypeLabel(device), text, l.value_x, text_y, kUiAccent);
+        } else if (item.kind == Item::kBindReset) {
+          label(bind_device && bind_device->midi ? "RESET TO GENERAL MIDI" : "RESET TO DEFAULTS", text,
+                l.menu_x + pad, text_y, kUiText);
+        } else if (bind_device && item.kind == Item::kBindType) {
+          label("INSTRUMENT TYPE", text, l.menu_x + pad, text_y, kUiText);
+          label(BindTypeLabel(*bind_device), text, l.value_x, text_y, kUiAccent);
+        } else if (item.kind == Item::kBindMic) {
+          static constexpr const char* kMicLabels[] = {"MIC 1: LEAD / HARMONY 1", "MIC 2: HARMONY 2",
+                                                       "MIC 3: HARMONY 3"};
+          label(fit(kMicLabels[item.index], l.value_x - l.menu_x - pad * 2), text, l.menu_x + pad, text_y, kUiText);
+          bool live = MicLevel(item.index) > 0.05f;
+          label(fit(MicValue(item.index), value_w), text, l.value_x, text_y,
+                live ? IM_COL32(110, 255, 120, 255) : kUiAccent);
+        } else if (bind_device) {
+          label(fit(BindInputLabel(*bind_device, item.index), l.value_x - l.menu_x - pad * 2), text,
+                l.menu_x + pad, text_y, kUiText);
+          bool live = BindInputLive(*bind_device, item.index);
+          label(fit(BindInputValue(*bind_device, item.index), value_w), text, l.value_x, text_y,
+                live ? IM_COL32(110, 255, 120, 255) : kUiAccent);
+        }
+        continue;
+      }
+      // Windowed: follows the window, grayed out.
       bool locked = (row == Row::kResolution || row == Row::kAspectRatio) && !ChoiceCount(row);
       label(Label(row), text, l.menu_x + pad, text_y, locked ? kUiMuted : kUiText);
 
@@ -1034,6 +1459,13 @@ class Launcher final : public rex::ui::ImGuiDialog {
         }
       }
 
+      if (row == Row::kBindControllers && ui_.HasImage("chevron")) {
+        float size = l.row_h * 0.95f;
+        float x1 = l.menu_x + l.menu_w - pad * 0.5f;
+        float cy = y + l.row_h * 0.5f;
+        ui_.DrawImage(draw, "chevron", ImVec2(x1 - size, cy - size * 0.5f), ImVec2(x1, cy + size * 0.5f),
+                      selected ? kUiDark : kUiText);
+      }
       if (row == Row::kDeluxeInstall) {
         std::string note = DeluxeNote();
         if (note.size() > 34) note = note.substr(0, 33) + "...";
@@ -1054,11 +1486,8 @@ class Launcher final : public rex::ui::ImGuiDialog {
 
       if (row >= Row::kController1 && row <= Row::kController4) {
         size_t slot = size_t(int(row) - int(Row::kController1));
-        std::string name = slot < pad_names.size() ? pad_names[slot] : "NOT CONNECTED";
-        // PS3 instruments all start with this.
-        constexpr std::string_view kLicensed = "Licensed by Sony Computer Entertainment ";
-        if (name.starts_with(kLicensed)) name.erase(0, kLicensed.size());
-        if (name.starts_with("America ")) name.erase(0, 8);
+        std::string name = slot < pad_names.size() ? ShortPadName(pad_names[slot]) : "NOT CONNECTED";
+        if (auto midi = MidiInPort(row)) name = Upper(midi->name);
         if (name.size() > 30) name = name.substr(0, 29) + "...";
         float small = 15.0f * l.scale;
         float w = ui_.TextWidth(UiFont::kDisplay, name, small);
@@ -1078,7 +1507,25 @@ class Launcher final : public rex::ui::ImGuiDialog {
       std::string text;
     };
     std::vector<Hint> hints;
-    if (editing_) {
+    Item hovered_item = Selected();
+    bool bind_midi = false;
+    if (auto device = bind_ == BindScreen::kDevice ? CurrentDevice() : std::nullopt) bind_midi = device->midi;
+    if (capturing_) {
+      hints = {{nullptr, bind_midi ? "HIT A PAD" : "PRESS OR MOVE A CONTROL"}, {nullptr, "ESC: CANCEL"}};
+    } else if (hovered_item.kind == Item::kBindInput) {
+      hints = {{nullptr, "STRUM: MOVE"}, {"g", "BIND"}};
+      if (bind_midi) hints.push_back({nullptr, "RIGHT: ADD A NOTE"});
+      hints.push_back({nullptr, "LEFT: CLEAR"});
+      hints.push_back({"r", "BACK"});
+    } else if (hovered_item.kind == Item::kBindType) {
+      hints = {{nullptr, "STRUM: MOVE"}, {"g", "CHANGE"}, {"r", "BACK"}};
+    } else if (hovered_item.kind == Item::kBindMic) {
+      hints = {{nullptr, "STRUM: MOVE"}, {nullptr, "LEFT / RIGHT: CHANGE"}, {"r", "BACK"}};
+    } else if (hovered_item.kind == Item::kDevice) {
+      hints = {{nullptr, "STRUM: MOVE"}, {"g", "BINDINGS"}, {"r", "BACK"}};
+    } else if (hovered_item.kind == Item::kBindReset) {
+      hints = {{nullptr, "STRUM: MOVE"}, {"g", "RESET"}, {"r", "BACK"}};
+    } else if (editing_) {
       hints = {{nullptr, "TYPE A NAME"},
                {nullptr, "BACKSPACE: DELETE"},
                {nullptr, "ENTER: DONE"},
@@ -1098,6 +1545,7 @@ class Launcher final : public rex::ui::ImGuiDialog {
                             : row == songs_remove_armed_ ? "REMOVE (FILES STAY)"
                             : IsExtraSongsFolder(row)    ? "REMOVE"
                             : row == Row::kSongsAdd      ? "ADD"
+                            : row == Row::kBindControllers ? "OPEN"
                                                          : "CHANGE";
       hints = {{nullptr, "STRUM: MOVE"},
                {"g", confirm},
@@ -1138,7 +1586,16 @@ class Launcher final : public rex::ui::ImGuiDialog {
   MenuPads pads_;
   Repeater repeater_;
   int selected_ = 0;  // index into Items()
+  int scroll_ = 0;    // the first item shown, in lists longer than the screen
   Section section_ = Section::kCount;  // the open category, or kCount at the top
+  BindScreen bind_ = BindScreen::kNone;
+  std::string bind_key_;  // the device whose bindings are open
+  bool capturing_ = false;  // waiting for a control to bind
+  int capture_input_ = 0;
+  bool capture_add_ = false;
+  uint64_t capture_serial_ = 0;  // MIDI: the last hit before capturing
+  std::optional<Capture> sdl_capture_;
+  Clock::time_point capture_start_;
   bool editing_ = false;
   std::unique_ptr<rex::kernel::xam::KeyboardUi> name_entry_;  // open from a controller
   bool adjusting_ = false;  // a list setting is selected for changing
