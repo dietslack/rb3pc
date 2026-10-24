@@ -8,7 +8,7 @@ window size, mouse support, microphones, MIDI drum kits, and custom songs.
 It can also run the popular [Rock Band 3 Deluxe](https://github.com/hmxmilohax/rock-band-3-deluxe)
 mod.
 
-Made by slack. I only have a Linux system, so pretty much everything so far
+Made with assistance from AI. I only have a Linux system, so pretty much everything so far
 expects Linux. Windows compatibility is probably low for now, but it will be
 worked on.
 
