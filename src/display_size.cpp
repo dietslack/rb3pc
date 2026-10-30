@@ -42,12 +42,26 @@ REXCVAR_DEFINE_INT32(debug_resolution_scale_y, 0, "rb3pc",
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// Not set (the window's left edge may be anywhere, negative included).
+constexpr int32_t kNoPosition = -100000;
+REXCVAR_DECLARE(int32_t, window_width);
+REXCVAR_DECLARE(int32_t, window_height);
+REXCVAR_DEFINE_INT32(window_x, kNoPosition, "rb3pc",
+                     "Window position where the last session left it (with window_y); the "
+                     "window opens there, its size from window_width/height")
+    .range(kNoPosition, 100000);
+REXCVAR_DEFINE_INT32(window_y, kNoPosition, "rb3pc", "See window_x").range(kNoPosition, 100000);
+
 namespace rb3pc {
 
 namespace {
 
 Scale current_scale;
 bool scale_live = true;
+// Set once the player resizes the window (not the window manager fitting a
+// new window to a screen, which happens as it opens).
+bool resized_by_player = false;
+uint64_t window_opened_ms = 0;
 Shape current_shape;
 
 // Read by the hooks below on game threads.
@@ -209,7 +223,14 @@ Scale WantedResolutionScale(bool fullscreen) {
 void ApplyResolutionScale(bool fullscreen) {
   current_shape = ViewShape(fullscreen);
   SetViewShape(current_shape);
-  guest_mode = GuestModeFor(current_shape);
+  // Windowed, the frame takes the shape the player last gave the window
+  // (window_width/height): Wayland compositors open a window no wider than a
+  // screen, so one spread over several comes back narrower until stretched.
+  Shape frame_shape = current_shape;
+  if (!fullscreen && REXCVAR_GET(window_width) > 0 && REXCVAR_GET(window_height) > 0) {
+    frame_shape = {uint32_t(REXCVAR_GET(window_width)), uint32_t(REXCVAR_GET(window_height))};
+  }
+  guest_mode = GuestModeFor(frame_shape);
   guest_ratio = double(guest_mode.height) / guest_mode.width;
   Scale scale = WantedResolutionScale(fullscreen);
   // Per-axis cvars override resolution_scale only when != 1.
@@ -254,9 +275,9 @@ bool ResolutionScaleLive() { return scale_live; }
 
 Scale CurrentResolutionScale() { return current_scale; }
 
-void FitWindowToUsableArea() {
-  SDL_Window* window = GameWindow();
-  if (!window || (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN)) return;
+namespace {
+
+void FitWindowToUsableArea(SDL_Window* window) {
   SDL_Rect usable;
   if (!SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window), &usable)) return;
   int top = 0, left = 0, bottom = 0, right = 0;
@@ -277,6 +298,70 @@ void FitWindowToUsableArea() {
                         usable.y + top + (room_h - fit_h) / 2);
   REXLOG_INFO("Display: window {}x{} didn't fit the usable {}x{}; now {}x{}", w, h, usable.w,
               usable.h, fit_w, fit_h);
+}
+
+
+// True if the rect lies within the displays together (it may span several),
+// give or take window borders.
+bool OnDisplays(const SDL_Rect& rect) {
+  int count = 0;
+  SDL_DisplayID* displays = SDL_GetDisplays(&count);
+  if (!displays) return false;
+  SDL_Rect all{0, 0, 0, 0};
+  for (int i = 0; i < count; ++i) {
+    SDL_Rect bounds;
+    if (!SDL_GetDisplayBounds(displays[i], &bounds)) continue;
+    if (all.w == 0) {
+      all = bounds;
+    } else {
+      SDL_GetRectUnion(&all, &bounds, &all);
+    }
+  }
+  SDL_free(displays);
+  constexpr int kSlack = 64;
+  return all.w > 0 && rect.x >= all.x - kSlack && rect.y >= all.y - kSlack &&
+         rect.x + rect.w <= all.x + all.w + kSlack && rect.y + rect.h <= all.y + all.h + kSlack;
+}
+
+}  // namespace
+
+void RestoreWindowGeometry() {
+  window_opened_ms = std::max<uint64_t>(SDL_GetTicks(), 1);
+  SDL_Window* window = GameWindow();
+  if (!window || (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN)) return;
+  int x = REXCVAR_GET(window_x), y = REXCVAR_GET(window_y);
+  int w = 0, h = 0;
+  SDL_GetWindowSize(window, &w, &h);
+  if (x == kNoPosition || y == kNoPosition || !OnDisplays({x, y, w, h})) {
+    FitWindowToUsableArea(window);
+    return;
+  }
+  // The size came from window_width/height. Wayland doesn't let a window
+  // place itself (the compositor does), and some X11 window managers keep
+  // a new window on the screen they opened it on.
+  SDL_SetWindowPosition(window, x, y);
+}
+
+void NoteWindowResized() {
+  if (window_opened_ms && SDL_GetTicks() > window_opened_ms + 1500) resized_by_player = true;
+}
+
+void SaveWindowGeometry() {
+  SDL_Window* window = GameWindow();
+  if (!window || !resized_by_player ||
+      (SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED |
+                                     SDL_WINDOW_MAXIMIZED))) {
+    return;
+  }
+  int x = 0, y = 0, w = 0, h = 0;
+  if (!SDL_GetWindowPosition(window, &x, &y) || !SDL_GetWindowSize(window, &w, &h) || w <= 0 ||
+      h <= 0) {
+    return;
+  }
+  rex::cvar::SetFlagByName("window_width", std::to_string(w));
+  rex::cvar::SetFlagByName("window_height", std::to_string(h));
+  rex::cvar::SetFlagByName("window_x", std::to_string(x));
+  rex::cvar::SetFlagByName("window_y", std::to_string(y));
 }
 
 }  // namespace rb3pc

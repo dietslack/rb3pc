@@ -70,8 +70,19 @@ bool ResolutionScaleLive();
 
 Scale CurrentResolutionScale();
 
-// Windowed: shrinks (same shape) and centres the window if it doesn't fit the
-// display's usable area.
-void FitWindowToUsableArea();
+// Windowed: puts the window back where the last session left it (saved by
+// SaveWindowGeometry), so its shape, which sets the game frame, holds from
+// launch; it may span displays. Otherwise shrinks (same shape) and centres it
+// if it doesn't fit the display's usable area. The position only takes on
+// X11 (Wayland compositors place windows themselves).
+void RestoreWindowGeometry();
+
+// On every window size change (UI thread).
+void NoteWindowResized();
+
+// Windowed, once the player has resized the window: its size and position
+// into window_width/height/x/y, for the next launch and the Deluxe handoff
+// (and the game frame's shape). The caller saves the config.
+void SaveWindowGeometry();
 
 }  // namespace rb3pc

@@ -130,7 +130,7 @@ class Rb3pcApp : public rex::ReXApp {
                           });
 
     mouse_cursor_ = rb3pc::CreateMouseCursorController(drawer, window());
-    rb3pc::FitWindowToUsableArea();
+    rb3pc::RestoreWindowGeometry();
     rb3pc::InstallTextEntry([this] { return immediate_drawer(); }, game_data_root());
     fps_overlay_ = rb3pc::CreateFpsOverlay(drawer);
     pointer_overlay_ = rb3pc::CreatePointerOverlay(
@@ -155,7 +155,16 @@ class Rb3pcApp : public rex::ReXApp {
     game_running_ = true;
     app_context().CallInUIThread([this] { FollowResolution(); });
   }
-  void OnWindowPixelSizeChanged(uint32_t, uint32_t) override { FollowResolution(); }
+  void OnWindowPixelSizeChanged(uint32_t, uint32_t) override {
+    rb3pc::NoteWindowResized();
+    FollowResolution();
+  }
+  // The window still exists here (not at shutdown).
+  bool OnWindowCloseRequested() override {
+    rb3pc::SaveWindowGeometry();
+    rex::cvar::SaveConfig(ConfigPath());
+    return true;
+  }
   void OnShutdown() override {
     screenshots_.Stop();
     rb3pc::MidiInput::Get().Stop();
@@ -219,6 +228,10 @@ class Rb3pcApp : public rex::ReXApp {
   }
 
   rex::PathConfig WithScriptPatches(rex::PathConfig paths) {
+    // The window's shape now sets the game frame; keep it for the Deluxe
+    // handoff below (a new process and window) and the next launch.
+    rb3pc::SaveWindowGeometry();
+    rex::cvar::SaveConfig(ConfigPath());
     rb3pc::ApplyResolutionScale(window()->IsFullscreen());
     // Deluxe setting mismatches this exe: execs the other one (deluxe.h).
     if (rb3pc::NeedsOtherExecutable()) {
