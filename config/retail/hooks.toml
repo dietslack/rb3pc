@@ -70,3 +70,22 @@ jump_address_on_true = 0x8271DA48
 [[midasm_hook]]
 address = 0x825F0724
 name = "Rb3pcCalibrationPoll"
+
+# Starting a sound effect's voice (sub_82B37728) after CreateSourceVoice
+# (sub_82B36148): r3 = its HRESULT, r30 = the voice owner, whose voice (+80)
+# is used unchecked from here. Without a voice, go to the function's cleanup
+# instead (src/audio_voices.cpp).
+[[midasm_hook]]
+address = 0x82B378B8
+name = "Rb3pcVoiceCreated"
+registers = ["r3", "r30"]
+jump_address_on_true = 0x82B37958
+
+# Its caller (sub_82B379B0) then starts the voice and marks the sample
+# playing; without a voice, skip to its unlock.
+[[midasm_hook]]
+address = 0x82B379E8
+name = "Rb3pcVoiceStarted"
+registers = ["r30"]
+jump_address_on_true = 0x82B37A14
+

@@ -66,3 +66,18 @@ jump_address_on_true = 0x82742A68
 [[midasm_hook]]
 address = 0x8260CE64
 name = "Rb3pcCalibrationPoll"
+
+# Sound effect voice start without a voice, sub_82B663A8 / its caller
+# sub_82B66630 (retail 0x82B378B8 / 0x82B379E8).
+[[midasm_hook]]
+address = 0x82B66538
+name = "Rb3pcVoiceCreated"
+registers = ["r3", "r30"]
+jump_address_on_true = 0x82B665D8
+
+[[midasm_hook]]
+address = 0x82B66668
+name = "Rb3pcVoiceStarted"
+registers = ["r30"]
+jump_address_on_true = 0x82B66694
+

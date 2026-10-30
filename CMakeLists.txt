@@ -29,6 +29,7 @@ set(RB3PC_SOURCES
     src/xekeys.cpp
     src/shm_cleanup.cpp
     src/crash_report.cpp
+    src/audio_voices.cpp
     src/input_bindings.cpp
     src/mic_input.cpp
     src/net_random.cpp
