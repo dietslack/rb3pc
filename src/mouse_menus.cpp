@@ -1171,10 +1171,12 @@ uint32_t HelpActionAt(const uint8_t* base, float px, float py, uint32_t& label_h
 }
 
 // ScrollbarDisplay (vtable 0x82031F1C): BandList +328, track height +332, min
-// thumb +348, top bone (RndMesh, local pos +112) +352, thumb position 0-1
-// +388, thumb share of track +392. Track runs -z from the top bone.
+// thumb +348, top bone (RndMesh, world pos +176) +352, thumb position 0-1
+// +388, thumb share of track +392. Track runs -z from the top bone. The bone
+// isn't always parented to the bar (wide view moves it), so take its world
+// position into the bar's plane.
 constexpr uint32_t kBarList = 328, kBarHeight = 332, kBarMinThumb = 348, kBarTopBone = 352;
-constexpr uint32_t kBarPosition = 388, kBarScale = 392, kBoneLocalPos = 112;
+constexpr uint32_t kBarPosition = 388, kBarScale = 392, kBoneWorldPos = kCompXfm + 48;
 // Drawn thumb, measured on screen.
 constexpr float kBarCentre = 0.35f, kBarHalfWidth = 3.05f, kBarBottomExtra = 1, kBarGrabHalfWidth = 14;
 
@@ -1193,8 +1195,9 @@ bool ReadScrollbar(const uint8_t* base, uint32_t bar, uint32_t cam, Scrollbar& o
   out.bar = bar;
   out.list = list;
   out.cam = cam;
-  out.x = LoadF(base, bone + kBoneLocalPos);
-  out.top = LoadF(base, bone + kBoneLocalPos + 8);
+  Vec3 top = ToLocal(base, bar, LoadVec(base, bone + kBoneWorldPos));
+  out.x = top.x;
+  out.top = top.z;
   out.height = LoadF(base, bar + kBarHeight);
   out.thumb_height = std::max(scale * out.height, LoadF(base, bar + kBarMinThumb));
   out.thumb_top = out.top - LoadF(base, bar + kBarPosition) * (out.height - out.thumb_height);
@@ -1587,7 +1590,10 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
     }
   }
   g_left_was_down = left;
-  if (g_drag.bar && (!left || !g_scrollbars.count(g_drag.bar))) g_drag = {};
+  // A held drag outlives frames the bar isn't drawn in (a jump to a song whose
+  // art loads slowly stalls the menu past the stale cutoff); it acts again once
+  // the bar is drawn.
+  if (g_drag.bar && !left) g_drag = {};
   if (g_slider_drag.slider && (!left || !g_drawn.count(g_slider_drag.slider))) {
     if (g_slider_drag.entered && g_drawn.count(g_slider_drag.slider)) Press(rex::input::X_INPUT_GAMEPAD_A);
     g_slider_drag = {};
@@ -1601,7 +1607,8 @@ void UpdatePointer(PPCContext& ctx, uint8_t* base) {
   } else if (g_drag.bar) {
     Vec3 hit;
     Scrollbar sb;
-    if (ReadScrollbar(base, g_drag.bar, g_scrollbars[g_drag.bar].cam, sb)) {
+    auto drawn = g_scrollbars.find(g_drag.bar);
+    if (drawn != g_scrollbars.end() && ReadScrollbar(base, g_drag.bar, drawn->second.cam, sb)) {
       if (PointerOnPlane(base, sb.bar, sb.cam, px, py, hit)) DragScrollbar(ctx, base, sb, hit.z + g_drag.grab);
       Highlight h;
       if (ScreenRect(base, sb.bar, sb.cam,
