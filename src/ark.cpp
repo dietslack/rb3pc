@@ -169,9 +169,9 @@ std::optional<size_t> ArkHeader::Find(const std::string& path) const {
   return std::nullopt;
 }
 
-bool Ark::Open(const fs::path& game_root) {
+bool Ark::Open(const fs::path& game_root, const std::string& header_name) {
   root_ = game_root;
-  auto raw = ReadFile(game_root / "gen" / "main_xbox.hdr");
+  auto raw = ReadFile(game_root / "gen" / header_name);
   if (raw.size() < 8) return false;
   header_key_ = Le32(raw.data());
   auto header = ArkHeader::Parse(HarmonixDecrypt(raw));

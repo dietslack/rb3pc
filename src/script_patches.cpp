@@ -29,6 +29,10 @@ REXCVAR_DEFINE_STRING(debug_venue, "", "rb3pc",
                       "Testing aid: play every song in this venue (e.g. small_club_01) instead of "
                       "a random one, for repeatable performance measurements")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(debug_song, "", "rb3pc",
+                      "Testing aid: once the main menu is up with player 1 joined, start this song (short name, e.g. "
+                      "bohemianrhapsody) on autoplay with guitar, drums and pro keys on Expert")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rb3pc {
 
@@ -85,17 +89,25 @@ constexpr std::string_view kChooseDiffEnter = R"(
         {handle ($this set_default_option_index {{$this get_user} get_difficulty})}})
 )";
 
+constexpr std::string_view kAutoplay = "{if {$this get_user} {{$this get_user} set autoplay TRUE}}";
+
 bool PatchSlotStates(DtbArray& root) {
   DtbArray* state = FindArray(root, {"kState_ChooseDiff"});
   if (!state) return false;
-  for (const auto& node : state->nodes) {
+  for (auto& node : state->nodes) {
     if (node.array && !node.array->nodes.empty() && node.array->nodes[0].IsSymbol("enter")) {
-      return false;
+      // Deluxe sets its own default; only add autoplay.
+      if (!REXCVAR_GET(debug_autoplay)) return false;
+      auto code = ParseDta(kAutoplay);
+      if (!code) return false;
+      auto& nodes = node.array->nodes;
+      nodes.insert(nodes.end(), code->begin(), code->end());
+      return true;
     }
   }
   std::string enter(kChooseDiffEnter);
   if (REXCVAR_GET(debug_autoplay)) {
-    enter.insert(enter.rfind(')'), "\n    {if {$this get_user} {{$this get_user} set autoplay TRUE}}");
+    enter.insert(enter.rfind(')'), "\n    " + std::string(kAutoplay));
   }
   auto code = ParseDta(enter);
   if (!code) return false;
@@ -112,6 +124,46 @@ bool PatchSelDiff(DtbArray& root) {
   venue.type = DtbNode::kSymbol;
   venue.text = REXCVAR_GET(debug_venue);
   call->nodes.push_back(venue);
+  return true;
+}
+
+// debug_song: once the main menu is up with player 1 joined (Deluxe shows it
+// before anyone joins), sets up the band with the game's own setup_game
+// (ui/global) and loads the song the way the dev mydta flow does. Track
+// symbols as in setup_game; 3 = Expert.
+constexpr std::string_view kDebugSongStart = R"(
+  {if {&& {! $rb3pc_debug_song_started}
+          {! {ui in_transition}}
+          {== {ui current_screen} main_hub_screen}
+          {{user_mgr get_user_from_pad_num 0} is_participating}}
+      {set $rb3pc_debug_song_started TRUE}
+      {gamemode set_mode qp_coop}
+      {setup_game SONG VENUE ((guitar 3 TRUE) (drum 3 TRUE) (real_keys 3 TRUE))}
+      {ui goto_screen mydta_start_in_game_screen}}
+)";
+
+bool PatchMainHub(DtbArray& root) {
+  DtbArray* panel = FindArray(root, {"new", "MainHubPanel", "main_hub_panel"});
+  if (!panel) return false;
+  std::string start(kDebugSongStart);
+  const std::string& venue = REXCVAR_GET(debug_venue);
+  start.replace(start.find("VENUE"), 5, venue.empty() ? "\"\"" : venue);
+  start.replace(start.find("SONG"), 4, REXCVAR_GET(debug_song));
+  auto code = ParseDta(start);
+  if (!code) return false;
+  // Deluxe's main hub already has a poll handler.
+  for (auto& node : panel->nodes) {
+    if (node.array && !node.array->nodes.empty() && node.array->nodes[0].IsSymbol("poll")) {
+      auto& nodes = node.array->nodes;
+      nodes.insert(nodes.begin() + 1, code->begin(), code->end());
+      return true;
+    }
+  }
+  auto poll = ParseDta("(poll)");
+  if (!poll || poll->empty() || !(*poll)[0].array) return false;
+  auto& nodes = (*poll)[0].array->nodes;
+  nodes.insert(nodes.end(), code->begin(), code->end());
+  panel->nodes.insert(panel->nodes.end(), poll->begin(), poll->end());
   return true;
 }
 
@@ -154,35 +206,65 @@ std::optional<fs::path> PrepareScriptPatches(const fs::path& game_root, const fs
   };
   std::vector<Patch> patches{{"ui/overshell/gen/slot_states.dtb", PatchSlotStates}};
   if (!REXCVAR_GET(debug_venue).empty()) patches.push_back({"ui/seldiff/gen/seldiff.dtb", PatchSelDiff});
+  if (!REXCVAR_GET(debug_song).empty()) patches.push_back({"ui/main/gen/main_hub.dtb", PatchMainHub});
   if (QuickStartEnabled()) {
     patches.push_back({"ui/gen/ui.dtb", PatchUi});
     patches.push_back({"ui/splash/gen/splash.dtb", PatchSplash});
+  }
+  // Deluxe's patch ARK (gen/patch_xbox.hdr) overrides many of these scripts.
+  // Its executable won't take another patch part, so its copy is patched into
+  // the main ARK's extra part and dropped from a rewritten patch header.
+  const std::string kPatchHeader = "patch_xbox.hdr";
+  std::optional<Ark> patch_ark;
+  ArkHeader patch_header;
+  if (auto it = replacements.find("gen/" + kPatchHeader); it != replacements.end()) {
+    patch_ark.emplace();
+    if (patch_ark->Open(it->second.parent_path().parent_path(), kPatchHeader)) {
+      patch_header = patch_ark->header();
+    } else {
+      REXLOG_WARN("Script patches: couldn't read {}; patching the game's ARK only",
+                  it->second.string());
+      patch_ark.reset();
+    }
   }
   ArkHeader header = ark.header();
   std::vector<uint8_t> part;  // extra ARK part
   uint64_t part_base = 0;
   for (auto size : header.part_sizes) part_base += size;
+  bool patch_header_changed = false;
   for (const Patch& p : patches) {
     auto index = header.Find(p.path);
-    auto data = index ? PatchDtb(ark, p.path, p.fn) : std::nullopt;
+    auto patch_index = patch_ark ? patch_header.Find(p.path) : std::nullopt;
+    auto data = !index         ? std::nullopt
+                : patch_index ? PatchDtb(*patch_ark, p.path, p.fn)
+                              : PatchDtb(ark, p.path, p.fn);
     if (!data) {
       REXLOG_WARN("Script patches: couldn't patch {}; left as is", p.path);
       continue;
     }
     auto& entry = header.entries[*index];
-    bool stored_uncompressed = entry.ucsize == entry.size;
+    bool stored_uncompressed = patch_index ? patch_header.entries[*patch_index].ucsize ==
+                                                 patch_header.entries[*patch_index].size
+                                           : entry.ucsize == entry.size;
     entry.offset = part_base + part.size();
     entry.size = uint32_t(data->size());
     entry.ucsize = stored_uncompressed ? entry.size : 0;
     part.insert(part.end(), data->begin(), data->end());
+    if (patch_index) {
+      patch_header.entries.erase(patch_header.entries.begin() + std::ptrdiff_t(*patch_index));
+      patch_header_changed = true;
+    }
   }
-  if (g_patched.empty()) return std::nullopt;
+  // Deluxe needs the overlay for its own files even with nothing patched.
+  if (g_patched.empty() && replacements.empty()) return std::nullopt;
   std::string part_path = "gen/main_xbox_" + std::to_string(header.part_sizes.size()) + ".ark";
-  header.part_count += 1;
-  header.part_sizes.push_back(uint32_t(part.size()));
-  header.part_paths.push_back(part_path);
-  header.cache_priorities.push_back(header.cache_priorities.empty() ? -1
-                                                                    : header.cache_priorities.back());
+  if (!g_patched.empty()) {
+    header.part_count += 1;
+    header.part_sizes.push_back(uint32_t(part.size()));
+    header.part_paths.push_back(part_path);
+    header.cache_priorities.push_back(
+        header.cache_priorities.empty() ? -1 : header.cache_priorities.back());
+  }
 
   // Symlinked game folder; game-written top-level files are kept, except
   // discordrp.json: Deluxe hangs at boot on a stale one.
@@ -220,16 +302,25 @@ std::optional<fs::path> PrepareScriptPatches(const fs::path& game_root, const fs
     fs::remove(overlay_dir / name, ec);
     ok &= link(target, overlay_dir / name);
   }
-  ok &= WriteFile(overlay_dir / part_path, part);
+  if (!g_patched.empty()) ok &= WriteFile(overlay_dir / part_path, part);
   ok &= WriteFile(overlay_dir / "gen" / "main_xbox.hdr",
                   HarmonixEncrypt(header.Serialize(), ark.header_key()));
+  if (patch_header_changed) {
+    fs::remove(overlay_dir / "gen" / kPatchHeader, ec);
+    ok &= WriteFile(overlay_dir / "gen" / kPatchHeader,
+                    HarmonixEncrypt(patch_header.Serialize(), patch_ark->header_key()));
+  }
   if (!ok) {
     g_patched.clear();
     REXLOG_WARN("Script patches: couldn't build {}; booting unpatched", overlay_dir.string());
     return std::nullopt;
   }
-  REXLOG_INFO("Script patches: patched {} scripts into {}", g_patched.size(),
-              (overlay_dir / part_path).string());
+  if (g_patched.empty()) {
+    REXLOG_INFO("Script patches: none needed; game files served from {}", overlay_dir.string());
+  } else {
+    REXLOG_INFO("Script patches: patched {} scripts into {}", g_patched.size(),
+                (overlay_dir / part_path).string());
+  }
   return overlay_dir;
 }
 

@@ -52,7 +52,8 @@ class ArkHeader {
 
 class Ark {
  public:
-  bool Open(const std::filesystem::path& game_root);
+  // header_name: e.g. "patch_xbox.hdr" for a patch ARK under the same root.
+  bool Open(const std::filesystem::path& game_root, const std::string& header_name = "main_xbox.hdr");
   // As stored (DTBs encrypted); empty if missing.
   std::vector<uint8_t> Read(const std::string& path) const;
 
