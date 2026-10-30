@@ -89,3 +89,27 @@ name = "Rb3pcVoiceStarted"
 registers = ["r30"]
 jump_address_on_true = 0x82B37A14
 
+# Camera shot framing (CamShotFrame, world/CameraShot.cpp): a shot's screen
+# offset moves the camera sideways by offset.x * distance / the projection's
+# x scale (RndCam +244), loaded here. A wide view's smaller x scale moved the
+# band off centre; src/display_size.cpp swaps in the 16:9 value.
+[[midasm_hook]]
+address = 0x824AC484
+name = "Rb3pcShotOffsetScale"
+registers = ["f10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824AD8B0
+name = "Rb3pcShotOffsetScale"
+registers = ["f13"]
+after_instruction = true
+
+# DxRnd's init sets height 720 (r28, already stored to Rnd +64) and width =
+# height * 16 / 9 (r7, stored to +60; r29 goes on to the device's back
+# buffer). Before the store, src/display_size.cpp puts the wide game frame's
+# size in all of them.
+[[midasm_hook]]
+address = 0x82716EF8
+name = "Rb3pcDxRndWidth"
+registers = ["r30", "r7", "r29", "r28"]
