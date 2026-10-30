@@ -608,11 +608,15 @@ class Launcher final : public rex::ui::ImGuiDialog {
     PollDeluxeInstall();
     PollSongsFolder();
     if (SelectedRow() != songs_remove_armed_) songs_remove_armed_ = Row::kCount;
+    if (bind_ == BindScreen::kDevice && !CurrentDevice()) LeaveSection();
     uint32_t held = pads_.Poll();
     uint32_t pad_pressed = repeater_.Update(held);
+    // A controller's own bindings screen: its buttons only bind and light up
+    // their rows there, so pressing them to test doesn't move or start
+    // anything. The keyboard and mouse drive it.
+    if (bind_ == BindScreen::kDevice) pad_pressed = 0;
     if (pad_pressed) NoteControllerPress();
     uint32_t pressed = pad_pressed | ScriptedActions();
-    if (bind_ == BindScreen::kDevice && !CurrentDevice()) LeaveSection();
     if (capturing_) {
       // Pads are being captured, so only keyboard/mouse can cancel.
       PollCapture();
@@ -1513,19 +1517,23 @@ class Launcher final : public rex::ui::ImGuiDialog {
     if (auto device = bind_ == BindScreen::kDevice ? CurrentDevice() : std::nullopt) bind_midi = device->midi;
     if (capturing_) {
       hints = {{nullptr, bind_midi ? "HIT A PAD" : "PRESS OR MOVE A CONTROL"}, {nullptr, "ESC: CANCEL"}};
-    } else if (hovered_item.kind == Item::kBindInput) {
-      hints = {{nullptr, "STRUM: MOVE"}, {"g", "BIND"}};
-      if (bind_midi) hints.push_back({nullptr, "RIGHT: ADD A NOTE"});
-      hints.push_back({nullptr, "LEFT: CLEAR"});
-      hints.push_back({"r", "BACK"});
-    } else if (hovered_item.kind == Item::kBindType) {
-      hints = {{nullptr, "STRUM: MOVE"}, {"g", "CHANGE"}, {"r", "BACK"}};
-    } else if (hovered_item.kind == Item::kBindMic) {
-      hints = {{nullptr, "STRUM: MOVE"}, {nullptr, "LEFT / RIGHT: CHANGE"}, {"r", "BACK"}};
+    } else if (bind_ == BindScreen::kDevice) {
+      // Keyboard and mouse only here (HandleInput).
+      hints = {{nullptr, "UP / DOWN: MOVE"}};
+      switch (hovered_item.kind) {
+        case Item::kBindInput:
+          hints.push_back({nullptr, "ENTER: BIND"});
+          if (bind_midi) hints.push_back({nullptr, "RIGHT: ADD A NOTE"});
+          hints.push_back({nullptr, "LEFT: CLEAR"});
+          break;
+        case Item::kBindType: hints.push_back({nullptr, "ENTER: CHANGE"}); break;
+        case Item::kBindMic: hints.push_back({nullptr, "LEFT / RIGHT: CHANGE"}); break;
+        case Item::kBindReset: hints.push_back({nullptr, "ENTER: RESET"}); break;
+        default: break;
+      }
+      hints.push_back({nullptr, "ESC: BACK"});
     } else if (hovered_item.kind == Item::kDevice) {
       hints = {{nullptr, "STRUM: MOVE"}, {"g", "BINDINGS"}, {"r", "BACK"}};
-    } else if (hovered_item.kind == Item::kBindReset) {
-      hints = {{nullptr, "STRUM: MOVE"}, {"g", "RESET"}, {"r", "BACK"}};
     } else if (editing_) {
       hints = {{nullptr, "TYPE A NAME"},
                {nullptr, "BACKSPACE: DELETE"},

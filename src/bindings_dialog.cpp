@@ -23,7 +23,12 @@ constexpr auto kCaptureTimeout = std::chrono::seconds(10);
 
 class BindingsDialog final : public rex::ui::ImGuiDialog {
  public:
-  explicit BindingsDialog(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+  // Controllers only bind and show what's pressed here; the game doesn't get
+  // them meanwhile.
+  explicit BindingsDialog(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {
+    HoldControllersFromGame(true);
+  }
+  ~BindingsDialog() override { HoldControllersFromGame(false); }
 
  protected:
   void OnDraw(ImGuiIO&) override {

@@ -44,4 +44,8 @@ void SetControllerType(size_t index, const std::string& type);
 // pad number). Player 1 also gets it from MnK, which shares that slot.
 void PressOnPlayer(int player, uint16_t buttons);
 
+// While on, the game sees every controller idle (MIDI included); SDL and the
+// bindings screens still read them. For the bindings window.
+void HoldControllersFromGame(bool hold);
+
 }  // namespace rb3pc

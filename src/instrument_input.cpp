@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -122,6 +123,7 @@ SDL_JoystickID SdlIdForGuid(const std::string& guid, size_t nth) {
 
 class InstrumentInputDriver;
 InstrumentInputDriver* g_driver = nullptr;
+std::atomic<bool> g_held_from_game{false};
 
 struct ScriptedPress {
   double at;
@@ -276,6 +278,22 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
   }
 
   X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override {
+    X_RESULT result = ReadDeviceState(id, out_state);
+    if (result == X_ERROR_SUCCESS && g_held_from_game) {
+      // Read anyway, so the packet count and the bindings window stay live.
+      auto& pad = out_state->gamepad;
+      pad.buttons = 0;
+      pad.left_trigger = 0;
+      pad.right_trigger = 0;
+      pad.thumb_lx = 0;
+      pad.thumb_ly = 0;
+      pad.thumb_rx = 0;
+      pad.thumb_ry = 0;
+    }
+    return result;
+  }
+
+  X_RESULT ReadDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     if (IsMidiDevice(id)) return GetMidiState(id, out_state);
     X_RESULT result = sdl_->GetDeviceState(id, out_state);
     if (result != X_ERROR_SUCCESS) {
@@ -354,7 +372,9 @@ class InstrumentInputDriver final : public rex::input::InputDriver {
   X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
                               rex::input::X_INPUT_KEYSTROKE* out_keystroke) override {
     if (IsMidiDevice(id)) return X_ERROR_EMPTY;
-    return sdl_->GetDeviceKeystroke(id, flags, out_keystroke);
+    X_RESULT result = sdl_->GetDeviceKeystroke(id, flags, out_keystroke);
+    if (result == X_ERROR_SUCCESS && g_held_from_game) return X_ERROR_EMPTY;  // dropped
+    return result;
   }
 
  private:
@@ -525,6 +545,8 @@ void ApplyMouseKeyboardDefaults() {
     if (!rex::cvar::HasNonDefaultValue(name)) rex::cvar::SetFlagByName(name, value);
   }
 }
+
+void HoldControllersFromGame(bool hold) { g_held_from_game = hold; }
 
 void PressOnPlayer(int player, uint16_t buttons) {
   if (player <= 0) {  // the keyboard and mouse are player 1
