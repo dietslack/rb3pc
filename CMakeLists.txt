@@ -28,6 +28,7 @@ set(RB3PC_SOURCES
     src/instrument_input.cpp
     src/xekeys.cpp
     src/shm_cleanup.cpp
+    src/crash_report.cpp
     src/input_bindings.cpp
     src/mic_input.cpp
     src/net_random.cpp

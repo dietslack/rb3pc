@@ -18,6 +18,7 @@
 #include <rex/system/interfaces/graphics.h>
 
 #include "bindings_dialog.h"
+#include "crash_report.h"
 #include "display_dialog.h"
 #include "audio_options.h"
 #include "frame_stats.h"
@@ -90,6 +91,7 @@ class Rb3pcApp : public rex::ReXApp {
   }
   void OnPostSetup() override {
     rb3pc::UnlinkOwnGuestMemory();
+    rb3pc::InstallCrashReport();
     SetGuestFrameStats(rb3pc::GuestFrameStats);  // F3 debug overlay
     rb3pc::ApplyProfileName(runtime()->kernel_state());
     rb3pc::RegisterCustomSongs(runtime()->kernel_state());
