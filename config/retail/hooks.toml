@@ -113,3 +113,12 @@ after_instruction = true
 address = 0x82716EF8
 name = "Rb3pcDxRndWidth"
 registers = ["r30", "r7", "r29", "r28"]
+
+# GemPlayer::ChangeDifficulty (sub_826A5240) calls its track's
+# ChangeDifficulty (sub_82B62598) with mTrack (+928) unchecked; without a
+# track, skip the call (src/track_fixes.cpp).
+[[midasm_hook]]
+address = 0x826A52C8
+name = "Rb3pcChangeDifficultyNoTrack"
+registers = ["r31"]
+jump_address_on_true = 0x826A52D0
