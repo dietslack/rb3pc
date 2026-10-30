@@ -179,7 +179,31 @@ class Rb3pcApp : public rex::ReXApp {
   // Launcher runs here: window exists, runtime/GPU not yet built. PLAY resumes.
   std::optional<rex::PathConfig> OnFinalizePaths(
       const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
-    if (!rb3pc::ShouldShowLauncher() || !imgui_drawer_) return WithScriptPatches(defaults);
+    if (!rb3pc::LauncherAllowed() || !imgui_drawer_) return WithScriptPatches(defaults);
+    if (rb3pc::ShowLauncherSetting()) {
+      ShowLauncher(defaults, std::move(resume));
+      return std::nullopt;
+    }
+    launcher_ = rb3pc::CreateShiftCheck(
+        imgui_drawer_, [this] { window()->RequestPaint(); },
+        [this, defaults, resume](bool shift) {
+          if (shift) REXLOG_INFO("Shift held at startup: showing the launcher");
+          // Deferred: the check is mid-draw when this is called.
+          app_context().CallInUIThreadDeferred([this, defaults, resume, shift] {
+            launcher_.reset();
+            if (shift) {
+              ShowLauncher(defaults, resume);
+            } else {
+              resume(WithScriptPatches(defaults));
+            }
+          });
+        });
+    window()->RequestPaint();
+    return std::nullopt;
+  }
+
+  void ShowLauncher(const rex::PathConfig& defaults,
+                    std::function<void(rex::PathConfig)> resume) {
     rb3pc::LauncherHooks hooks;
     hooks.is_fullscreen = [this] { return window()->IsFullscreen(); };
     hooks.set_fullscreen = [this](bool on) { SetFullscreen(on); };
@@ -198,7 +222,6 @@ class Rb3pcApp : public rex::ReXApp {
     launcher_ = rb3pc::CreateLauncher(
         imgui_drawer_, [this] { return immediate_drawer(); }, defaults.game_data_root,
         std::move(hooks));
-    return std::nullopt;
   }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {

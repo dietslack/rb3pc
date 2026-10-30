@@ -20,6 +20,7 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/logging.h>
 #include <rex/input/input.h>
 #include <rex/ui/imgui_dialog.h>
 
@@ -1615,12 +1616,55 @@ class Launcher final : public rex::ui::ImGuiDialog {
   size_t songs_count_ = CountSongPackages(SongsFolders());
 };
 
+class ShiftCheck final : public rex::ui::ImGuiDialog {
+ public:
+  ShiftCheck(rex::ui::ImGuiDrawer* drawer, std::function<void()> request_paint,
+             std::function<void(bool)> done)
+      : ImGuiDialog(drawer), request_paint_(std::move(request_paint)), done_(std::move(done)) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    (void)io;
+    if (!done_) return;
+    auto now = Clock::now();
+    // The compositor sends the held modifiers right after the focus; give
+    // them a moment to be read.
+    if (SDL_GetKeyboardFocus()) {
+      if (!focused_at_) focused_at_ = now;
+    }
+    bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+    bool timed_out = focused_at_ ? now - *focused_at_ >= std::chrono::milliseconds(100)
+                                 : now - start_ >= std::chrono::seconds(1);
+    if (shift || timed_out) {
+      std::function<void(bool)> done = std::move(done_);
+      done_ = nullptr;
+      if (!shift && !focused_at_) REXLOG_INFO("Startup Shift check: the window got no keyboard focus");
+      done(shift);
+      return;
+    }
+    if (request_paint_) request_paint_();
+  }
+
+ private:
+  std::function<void()> request_paint_;
+  std::function<void(bool)> done_;
+  Clock::time_point start_ = Clock::now();
+  std::optional<Clock::time_point> focused_at_;
+};
+
 }  // namespace
 
-bool ShouldShowLauncher() {
+bool LauncherAllowed() {
   // A boot handed over from the other executable has been through it already.
-  return REXCVAR_GET(show_launcher) && REXCVAR_GET(debug_input_script).empty() &&
-         !LaunchedByOtherExecutable();
+  return REXCVAR_GET(debug_input_script).empty() && !LaunchedByOtherExecutable();
+}
+
+bool ShowLauncherSetting() { return REXCVAR_GET(show_launcher); }
+
+std::unique_ptr<rex::ui::ImGuiDialog> CreateShiftCheck(rex::ui::ImGuiDrawer* drawer,
+                                                       std::function<void()> request_paint,
+                                                       std::function<void(bool)> done) {
+  return std::make_unique<ShiftCheck>(drawer, std::move(request_paint), std::move(done));
 }
 
 bool LauncherActive() { return g_launcher_active; }

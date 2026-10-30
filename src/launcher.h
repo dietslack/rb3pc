@@ -26,8 +26,17 @@ struct LauncherHooks {
   std::filesystem::path config_path;
 };
 
-// show_launcher, unless an input script is driving.
-bool ShouldShowLauncher();
+// Not when an input script is driving or the other executable handed over.
+bool LauncherAllowed();
+bool ShowLauncherSetting();  // show_launcher
+
+// With show_launcher off, holding Shift while the game opens brings the
+// launcher up anyway. The held keys only reach the window with its keyboard
+// focus, so this draws nothing until then (or a timeout) and calls done once,
+// from the UI thread, with whether Shift was held.
+std::unique_ptr<rex::ui::ImGuiDialog> CreateShiftCheck(rex::ui::ImGuiDrawer* drawer,
+                                                       std::function<void()> request_paint,
+                                                       std::function<void(bool)> done);
 
 bool LauncherActive();
 
